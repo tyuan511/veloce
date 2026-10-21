@@ -1,0 +1,24 @@
+[package]
+name = "veloce"
+description = "Veloce — a GPU-accelerated, keyboard-first unified file manager"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "veloce"
+path = "src/main.rs"
+
+[dependencies]
+vfs-core = { path = "../vfs-core" }
+gpui = { version = "0.2.2", features = ["runtime_shaders"] }
+anyhow.workspace = true
+async-channel.workspace = true
+futures.workspace = true
+nucleo-matcher.workspace = true
+open.workspace = true
+unicode-segmentation = "1"
+
+[dev-dependencies]
+tempfile = "3"
