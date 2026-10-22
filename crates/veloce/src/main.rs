@@ -17,6 +17,7 @@ mod file_icons_data;
 mod icons;
 mod info;
 mod listing;
+mod open_with;
 mod palette;
 mod pane;
 mod preview;

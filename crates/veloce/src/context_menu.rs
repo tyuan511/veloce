@@ -1,8 +1,9 @@
 //! The right-click menu: what it contains for a given target, and where it goes.
 //!
-//! The content follows Finder's menus (Open / Move to Trash / Get Info / Rename /
-//! Compress / Duplicate / Make Alias / Quick Look / Copy / Paste Item ...). Only
-//! the model lives here; the workspace draws it and runs the chosen action.
+//! The content follows Finder's menus: Open / Open With ▸ / Compress ▸ / Copy /
+//! Rename / Properties ..., with the long lists (formats, applications, sort keys)
+//! folded into submenus. Only the model and the geometry live here; the workspace
+//! draws it and runs the chosen action.
 
 use vfs_core::{SortKey, SortSpec, archive::CompressFormat};
 
@@ -11,7 +12,13 @@ use crate::view::ViewMode;
 /// Everything a menu row can do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
+    /// A row that does nothing (the "Loading…" placeholder).
+    Nothing,
     Open,
+    /// Open with the n-th application of the Open With list.
+    OpenWith(usize),
+    /// Pick any application from a file dialog.
+    OpenWithOther,
     OpenInNewTab,
     OpenInTerminal,
     Preview,
@@ -48,9 +55,17 @@ pub struct ActionItem {
     pub checked: bool,
 }
 
+/// A row that opens a flyout to its right.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubMenu {
+    pub label: String,
+    pub items: Vec<MenuItem>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MenuItem {
     Action(ActionItem),
+    Submenu(SubMenu),
     Separator,
 }
 
@@ -64,9 +79,41 @@ pub enum MenuTarget {
         count: usize,
         /// A single folder is selected.
         is_dir: bool,
+        /// Nothing but files is selected (Open With only makes sense then).
+        files_only: bool,
         /// A single archive is selected: the folder name "Extract to" would create.
         archive_stem: Option<String>,
     },
+}
+
+/// Applications that can open the selection, which arrive asynchronously.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OpenWith {
+    Loading,
+    /// Display names; the first is the default application.
+    Apps(Vec<String>),
+}
+
+/// State the menu content depends on besides what was clicked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MenuContext {
+    pub can_paste: bool,
+    pub view: ViewMode,
+    pub show_hidden: bool,
+    pub sort: SortSpec,
+    pub open_with: OpenWith,
+}
+
+impl Default for MenuContext {
+    fn default() -> Self {
+        Self {
+            can_paste: false,
+            view: ViewMode::default(),
+            show_hidden: false,
+            sort: SortSpec::default(),
+            open_with: OpenWith::Loading,
+        }
+    }
 }
 
 fn action(
@@ -84,13 +131,20 @@ fn action(
     })
 }
 
+fn submenu(label: &str, items: Vec<MenuItem>) -> MenuItem {
+    MenuItem::Submenu(SubMenu {
+        label: label.to_string(),
+        items,
+    })
+}
+
 fn checked(item: MenuItem, on: bool) -> MenuItem {
     match item {
         MenuItem::Action(mut item) => {
             item.checked = on;
             MenuItem::Action(item)
         }
-        separator => separator,
+        other => other,
     }
 }
 
@@ -105,7 +159,7 @@ pub fn sort_key_label(key: SortKey) -> &'static str {
     }
 }
 
-/// The toolbar's "Sort By" menu, with the current choice checked.
+/// The "Sort By" menu, with the current choice checked.
 pub fn sort_menu(spec: SortSpec) -> Vec<MenuItem> {
     let mut items: Vec<MenuItem> = SortKey::ALL
         .iter()
@@ -138,56 +192,93 @@ pub fn sort_menu(spec: SortSpec) -> Vec<MenuItem> {
     items
 }
 
-/// Build the menu for `target`, laid out like Explorer's classic context menu:
-/// open actions, then Cut / Copy / Paste, then shortcut / Delete / Rename, then
-/// Properties. `can_paste` is whether the file clipboard holds anything.
-pub fn build_menu(
-    target: &MenuTarget,
-    can_paste: bool,
-    view: ViewMode,
-    show_hidden: bool,
-) -> Vec<MenuItem> {
+fn view_menu(view: ViewMode) -> Vec<MenuItem> {
+    use MenuAction::SetView;
+    vec![
+        checked(
+            action(SetView(ViewMode::Icons), "as Icons", Some("⌘1"), true),
+            view == ViewMode::Icons,
+        ),
+        checked(
+            action(SetView(ViewMode::List), "as List", Some("⌘2"), true),
+            view == ViewMode::List,
+        ),
+        checked(
+            action(SetView(ViewMode::Columns), "as Columns", Some("⌘3"), true),
+            view == ViewMode::Columns,
+        ),
+    ]
+}
+
+fn compress_menu() -> Vec<MenuItem> {
+    CompressFormat::ALL
+        .iter()
+        .map(|format| action(MenuAction::Compress(*format), &format.label(), None, true))
+        .collect()
+}
+
+/// Open With submenu: the default app first, the rest alphabetical, then "Other…".
+fn open_with_menu(open_with: &OpenWith) -> Vec<MenuItem> {
+    let mut items = match open_with {
+        OpenWith::Loading => vec![action(MenuAction::Nothing, "Loading…", None, false)],
+        OpenWith::Apps(names) if names.is_empty() => {
+            vec![action(MenuAction::Nothing, "No applications", None, false)]
+        }
+        OpenWith::Apps(names) => {
+            let mut rows: Vec<MenuItem> = names
+                .iter()
+                .enumerate()
+                .map(|(index, name)| {
+                    let label = if index == 0 {
+                        format!("{name} (default)")
+                    } else {
+                        name.clone()
+                    };
+                    action(MenuAction::OpenWith(index), &label, None, true)
+                })
+                .collect();
+            if rows.len() > 1 {
+                rows.insert(1, MenuItem::Separator);
+            }
+            rows
+        }
+    };
+    items.push(MenuItem::Separator);
+    items.push(action(MenuAction::OpenWithOther, "Other…", None, true));
+    items
+}
+
+/// Build the menu for `target`.
+pub fn build_menu(target: &MenuTarget, ctx: &MenuContext) -> Vec<MenuItem> {
     use MenuAction::*;
     match target {
         MenuTarget::Background => vec![
             action(Refresh, "Refresh", Some("⌘R"), true),
             MenuItem::Separator,
-            action(Paste, "Paste", Some("⌘V"), can_paste),
+            action(Paste, "Paste", Some("⌘V"), ctx.can_paste),
             MenuItem::Separator,
             action(NewFolder, "New folder", Some("⇧⌘N"), true),
             action(OpenInTerminal, "Open in Terminal", None, true),
             MenuItem::Separator,
-            checked(
-                action(SetView(ViewMode::Icons), "View as Icons", Some("⌘1"), true),
-                view == ViewMode::Icons,
-            ),
-            checked(
-                action(SetView(ViewMode::List), "View as List", Some("⌘2"), true),
-                view == ViewMode::List,
-            ),
-            checked(
-                action(
-                    SetView(ViewMode::Columns),
-                    "View as Columns",
-                    Some("⌘3"),
-                    true,
-                ),
-                view == ViewMode::Columns,
-            ),
-            MenuItem::Separator,
+            submenu("Sort By", sort_menu(ctx.sort)),
+            submenu("View", view_menu(ctx.view)),
             checked(
                 action(ToggleHidden, "Show hidden files", Some("⇧⌘."), true),
-                show_hidden,
+                ctx.show_hidden,
             ),
         ],
         MenuTarget::Items {
             count,
             is_dir,
+            files_only,
             archive_stem,
         } => {
             let single = *count == 1;
             let folder = single && *is_dir;
             let mut items = vec![action(Open, "Open", Some("⌘O"), true)];
+            if *files_only {
+                items.push(submenu("Open With", open_with_menu(&ctx.open_with)));
+            }
             if folder {
                 items.push(action(OpenInNewTab, "Open in new tab", None, true));
                 items.push(action(OpenInTerminal, "Open in Terminal", None, true));
@@ -205,21 +296,13 @@ pub fn build_menu(
                     true,
                 ));
             }
-            for format in CompressFormat::ALL {
-                items.push(action(
-                    Compress(format),
-                    &format!("Compress to {}", format.label()),
-                    None,
-                    true,
-                ));
-            }
-            items.push(MenuItem::Separator);
+            items.push(submenu("Compress to", compress_menu()));
             items.push(action(CopyPath, "Copy as path", Some("⇧⌘C"), true));
             items.push(MenuItem::Separator);
             items.push(action(Cut, "Cut", Some("⌘X"), true));
             items.push(action(Copy, "Copy", Some("⌘C"), true));
             if folder {
-                items.push(action(PasteInto, "Paste", Some("⌘V"), can_paste));
+                items.push(action(PasteInto, "Paste", Some("⌘V"), ctx.can_paste));
             }
             items.push(MenuItem::Separator);
             items.push(action(CreateShortcut, "Create shortcut", None, true));
@@ -233,6 +316,7 @@ pub fn build_menu(
 }
 
 pub const MENU_WIDTH: f32 = 248.0;
+pub const SUBMENU_WIDTH: f32 = 208.0;
 pub const ITEM_HEIGHT: f32 = 24.0;
 pub const SEPARATOR_HEIGHT: f32 = 9.0;
 pub const MENU_PADDING: f32 = 4.0;
@@ -242,7 +326,7 @@ pub fn menu_height(items: &[MenuItem]) -> f32 {
     let rows: f32 = items
         .iter()
         .map(|item| match item {
-            MenuItem::Action(_) => ITEM_HEIGHT,
+            MenuItem::Action(_) | MenuItem::Submenu(_) => ITEM_HEIGHT,
             MenuItem::Separator => SEPARATOR_HEIGHT,
         })
         .sum();
@@ -265,40 +349,107 @@ pub fn clamp_origin(cursor: (f32, f32), menu: (f32, f32), window: (f32, f32)) ->
     )
 }
 
+/// Where a flyout opens: level with its parent row, to the right of the parent
+/// menu, flipping to the left when the right side has no room and sliding up if
+/// it would run off the bottom.
+pub fn submenu_origin(
+    parent_items: &[MenuItem],
+    row: usize,
+    parent_origin: (f32, f32),
+    sub: (f32, f32),
+    window: (f32, f32),
+) -> (f32, f32) {
+    let rows_above: f32 = parent_items
+        .iter()
+        .take(row)
+        .map(|item| match item {
+            MenuItem::Separator => SEPARATOR_HEIGHT,
+            _ => ITEM_HEIGHT,
+        })
+        .sum();
+    // Overlap the parent by a few pixels so the pointer never crosses a gap.
+    let overlap = 4.0;
+    let right = parent_origin.0 + MENU_WIDTH - overlap;
+    let x = if right + sub.0 <= window.0 {
+        right
+    } else {
+        (parent_origin.0 - sub.0 + overlap).max(0.0)
+    };
+    let top = parent_origin.1 + MENU_PADDING + rows_above - MENU_PADDING;
+    let y = if top + sub.1 <= window.1 {
+        top
+    } else {
+        (window.1 - sub.1).max(0.0)
+    };
+    (x, y)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn labels(items: &[MenuItem]) -> Vec<&str> {
+    fn ctx() -> MenuContext {
+        MenuContext::default()
+    }
+
+    /// Every action in the menu, descending into submenus.
+    fn flatten(items: &[MenuItem]) -> Vec<&ActionItem> {
+        let mut out = Vec::new();
+        for item in items {
+            match item {
+                MenuItem::Action(a) => out.push(a),
+                MenuItem::Submenu(sub) => out.extend(flatten(&sub.items)),
+                MenuItem::Separator => {}
+            }
+        }
+        out
+    }
+
+    fn top_labels(items: &[MenuItem]) -> Vec<&str> {
         items
             .iter()
             .filter_map(|item| match item {
                 MenuItem::Action(a) => Some(a.label.as_str()),
+                MenuItem::Submenu(s) => Some(s.label.as_str()),
                 MenuItem::Separator => None,
             })
             .collect()
     }
 
     fn find(items: &[MenuItem], wanted: MenuAction) -> &ActionItem {
-        items
-            .iter()
-            .find_map(|item| match item {
-                MenuItem::Action(a) if a.action == wanted => Some(a),
-                _ => None,
-            })
+        flatten(items)
+            .into_iter()
+            .find(|a| a.action == wanted)
             .expect("menu has the action")
     }
 
     fn has(items: &[MenuItem], wanted: MenuAction) -> bool {
+        flatten(items).iter().any(|a| a.action == wanted)
+    }
+
+    fn sub<'a>(items: &'a [MenuItem], label: &str) -> &'a SubMenu {
         items
             .iter()
-            .any(|item| matches!(item, MenuItem::Action(a) if a.action == wanted))
+            .find_map(|item| match item {
+                MenuItem::Submenu(s) if s.label == label => Some(s),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("no submenu {label}"))
+    }
+
+    fn checked_actions(items: &[MenuItem]) -> Vec<MenuAction> {
+        flatten(items)
+            .into_iter()
+            .filter(|a| a.checked)
+            .map(|a| a.action)
+            .collect()
     }
 
     fn files(count: usize) -> MenuTarget {
         MenuTarget::Items {
             count,
             is_dir: false,
+            files_only: true,
             archive_stem: None,
         }
     }
@@ -307,6 +458,7 @@ mod tests {
         MenuTarget::Items {
             count: 1,
             is_dir: true,
+            files_only: false,
             archive_stem: None,
         }
     }
@@ -315,14 +467,15 @@ mod tests {
         MenuTarget::Items {
             count: 1,
             is_dir: false,
+            files_only: true,
             archive_stem: Some("photos".to_string()),
         }
     }
 
     #[test]
     fn file_menu_has_the_explorer_core_in_order() {
-        let items = build_menu(&files(1), false, ViewMode::List, false);
-        let labels = labels(&items);
+        let items = build_menu(&files(1), &ctx());
+        let labels = top_labels(&items);
         let at = |label: &str| labels.iter().position(|l| *l == label).unwrap();
         assert_eq!(labels[0], "Open");
         assert!(at("Cut") < at("Copy"));
@@ -334,10 +487,8 @@ mod tests {
     #[test]
     fn no_finder_only_commands_remain() {
         for target in [files(1), folder(), MenuTarget::Background] {
-            let labels = labels(&build_menu(&target, true, ViewMode::List, false))
-                .iter()
-                .map(|l| l.to_string())
-                .collect::<Vec<_>>();
+            let items = build_menu(&target, &ctx());
+            let labels: Vec<String> = flatten(&items).iter().map(|a| a.label.clone()).collect();
             for banned in ["Duplicate", "Make Alias", "Get Info", "Move to Trash"] {
                 assert!(!labels.iter().any(|l| l == banned), "{banned}");
             }
@@ -346,7 +497,7 @@ mod tests {
 
     #[test]
     fn several_items_disable_rename_and_properties_but_not_delete() {
-        let items = build_menu(&files(3), false, ViewMode::List, false);
+        let items = build_menu(&files(3), &ctx());
         assert!(!find(&items, MenuAction::Rename).enabled);
         assert!(!find(&items, MenuAction::Properties).enabled);
         assert!(find(&items, MenuAction::Delete).enabled);
@@ -355,92 +506,153 @@ mod tests {
 
     #[test]
     fn folders_gain_tab_terminal_and_paste_into() {
-        let items = build_menu(&folder(), true, ViewMode::List, false);
+        let with_clipboard = MenuContext {
+            can_paste: true,
+            ..ctx()
+        };
+        let items = build_menu(&folder(), &with_clipboard);
         assert!(has(&items, MenuAction::OpenInNewTab));
         assert!(has(&items, MenuAction::OpenInTerminal));
         assert!(find(&items, MenuAction::PasteInto).enabled);
-        assert!(
-            !find(
-                &build_menu(&folder(), false, ViewMode::List, false),
-                MenuAction::PasteInto
-            )
-            .enabled
-        );
+        assert!(!find(&build_menu(&folder(), &ctx()), MenuAction::PasteInto).enabled);
         assert!(!has(
-            &build_menu(&files(1), true, ViewMode::List, false),
+            &build_menu(&files(1), &with_clipboard),
             MenuAction::PasteInto
         ));
     }
 
     #[test]
-    fn every_compress_format_is_offered_for_any_selection() {
+    fn single_files_can_be_previewed_but_folders_cannot() {
+        assert!(has(&build_menu(&files(1), &ctx()), MenuAction::Preview));
+        assert!(!has(&build_menu(&folder(), &ctx()), MenuAction::Preview));
+        assert!(!has(&build_menu(&files(2), &ctx()), MenuAction::Preview));
+    }
+
+    #[test]
+    fn compress_formats_live_in_a_submenu_not_the_top_level() {
         for target in [files(1), files(3), folder(), archive()] {
-            let items = build_menu(&target, false, ViewMode::List, false);
+            let items = build_menu(&target, &ctx());
+            let compress = sub(&items, "Compress to");
+            assert_eq!(compress.items.len(), CompressFormat::ALL.len());
             for format in CompressFormat::ALL {
-                assert!(has(&items, MenuAction::Compress(format)), "{format:?}");
+                assert!(
+                    has(&compress.items, MenuAction::Compress(format)),
+                    "{format:?}"
+                );
             }
+            assert!(
+                !items
+                    .iter()
+                    .any(|i| matches!(i, MenuItem::Action(a) if matches!(a.action, MenuAction::Compress(_)))),
+                "no format sits at the top level"
+            );
         }
-        assert!(
-            labels(&build_menu(&files(1), false, ViewMode::List, false))
-                .contains(&"Compress to ZIP file")
-        );
-        assert!(
-            labels(&build_menu(&files(1), false, ViewMode::List, false))
-                .contains(&"Compress to TAR.GZ")
-        );
+        let items = build_menu(&files(1), &ctx());
+        let labels: Vec<&str> = sub(&items, "Compress to")
+            .items
+            .iter()
+            .filter_map(|i| match i {
+                MenuItem::Action(a) => Some(a.label.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels[0], "ZIP file");
+        assert!(labels.contains(&"TAR.GZ"));
     }
 
     #[test]
     fn archives_offer_extraction_named_after_their_stem() {
-        let items = build_menu(&archive(), false, ViewMode::List, false);
+        let items = build_menu(&archive(), &ctx());
         assert!(has(&items, MenuAction::ExtractHere));
-        assert!(labels(&items).contains(&"Extract to “photos/”"));
+        assert!(top_labels(&items).contains(&"Extract to “photos/”"));
     }
 
     #[test]
     fn only_a_single_archive_offers_extraction() {
         assert!(!has(
-            &build_menu(&files(1), false, ViewMode::List, false),
+            &build_menu(&files(1), &ctx()),
             MenuAction::ExtractHere
         ));
-        assert!(!has(
-            &build_menu(&folder(), false, ViewMode::List, false),
-            MenuAction::ExtractTo
-        ));
+        assert!(!has(&build_menu(&folder(), &ctx()), MenuAction::ExtractTo));
         let many = MenuTarget::Items {
             count: 2,
             is_dir: false,
+            files_only: true,
             archive_stem: Some("a".into()),
         };
-        assert!(!has(
-            &build_menu(&many, false, ViewMode::List, false),
-            MenuAction::ExtractHere
-        ));
+        assert!(!has(&build_menu(&many, &ctx()), MenuAction::ExtractHere));
     }
 
     #[test]
-    fn single_files_can_be_previewed_but_folders_cannot() {
-        assert!(has(
-            &build_menu(&files(1), false, ViewMode::List, false),
-            MenuAction::Preview
-        ));
-        assert!(!has(
-            &build_menu(&folder(), false, ViewMode::List, false),
-            MenuAction::Preview
-        ));
-        assert!(!has(
-            &build_menu(&files(2), false, ViewMode::List, false),
-            MenuAction::Preview
-        ));
+    fn open_with_appears_for_files_only() {
+        assert!(top_labels(&build_menu(&files(1), &ctx())).contains(&"Open With"));
+        assert!(top_labels(&build_menu(&files(3), &ctx())).contains(&"Open With"));
+        assert!(!top_labels(&build_menu(&folder(), &ctx())).contains(&"Open With"));
+        let mixed = MenuTarget::Items {
+            count: 2,
+            is_dir: false,
+            files_only: false,
+            archive_stem: None,
+        };
+        assert!(!top_labels(&build_menu(&mixed, &ctx())).contains(&"Open With"));
+    }
+
+    #[test]
+    fn open_with_shows_loading_until_the_app_list_arrives() {
+        let items = build_menu(&files(1), &ctx());
+        let open_with = sub(&items, "Open With");
+        let loading = find(&open_with.items, MenuAction::Nothing);
+        assert_eq!(loading.label, "Loading…");
+        assert!(!loading.enabled);
+        assert!(has(&open_with.items, MenuAction::OpenWithOther));
+    }
+
+    #[test]
+    fn open_with_lists_apps_with_the_default_first_and_marked() {
+        let ready = MenuContext {
+            open_with: OpenWith::Apps(vec!["Preview".into(), "Pixelmator".into()]),
+            ..ctx()
+        };
+        let items = build_menu(&files(1), &ready);
+        let open_with = sub(&items, "Open With");
+        assert_eq!(
+            find(&open_with.items, MenuAction::OpenWith(0)).label,
+            "Preview (default)"
+        );
+        assert_eq!(
+            find(&open_with.items, MenuAction::OpenWith(1)).label,
+            "Pixelmator"
+        );
+        assert!(!has(&open_with.items, MenuAction::Nothing));
+        assert!(find(&open_with.items, MenuAction::OpenWithOther).enabled);
+    }
+
+    #[test]
+    fn open_with_with_no_apps_still_offers_other() {
+        let none = MenuContext {
+            open_with: OpenWith::Apps(Vec::new()),
+            ..ctx()
+        };
+        let items = build_menu(&files(1), &none);
+        let open_with = sub(&items, "Open With");
+        assert_eq!(
+            find(&open_with.items, MenuAction::Nothing).label,
+            "No applications"
+        );
+        assert!(has(&open_with.items, MenuAction::OpenWithOther));
     }
 
     #[test]
     fn background_menu_pastes_only_with_a_clipboard() {
-        let empty = build_menu(&MenuTarget::Background, false, ViewMode::List, false);
+        let empty = build_menu(&MenuTarget::Background, &ctx());
         assert!(!find(&empty, MenuAction::Paste).enabled);
+        let full = MenuContext {
+            can_paste: true,
+            ..ctx()
+        };
         assert!(
             find(
-                &build_menu(&MenuTarget::Background, true, ViewMode::List, false),
+                &build_menu(&MenuTarget::Background, &full),
                 MenuAction::Paste
             )
             .enabled
@@ -449,9 +661,69 @@ mod tests {
     }
 
     #[test]
+    fn background_menu_folds_sort_and_view_into_submenus() {
+        let items = build_menu(&MenuTarget::Background, &ctx());
+        let sort = sub(&items, "Sort By");
+        for key in SortKey::ALL {
+            assert!(has(&sort.items, MenuAction::SortBy(key)), "{key:?}");
+        }
+        let view = sub(&items, "View");
+        assert_eq!(flatten(&view.items).len(), 3);
+    }
+
+    #[test]
+    fn background_submenus_check_the_current_sort_and_view() {
+        for mode in [ViewMode::Icons, ViewMode::List, ViewMode::Columns] {
+            let items = build_menu(
+                &MenuTarget::Background,
+                &MenuContext {
+                    view: mode,
+                    ..ctx()
+                },
+            );
+            let view = sub(&items, "View");
+            assert_eq!(
+                checked_actions(&view.items),
+                [MenuAction::SetView(mode)],
+                "{mode:?}"
+            );
+        }
+        let items = build_menu(
+            &MenuTarget::Background,
+            &MenuContext {
+                sort: SortSpec::new(SortKey::Size, true),
+                ..ctx()
+            },
+        );
+        let checked = checked_actions(&sub(&items, "Sort By").items);
+        assert!(checked.contains(&MenuAction::SortBy(SortKey::Size)));
+        assert!(checked.contains(&MenuAction::SortDescending(true)));
+    }
+
+    #[test]
+    fn background_menu_reflects_whether_hidden_files_are_shown() {
+        let off = build_menu(&MenuTarget::Background, &ctx());
+        assert!(!checked_actions(&off).contains(&MenuAction::ToggleHidden));
+        let on = build_menu(
+            &MenuTarget::Background,
+            &MenuContext {
+                show_hidden: true,
+                ..ctx()
+            },
+        );
+        assert!(checked_actions(&on).contains(&MenuAction::ToggleHidden));
+    }
+
+    #[test]
     fn no_menu_starts_or_ends_with_a_separator_or_doubles_one() {
-        for target in [MenuTarget::Background, files(1), files(2), folder()] {
-            let items = build_menu(&target, true, ViewMode::List, false);
+        for target in [
+            MenuTarget::Background,
+            files(1),
+            files(2),
+            folder(),
+            archive(),
+        ] {
+            let items = build_menu(&target, &ctx());
             assert_ne!(items.first(), Some(&MenuItem::Separator));
             assert_ne!(items.last(), Some(&MenuItem::Separator));
             assert!(
@@ -462,19 +734,9 @@ mod tests {
         }
     }
 
-    fn checked_actions(items: &[MenuItem]) -> Vec<MenuAction> {
-        items
-            .iter()
-            .filter_map(|item| match item {
-                MenuItem::Action(a) if a.checked => Some(a.action),
-                _ => None,
-            })
-            .collect()
-    }
-
     #[test]
     fn sort_menu_lists_every_key_and_checks_the_current_one() {
-        let items = build_sort_for_test(SortKey::Size, false);
+        let items = sort_menu(SortSpec::new(SortKey::Size, false));
         let checked = checked_actions(&items);
         assert!(checked.contains(&MenuAction::SortBy(SortKey::Size)));
         assert!(!checked.contains(&MenuAction::SortBy(SortKey::Name)));
@@ -485,10 +747,10 @@ mod tests {
 
     #[test]
     fn sort_menu_checks_exactly_one_direction() {
-        let asc = checked_actions(&build_sort_for_test(SortKey::Name, false));
+        let asc = checked_actions(&sort_menu(SortSpec::new(SortKey::Name, false)));
         assert!(asc.contains(&MenuAction::SortDescending(false)));
         assert!(!asc.contains(&MenuAction::SortDescending(true)));
-        let desc = checked_actions(&build_sort_for_test(SortKey::Name, true));
+        let desc = checked_actions(&sort_menu(SortSpec::new(SortKey::Name, true)));
         assert!(desc.contains(&MenuAction::SortDescending(true)));
         assert!(!desc.contains(&MenuAction::SortDescending(false)));
     }
@@ -510,37 +772,15 @@ mod tests {
         assert_eq!(sort_key_label(SortKey::Created), "Date Created");
     }
 
-    fn build_sort_for_test(key: SortKey, descending: bool) -> Vec<MenuItem> {
-        sort_menu(SortSpec::new(key, descending))
-    }
-
     #[test]
-    fn background_menu_checks_the_current_view() {
-        for mode in [ViewMode::Icons, ViewMode::List, ViewMode::Columns] {
-            let items = build_menu(&MenuTarget::Background, false, mode, false);
-            assert_eq!(
-                checked_actions(&items),
-                [MenuAction::SetView(mode)],
-                "{mode:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn background_menu_reflects_whether_hidden_files_are_shown() {
-        let off = build_menu(&MenuTarget::Background, false, ViewMode::List, false);
-        assert!(!checked_actions(&off).contains(&MenuAction::ToggleHidden));
-        let on = build_menu(&MenuTarget::Background, false, ViewMode::List, true);
-        assert!(checked_actions(&on).contains(&MenuAction::ToggleHidden));
-        assert!(has(&off, MenuAction::ToggleHidden));
-    }
-
-    #[test]
-    fn menu_height_counts_rows_separators_and_padding() {
+    fn menu_height_counts_rows_separators_submenus_and_padding() {
         let items = vec![
             action(MenuAction::Open, "Open", None, true),
             MenuItem::Separator,
-            action(MenuAction::Delete, "Delete", None, true),
+            submenu(
+                "More",
+                vec![action(MenuAction::Delete, "Delete", None, true)],
+            ),
         ];
         assert_eq!(
             menu_height(&items),
@@ -568,5 +808,32 @@ mod tests {
             clamp_origin((10.0, 10.0), (500.0, 500.0), (300.0, 300.0)),
             (0.0, 0.0)
         );
+    }
+
+    fn rows() -> Vec<MenuItem> {
+        vec![
+            action(MenuAction::Open, "Open", None, true),
+            MenuItem::Separator,
+            submenu("Compress to", Vec::new()),
+        ]
+    }
+
+    #[test]
+    fn flyout_opens_level_with_its_row_to_the_right() {
+        let (x, y) = submenu_origin(&rows(), 2, (100.0, 50.0), (200.0, 100.0), (1000.0, 800.0));
+        assert_eq!(x, 100.0 + MENU_WIDTH - 4.0);
+        assert_eq!(y, 50.0 + ITEM_HEIGHT + SEPARATOR_HEIGHT);
+    }
+
+    #[test]
+    fn flyout_flips_left_when_the_right_edge_is_too_close() {
+        let (x, _) = submenu_origin(&rows(), 2, (800.0, 50.0), (200.0, 100.0), (1000.0, 800.0));
+        assert_eq!(x, 800.0 - 200.0 + 4.0);
+    }
+
+    #[test]
+    fn flyout_slides_up_to_stay_inside_the_window() {
+        let (_, y) = submenu_origin(&rows(), 2, (100.0, 700.0), (200.0, 300.0), (1000.0, 800.0));
+        assert_eq!(y, 500.0);
     }
 }

@@ -15,18 +15,21 @@ use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent,
     MouseButton, Render, Subscription, Window, div, prelude::*, px, svg,
 };
+mod menu_view;
+
 use vfs_core::{FsWatcher, VfsUri, WatchEvent};
 
 use crate::{
     actions::*,
     clipboard::FileClipboard,
     context_menu::{
-        ActionItem, MENU_PADDING, MENU_WIDTH, MenuAction, MenuItem, MenuTarget, build_menu,
-        clamp_origin, menu_height, sort_menu,
+        ActionItem, MENU_PADDING, MENU_WIDTH, MenuAction, MenuContext, MenuItem, MenuTarget,
+        OpenWith, build_menu, clamp_origin, menu_height, sort_menu,
     },
     icons,
     info::info_rows,
     listing::{Place, expand_home, favorite_places, location_places, place_is_current},
+    open_with::{self, AppInfo},
     palette::{Palette, PaletteChoice, PaletteEvent, PaletteMode},
     pane::{Pane, PaneEvent, PaneSide, Services},
     preview::PreviewView,
@@ -45,8 +48,16 @@ pub(crate) enum InlinePrompt {
 /// An open right-click menu. The origin is the raw cursor position; it is
 /// clamped to the window at render time, when the window size is known.
 pub(crate) struct OpenMenu {
+    /// Distinguishes this menu from a later one when async results arrive.
+    id: u64,
     origin: (f32, f32),
     items: Vec<MenuItem>,
+    /// Index of the top-level submenu row whose flyout is showing.
+    open_sub: Option<usize>,
+    target: MenuTarget,
+    ctx: MenuContext,
+    /// Applications behind the Open With rows, in menu order.
+    apps: Vec<AppInfo>,
 }
 
 /// The Get Info window's subject plus its slowly computed folder size.
@@ -74,6 +85,10 @@ pub struct Workspace {
     /// Paths copied with Copy / "Copy Item", pasted by Paste Item.
     clipboard: FileClipboard,
     menu: Option<OpenMenu>,
+    menu_counter: u64,
+    /// Open With applications of the menu that was just closed by a click.
+    menu_apps: Vec<AppInfo>,
+    home: PathBuf,
     info: Option<InfoState>,
     /// Finder-style shortcuts down the left edge.
     places: Vec<Place>,
@@ -132,6 +147,9 @@ impl Workspace {
             split: false,
             clipboard: FileClipboard::default(),
             menu: None,
+            menu_counter: 0,
+            menu_apps: Vec::new(),
+            home: home_dir.clone(),
             info: None,
             places: favorite_places(&home_dir),
             prompt: None,
@@ -228,6 +246,7 @@ impl Workspace {
             (true, Some(first)) => MenuTarget::Items {
                 count: selection.len(),
                 is_dir: selection.len() == 1 && first.is_dir(),
+                files_only: selection.iter().all(|entry| !entry.is_dir()),
                 archive_stem: (selection.len() == 1 && !first.is_dir())
                     .then(|| vfs_core::archive::ArchiveKind::detect(&first.name))
                     .flatten()
@@ -235,26 +254,145 @@ impl Workspace {
             },
             _ => MenuTarget::Background,
         };
+        let (view, show_hidden, sort) = {
+            let pane = self.focused_pane().read(cx);
+            (pane.view, pane.listing.show_hidden, pane.sort)
+        };
+        let ctx = MenuContext {
+            can_paste: !self.clipboard.is_empty(),
+            view,
+            show_hidden,
+            sort,
+            open_with: OpenWith::Loading,
+        };
+        self.menu_counter += 1;
+        let id = self.menu_counter;
+        let wants_apps = matches!(
+            &target,
+            MenuTarget::Items {
+                files_only: true,
+                ..
+            }
+        );
         self.menu = Some(OpenMenu {
+            id,
             origin: (f32::from(position.x), f32::from(position.y)),
-            items: build_menu(
-                &target,
-                !self.clipboard.is_empty(),
-                self.focused_pane().read(cx).view,
-                self.focused_pane().read(cx).listing.show_hidden,
-            ),
+            items: build_menu(&target, &ctx),
+            open_sub: None,
+            target,
+            ctx,
+            apps: Vec::new(),
         });
         cx.notify();
+        if wants_apps {
+            let first = selection.iter().find_map(|entry| entry.uri.as_local_path());
+            if let Some(path) = first {
+                self.load_open_with(id, path, cx);
+            }
+        }
+    }
+
+    /// Ask LaunchServices which apps can open `path`, off the UI thread, and fill
+    /// the Open With submenu when the answer lands (if that menu is still open).
+    fn load_open_with(&mut self, id: u64, path: PathBuf, cx: &mut Context<Self>) {
+        let home = self.home.clone();
+        cx.spawn(async move |this, cx| {
+            let apps = cx
+                .background_executor()
+                .spawn(async move { open_with::list_apps(&path, &home) })
+                .await
+                .unwrap_or_default();
+            this.update(cx, |workspace, cx| {
+                let Some(menu) = workspace.menu.as_mut().filter(|menu| menu.id == id) else {
+                    return;
+                };
+                menu.ctx.open_with =
+                    OpenWith::Apps(apps.iter().map(|app| app.name.clone()).collect());
+                menu.apps = apps;
+                menu.items = build_menu(&menu.target, &menu.ctx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// The toolbar's "Sort By" menu, dropped just below the click.
     fn open_sort_menu(&mut self, at: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
         let spec = self.focused_pane().read(cx).sort;
+        self.menu_counter += 1;
         self.menu = Some(OpenMenu {
+            id: self.menu_counter,
             origin: (f32::from(at.x), f32::from(at.y) + 14.0),
             items: sort_menu(spec),
+            open_sub: None,
+            target: MenuTarget::Background,
+            ctx: MenuContext::default(),
+            apps: Vec::new(),
         });
         cx.notify();
+    }
+
+    fn set_open_sub(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
+        if let Some(menu) = self.menu.as_mut()
+            && menu.open_sub != index
+        {
+            menu.open_sub = index;
+            cx.notify();
+        }
+    }
+
+    /// Close the menu but remember its app list: a click on "Open With ▸ Zed"
+    /// closes the menu first and then needs to know what "Zed" was.
+    fn close_menu_keeping_apps(&mut self) {
+        if let Some(menu) = self.menu.take() {
+            self.menu_apps = menu.apps;
+        }
+    }
+
+    /// Open the selected files with `app`.
+    fn open_selection_with(&mut self, app: AppInfo, cx: &mut Context<Self>) {
+        let files = self.open_with_files(cx);
+        if let Err(message) = open_with::open_with(&app.path, &files) {
+            self.banner = Some((message, std::time::Instant::now()));
+        }
+    }
+
+    fn open_with_files(&self, cx: &mut Context<Self>) -> Vec<PathBuf> {
+        self.focused_pane()
+            .read(cx)
+            .selection_or_cursor()
+            .iter()
+            .filter(|entry| !entry.is_dir())
+            .filter_map(|entry| entry.uri.as_local_path())
+            .collect()
+    }
+
+    /// "Other…": let the user pick any application.
+    fn open_selection_with_other(&mut self, cx: &mut Context<Self>) {
+        let files = self.open_with_files(cx);
+        let chosen = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: true,
+            multiple: false,
+            prompt: Some("Open".into()),
+        });
+        cx.spawn(async move |this, cx| {
+            let Ok(Ok(Some(paths))) = chosen.await else {
+                return;
+            };
+            let Some(app) = paths.into_iter().next() else {
+                return;
+            };
+            if let Err(message) = open_with::open_with(&app, &files) {
+                this.update(cx, |workspace, cx| {
+                    workspace.banner = Some((message, std::time::Instant::now()));
+                    cx.notify();
+                })
+                .ok();
+            }
+        })
+        .detach();
     }
 
     fn show_tasks(&mut self, cx: &mut Context<Self>) {
@@ -334,7 +472,14 @@ impl Workspace {
     fn run_menu_action(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
         let pane = self.focused_pane();
         match action {
+            MenuAction::Nothing => {}
             MenuAction::Open => pane.update(cx, |pane, cx| pane.open_selection(cx)),
+            MenuAction::OpenWith(index) => {
+                if let Some(app) = self.menu_apps.get(index).cloned() {
+                    self.open_selection_with(app, cx);
+                }
+            }
+            MenuAction::OpenWithOther => self.open_selection_with_other(cx),
             MenuAction::OpenInNewTab => {
                 if let Some(entry) = pane.read(cx).cursor_entry().cloned() {
                     pane.update(cx, |pane, cx| pane.open_in_new_tab(entry.uri, cx));
@@ -1234,150 +1379,6 @@ impl Render for Workspace {
 }
 
 impl Workspace {
-    fn render_context_menu(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let menu = self.menu.as_ref()?;
-        let viewport = window.viewport_size();
-        let height = menu_height(&menu.items);
-        let (x, y) = clamp_origin(
-            menu.origin,
-            (MENU_WIDTH, height),
-            (f32::from(viewport.width), f32::from(viewport.height)),
-        );
-
-        let has_checks = menu
-            .items
-            .iter()
-            .any(|item| matches!(item, MenuItem::Action(a) if a.checked));
-        let rows = menu
-            .items
-            .iter()
-            .enumerate()
-            .map(|(index, item)| match item {
-                MenuItem::Separator => div()
-                    .my(px(4.))
-                    .mx_2()
-                    .h(px(1.))
-                    .bg(theme::border_soft())
-                    .into_any_element(),
-                MenuItem::Action(ActionItem {
-                    action,
-                    label,
-                    shortcut,
-                    enabled,
-                    checked,
-                }) => {
-                    let action = *action;
-                    let checked = *checked;
-                    let entity = cx.entity();
-                    let row = div()
-                        .id(gpui::ElementId::Name(format!("menu-item-{index}").into()))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .justify_between()
-                        .gap_4()
-                        .h(px(crate::context_menu::ITEM_HEIGHT))
-                        .px_2()
-                        .rounded_sm()
-                        .text_sm()
-                        .child(
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .gap_1()
-                                .min_w_0()
-                                // Menus with check marks reserve a column for them,
-                                // so labels line up whether or not a row is checked.
-                                .when(has_checks, |this| {
-                                    this.child(div().w(px(14.)).flex_shrink_0().when(
-                                        checked,
-                                        |this| {
-                                            this.child(
-                                                svg()
-                                                    .path(icons::CHECK)
-                                                    .w(px(12.))
-                                                    .h(px(12.))
-                                                    .text_color(theme::text()),
-                                            )
-                                        },
-                                    ))
-                                })
-                                .child(div().truncate().min_w_0().child(label.clone())),
-                        )
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .text_xs()
-                                .opacity(0.7)
-                                .child(shortcut.unwrap_or("")),
-                        );
-                    if *enabled {
-                        row.text_color(theme::text())
-                            .cursor_pointer()
-                            .hover(|this| this.bg(theme::bg_selected()).text_color(gpui::white()))
-                            .on_click(move |_, window, cx| {
-                                entity.update(cx, |workspace, cx| {
-                                    workspace.menu = None;
-                                    workspace.run_menu_action(action, window, cx);
-                                });
-                            })
-                            .into_any_element()
-                    } else {
-                        row.text_color(theme::text_faint()).into_any_element()
-                    }
-                }
-            });
-
-        let entity = cx.entity();
-        let close_left = entity.clone();
-        Some(
-            div()
-                .absolute()
-                .top(px(0.))
-                .left(px(0.))
-                .right(px(0.))
-                .bottom(px(0.))
-                .occlude()
-                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                    close_left.update(cx, |workspace, cx| {
-                        workspace.menu = None;
-                        cx.notify();
-                    });
-                })
-                .on_mouse_down(MouseButton::Right, move |_, _, cx| {
-                    entity.update(cx, |workspace, cx| {
-                        workspace.menu = None;
-                        cx.notify();
-                    });
-                })
-                .child(
-                    div()
-                        .absolute()
-                        .left(px(x))
-                        .top(px(y))
-                        .w(px(MENU_WIDTH))
-                        .flex()
-                        .flex_col()
-                        .p(px(MENU_PADDING))
-                        .rounded_lg()
-                        .bg(theme::bg_raised())
-                        .border_1()
-                        .border_color(theme::border())
-                        .shadow_lg()
-                        // Clicks inside the menu must not reach the dismissing backdrop.
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
-                        .children(rows),
-                )
-                .into_any_element(),
-        )
-    }
-
     /// Quick Look: a large preview of the cursor entry, closed with Space or Esc.
     fn render_quick_look(&mut self, window: &Window) -> Option<AnyElement> {
         if !self.quick_look_open {
