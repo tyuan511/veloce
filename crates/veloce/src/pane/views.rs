@@ -128,12 +128,18 @@ impl Pane {
         let store = self.services.persist.store();
         cx.spawn(async move |this, cx| {
             let job_path = path.clone();
-            let bytes =
-                cx.background_executor()
-                    .spawn(async move {
-                        thumbs::thumbnail_bytes(store.as_deref(), &job_path, &ext, stamp)
-                    })
-                    .await;
+            let bytes = cx
+                .background_executor()
+                .spawn(async move {
+                    thumbs::thumbnail_bytes(
+                        store.as_deref(),
+                        &job_path,
+                        &ext,
+                        stamp,
+                        thumbs::THUMB_PIXELS,
+                    )
+                })
+                .await;
             this.update(cx, |pane, cx| {
                 pane.thumbs_in_flight = pane.thumbs_in_flight.saturating_sub(1);
                 let state = match bytes {

@@ -82,6 +82,9 @@ impl Persist {
                 let pruning = store.clone();
                 std::thread::spawn(move || {
                     let _ = pruning.prune_thumbnails(crate::thumbs::CACHE_LIMIT_BYTES);
+                    // Older builds kept preview renders as loose files in the
+                    // system temp directory; they live in the database now.
+                    let _ = std::fs::remove_dir_all(std::env::temp_dir().join("veloce-thumbnails"));
                 });
                 (
                     Self {

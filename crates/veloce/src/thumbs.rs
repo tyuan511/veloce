@@ -14,8 +14,11 @@ use std::{
 
 use veloce_store::Store;
 
-/// Edge length, in pixels, thumbnails are rendered at.
+/// Edge length, in pixels, of icon-view thumbnails.
 pub const THUMB_PIXELS: u32 = 256;
+/// Edge length of the larger renders the preview panel shows. They share the
+/// cache with the icon view, told apart by size in the key.
+pub const PREVIEW_PIXELS: u32 = 1024;
 
 /// Ordinary raster pictures, which `sips` converts in a few milliseconds.
 const RASTER: &[&str] = &[
@@ -71,14 +74,21 @@ impl Stamp {
     }
 }
 
-pub fn cache_key(path: &Path, stamp: Stamp) -> String {
-    crate::preview::thumbnail_cache_key(path, stamp.size, stamp.modified_secs)
+/// Cache key for one rendering of one file version: changes when the file does,
+/// and differs per pixel size so icon-view and preview renders never collide.
+pub fn cache_key(path: &Path, stamp: Stamp, pixels: u32) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    stamp.size.hash(&mut hasher);
+    stamp.modified_secs.hash(&mut hasher);
+    format!("{:016x}@{pixels}", hasher.finish())
 }
 
-pub fn sips_args(src: &Path, out: &Path) -> Vec<OsString> {
+pub fn sips_args(src: &Path, out: &Path, pixels: u32) -> Vec<OsString> {
     vec![
         "-Z".into(),
-        THUMB_PIXELS.to_string().into(),
+        pixels.to_string().into(),
         "-s".into(),
         "format".into(),
         "png".into(),
@@ -88,11 +98,11 @@ pub fn sips_args(src: &Path, out: &Path) -> Vec<OsString> {
     ]
 }
 
-pub fn quicklook_args(src: &Path, out_dir: &Path) -> Vec<OsString> {
+pub fn quicklook_args(src: &Path, out_dir: &Path, pixels: u32) -> Vec<OsString> {
     vec![
         "-t".into(),
         "-s".into(),
-        THUMB_PIXELS.to_string().into(),
+        pixels.to_string().into(),
         "-o".into(),
         out_dir.as_os_str().to_os_string(),
         src.as_os_str().to_os_string(),
@@ -127,40 +137,43 @@ fn run_with_timeout(mut command: Command, limit: Duration) -> bool {
 
 /// Render a thumbnail PNG for `path`, or `None` when the tools are missing, the
 /// file cannot be rendered, or the platform has no generator.
-pub fn generate(path: &Path, ext: &str, key: &str) -> Option<Vec<u8>> {
+pub fn generate(path: &Path, ext: &str, key: &str, pixels: u32) -> Option<Vec<u8>> {
     if !cfg!(target_os = "macos") {
         return None;
     }
-    let work = std::env::temp_dir().join("veloce-thumb-work").join(key);
+    // `@` in the key is fine in a path, but keep the work directory tidy.
+    let work = std::env::temp_dir()
+        .join("veloce-thumb-work")
+        .join(key.replace('@', "-"));
     std::fs::create_dir_all(&work).ok()?;
-    let result = render_into(path, ext, &work);
+    let result = render_into(path, ext, &work, pixels);
     let _ = std::fs::remove_dir_all(&work);
     result
 }
 
-fn render_into(path: &Path, ext: &str, work: &Path) -> Option<Vec<u8>> {
+fn render_into(path: &Path, ext: &str, work: &Path, pixels: u32) -> Option<Vec<u8>> {
     let produced: PathBuf = match generator_for(ext) {
         Generator::Sips => {
             let out = work.join("thumb.png");
             let mut command = Command::new("sips");
-            command.args(sips_args(path, &out));
+            command.args(sips_args(path, &out, pixels));
             if run_with_timeout(command, Duration::from_secs(10)) {
                 out
             } else {
                 // sips cannot read everything (some WebP/ICO): Quick Look can.
-                return quicklook_render(path, work);
+                return quicklook_render(path, work, pixels);
             }
         }
-        Generator::QuickLook => return quicklook_render(path, work),
+        Generator::QuickLook => return quicklook_render(path, work, pixels),
     };
     std::fs::read(produced)
         .ok()
         .filter(|bytes| !bytes.is_empty())
 }
 
-fn quicklook_render(path: &Path, work: &Path) -> Option<Vec<u8>> {
+fn quicklook_render(path: &Path, work: &Path, pixels: u32) -> Option<Vec<u8>> {
     let mut command = Command::new("qlmanage");
-    command.args(quicklook_args(path, work));
+    command.args(quicklook_args(path, work, pixels));
     if !run_with_timeout(command, Duration::from_secs(8)) {
         return None;
     }
@@ -176,14 +189,15 @@ pub fn thumbnail_bytes(
     path: &Path,
     ext: &str,
     stamp: Stamp,
+    pixels: u32,
 ) -> Option<Vec<u8>> {
-    let key = cache_key(path, stamp);
+    let key = cache_key(path, stamp, pixels);
     if let Some(store) = store
         && let Ok(Some(png)) = store.get_thumbnail(&key)
     {
         return Some(png);
     }
-    let png = generate(path, ext, &key)?;
+    let png = generate(path, ext, &key, pixels)?;
     if let Some(store) = store {
         let _ = store.put_thumbnail(&key, &png);
     }
@@ -225,26 +239,56 @@ mod tests {
             size: 10,
             modified_secs: 5,
         };
-        assert_eq!(cache_key(path, stamp), cache_key(path, stamp));
-        assert_ne!(
-            cache_key(path, stamp),
-            cache_key(
-                path,
-                Stamp {
-                    modified_secs: 6,
-                    ..stamp
-                }
-            )
-        );
-        assert_ne!(
-            cache_key(path, stamp),
-            cache_key(path, Stamp { size: 11, ..stamp })
-        );
+        let key = |path: &Path, stamp: Stamp| cache_key(path, stamp, THUMB_PIXELS);
+        assert_eq!(key(path, stamp), key(path, stamp), "deterministic");
+        let touched = Stamp {
+            modified_secs: 6,
+            ..stamp
+        };
+        let grown = Stamp { size: 11, ..stamp };
+        assert_ne!(key(path, stamp), key(path, touched), "mtime");
+        assert_ne!(key(path, stamp), key(path, grown), "size");
+        assert_ne!(key(path, stamp), key(Path::new("/a/c.png"), stamp), "path");
+    }
+
+    #[test]
+    fn small_and_large_renders_of_one_file_have_different_keys() {
+        let path = Path::new("/a/b.pdf");
+        let stamp = Stamp {
+            size: 10,
+            modified_secs: 5,
+        };
+        let small = cache_key(path, stamp, THUMB_PIXELS);
+        let large = cache_key(path, stamp, PREVIEW_PIXELS);
+        assert_ne!(small, large);
+        assert!(small.ends_with("@256") && large.ends_with("@1024"));
+    }
+
+    #[test]
+    fn both_sizes_are_cached_side_by_side() {
+        let store = Store::in_memory().unwrap();
+        let path = Path::new("/a/b.pdf");
+        let stamp = Stamp {
+            size: 1,
+            modified_secs: 1,
+        };
+        store
+            .put_thumbnail(&cache_key(path, stamp, THUMB_PIXELS), &[1; 10])
+            .unwrap();
+        store
+            .put_thumbnail(&cache_key(path, stamp, PREVIEW_PIXELS), &[2; 30])
+            .unwrap();
+        // The preview render is a cache hit even though the file is not on disk.
+        let hit = thumbnail_bytes(Some(&store), path, "pdf", stamp, PREVIEW_PIXELS);
+        assert_eq!(hit, Some(vec![2; 30]));
+        let small = thumbnail_bytes(Some(&store), path, "pdf", stamp, THUMB_PIXELS);
+        assert_eq!(small, Some(vec![1; 10]));
+        assert_eq!(store.thumbnail_bytes().unwrap(), 40);
     }
 
     #[test]
     fn tool_arguments_name_the_source_target_and_size() {
-        let args = sips_args(Path::new("/in.jpg"), Path::new("/out.png"));
+        let args = sips_args(Path::new("/in.jpg"), Path::new("/out.png"), THUMB_PIXELS);
         let strings: Vec<String> = args
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -252,9 +296,13 @@ mod tests {
         assert_eq!(&strings[..2], ["-Z", "256"]);
         assert!(strings.contains(&"/in.jpg".to_string()));
         assert!(strings.ends_with(&["--out".to_string(), "/out.png".to_string()]));
-        let ql = quicklook_args(Path::new("/in.pdf"), Path::new("/dir"));
+        let ql = quicklook_args(Path::new("/in.pdf"), Path::new("/dir"), PREVIEW_PIXELS);
         assert_eq!(ql.last().unwrap().to_string_lossy(), "/in.pdf");
         assert!(ql.iter().any(|a| a.to_string_lossy() == "/dir"));
+        assert!(
+            ql.iter().any(|a| a.to_string_lossy() == "1024"),
+            "size is a parameter"
+        );
     }
 
     #[test]
@@ -312,13 +360,15 @@ mod tests {
         let stamp = Stamp::of(&file).unwrap();
         let store = Store::in_memory().unwrap();
 
-        let first = thumbnail_bytes(Some(&store), &file, "png", stamp).expect("sips renders it");
+        let first = thumbnail_bytes(Some(&store), &file, "png", stamp, THUMB_PIXELS)
+            .expect("sips renders it");
         assert_eq!(&first[..8], b"\x89PNG\r\n\x1a\n");
         assert!(store.thumbnail_bytes().unwrap() > 0, "cached");
 
         // With the file gone the cache still answers.
         std::fs::remove_file(&file).unwrap();
-        let again = thumbnail_bytes(Some(&store), &file, "png", stamp).expect("from the store");
+        let again = thumbnail_bytes(Some(&store), &file, "png", stamp, THUMB_PIXELS)
+            .expect("from the store");
         assert_eq!(again, first);
     }
 
@@ -330,7 +380,7 @@ mod tests {
         std::fs::write(&file, b"not an image").unwrap();
         let stamp = Stamp::of(&file).unwrap();
         let store = Store::in_memory().unwrap();
-        assert!(thumbnail_bytes(Some(&store), &file, "png", stamp).is_none());
+        assert!(thumbnail_bytes(Some(&store), &file, "png", stamp, THUMB_PIXELS).is_none());
         assert_eq!(store.thumbnail_bytes().unwrap(), 0);
     }
 }

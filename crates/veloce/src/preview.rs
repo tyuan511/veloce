@@ -18,13 +18,14 @@ use std::{
 use gpui::{
     AnyElement, Context, Hsla, ObjectFit, StatefulInteractiveElement, div, img, prelude::*, px, svg,
 };
+use veloce_store::Store;
 use vfs_core::{
     FileEntry, LocalProvider, VfsProvider,
     archive::{ArchiveKind, list_entries},
     entry::{format_size, format_time},
 };
 
-use crate::{file_icons, icons, theme};
+use crate::{file_icons, icons, theme, thumbs};
 
 /// How much of a text file is read for the preview.
 pub const PREVIEW_BYTES: u64 = 64 * 1024;
@@ -68,6 +69,10 @@ pub enum PreviewContent {
     Image {
         path: PathBuf,
     },
+    /// A rendered picture held in memory (a Quick Look thumbnail).
+    Picture {
+        image: Arc<gpui::Image>,
+    },
     /// Not text: size plus a hex dump of the head so it is still inspectable.
     Binary {
         size: u64,
@@ -95,11 +100,14 @@ pub struct Preview {
     /// Entry currently shown, to avoid redundant reloads.
     pub loaded: Option<String>,
     token: Arc<std::sync::atomic::AtomicBool>,
+    /// Where rendered thumbnails are cached (shared with the icon view).
+    store: Option<Arc<Store>>,
 }
 
 impl Preview {
-    pub fn new() -> Self {
+    pub fn new(store: Option<Arc<Store>>) -> Self {
         Self {
+            store,
             content: PreviewContent::Empty,
             loaded: None,
             token: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -133,11 +141,12 @@ impl Preview {
         let token = Arc::new(std::sync::atomic::AtomicBool::new(false));
         self.token = token.clone();
 
+        let store = self.store.clone();
         cx.spawn(async move |this, cx| {
             // Reading files and running `tar` / `qlmanage` must not block the UI.
             let content = cx
                 .background_executor()
-                .spawn(async move { build_preview(&entry).await })
+                .spawn(async move { build_preview(&entry, store.as_deref()).await })
                 .await;
             this.update(cx, |preview, cx| {
                 if token.load(std::sync::atomic::Ordering::Relaxed) {
@@ -149,12 +158,6 @@ impl Preview {
             .ok();
         })
         .detach();
-    }
-}
-
-impl Default for Preview {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -347,72 +350,10 @@ pub fn hex_dump(bytes: &[u8], max_bytes: usize) -> Vec<String> {
         .collect()
 }
 
-/// Stable cache directory name for a thumbnail: changes when the file does.
-pub(crate) fn thumbnail_cache_key(path: &Path, size: u64, modified_secs: u64) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut hasher);
-    size.hash(&mut hasher);
-    modified_secs.hash(&mut hasher);
-    format!("{:016x}", hasher.finish())
-}
-
-/// Render a Quick Look thumbnail with `qlmanage` (macOS), cached on disk.
-#[cfg(target_os = "macos")]
-fn quicklook_thumbnail(entry: &FileEntry, path: &Path) -> Option<PathBuf> {
-    use std::{
-        process::{Command, Stdio},
-        time::{Duration, Instant, UNIX_EPOCH},
-    };
-
-    let modified = entry
-        .modified
-        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0);
-    let key = thumbnail_cache_key(path, entry.size, modified);
-    let dir = std::env::temp_dir().join("veloce-thumbnails").join(key);
-    let output = dir.join(format!("{}.png", path.file_name()?.to_string_lossy()));
-    if output.is_file() {
-        return Some(output);
-    }
-    std::fs::create_dir_all(&dir).ok()?;
-    let mut child = Command::new("qlmanage")
-        .args(["-t", "-s", "1024", "-o"])
-        .arg(&dir)
-        .arg(path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    // Some files make Quick Look hang; give up rather than spin forever.
-    let deadline = Instant::now() + Duration::from_secs(8);
-    loop {
-        match child.try_wait() {
-            Ok(Some(_)) => break,
-            Ok(None) if Instant::now() < deadline => {
-                std::thread::sleep(Duration::from_millis(40));
-            }
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
-        }
-    }
-    output.is_file().then_some(output)
-}
-
-#[cfg(not(target_os = "macos"))]
-fn quicklook_thumbnail(_entry: &FileEntry, _path: &Path) -> Option<PathBuf> {
-    None
-}
-
 /// Whether this platform can render Quick Look thumbnails.
 const THUMBNAILS: bool = cfg!(target_os = "macos");
 
-async fn build_preview(entry: &FileEntry) -> PreviewContent {
+async fn build_preview(entry: &FileEntry, store: Option<&Store>) -> PreviewContent {
     if entry.is_dir() {
         return directory_preview(entry);
     }
@@ -426,8 +367,16 @@ async fn build_preview(entry: &FileEntry) -> PreviewContent {
 
     match route_for(&entry.name, &extension, THUMBNAILS) {
         Route::Image => PreviewContent::Image { path },
-        Route::Thumbnail => match quicklook_thumbnail(entry, &path) {
-            Some(thumbnail) => PreviewContent::Image { path: thumbnail },
+        Route::Thumbnail => match thumbs::thumbnail_bytes(
+            store,
+            &path,
+            &extension,
+            thumbs::Stamp::new(entry.size, entry.modified),
+            thumbs::PREVIEW_PIXELS,
+        ) {
+            Some(png) => PreviewContent::Picture {
+                image: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png)),
+            },
             // No thumbnail (DRM media, odd codec ...): HTML falls back to its source,
             // everything else to the bytes.
             None if is_text_extension(&extension) => read_text_preview(&provider, entry).await,
@@ -683,9 +632,9 @@ impl gpui::Focusable for PreviewView {
 }
 
 impl PreviewView {
-    pub fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(store: Option<Arc<Store>>, cx: &mut Context<Self>) -> Self {
         Self {
-            preview: Preview::new(),
+            preview: Preview::new(store),
             focus_handle: cx.focus_handle(),
             entry: None,
             width: 340.0,
@@ -724,7 +673,8 @@ pub fn render_preview(
         PreviewContent::Code { lines, truncated } => views::code_state(lines, *truncated),
         PreviewContent::Markdown { blocks, truncated } => views::markdown_state(blocks, *truncated),
         PreviewContent::Table { rows, truncated } => views::table_state(rows, *truncated),
-        PreviewContent::Image { path } => image_state(path),
+        PreviewContent::Image { path } => image_state(path.clone()),
+        PreviewContent::Picture { image } => image_state(image.clone()),
         PreviewContent::Binary { size, dump } => binary_state(*size, dump),
         PreviewContent::Archive { entries, truncated } => archive_state(entries, *truncated),
         PreviewContent::Directory { children, names } => directory_state(*children, names),
@@ -1028,7 +978,7 @@ fn text_state(lines: &[String], truncated: bool) -> AnyElement {
         .into_any_element()
 }
 
-fn image_state(path: &Path) -> AnyElement {
+fn image_state(source: impl Into<gpui::ImageSource>) -> AnyElement {
     div()
         .flex_1()
         .min_h_0()
@@ -1037,7 +987,7 @@ fn image_state(path: &Path) -> AnyElement {
         .items_center()
         .justify_center()
         .child(
-            img(path.to_path_buf())
+            img(source)
                 .object_fit(ObjectFit::Contain)
                 .max_w_full()
                 .max_h_full(),
@@ -1256,7 +1206,7 @@ mod tests {
         fs::write(&path, line.repeat(5000)).unwrap();
 
         let entry = entry_for(&path);
-        let content = futures::executor::block_on(build_preview(&entry));
+        let content = futures::executor::block_on(build_preview(&entry, None));
         match content {
             PreviewContent::Text {
                 lines, truncated, ..
@@ -1274,7 +1224,7 @@ mod tests {
         let path = dir.path().join("blob.dat");
         fs::write(&path, [0u8, 1, 2, 3, 0, 9]).unwrap();
         let entry = entry_for(&path);
-        let content = futures::executor::block_on(build_preview(&entry));
+        let content = futures::executor::block_on(build_preview(&entry, None));
         assert!(matches!(content, PreviewContent::Binary { .. }));
     }
 
@@ -1287,7 +1237,7 @@ mod tests {
             fs::write(folder.join(name), b"x").unwrap();
         }
         let entry = entry_for(&folder);
-        let content = futures::executor::block_on(build_preview(&entry));
+        let content = futures::executor::block_on(build_preview(&entry, None));
         match content {
             PreviewContent::Directory { children, names } => {
                 assert_eq!(children, 3);
@@ -1303,7 +1253,7 @@ mod tests {
         let path = dir.path().join("shot.png");
         fs::write(&path, b"not really a png").unwrap();
         let entry = entry_for(&path);
-        let content = futures::executor::block_on(build_preview(&entry));
+        let content = futures::executor::block_on(build_preview(&entry, None));
         assert!(matches!(content, PreviewContent::Image { .. }));
     }
 
@@ -1432,7 +1382,7 @@ mod tests {
         let path = dir.path().join("notes.md");
         fs::write(&path, "# Title\n\n- a\n- b\n").unwrap();
         let entry = entry_for(&path);
-        let content = futures::executor::block_on(build_preview(&entry));
+        let content = futures::executor::block_on(build_preview(&entry, None));
         assert!(
             matches!(content, PreviewContent::Markdown { .. }),
             "{content:?}"
@@ -1445,7 +1395,7 @@ mod tests {
         let path = dir.path().join("weird.json");
         fs::write(&path, [0u8, 159, 146, 150]).unwrap();
         let entry = entry_for(&path);
-        let content = futures::executor::block_on(build_preview(&entry));
+        let content = futures::executor::block_on(build_preview(&entry, None));
         assert!(
             matches!(content, PreviewContent::Binary { .. }),
             "{content:?}"
@@ -1477,7 +1427,7 @@ mod tests {
         fs::create_dir_all(folder.join("zeta")).unwrap();
         fs::write(folder.join("alpha.txt"), b"x").unwrap();
         let entry = entry_for(&folder);
-        match futures::executor::block_on(build_preview(&entry)) {
+        match futures::executor::block_on(build_preview(&entry, None)) {
             PreviewContent::Directory { names, .. } => {
                 assert_eq!(names[0], ("zeta".to_string(), true));
                 assert_eq!(names[1], ("alpha.txt".to_string(), false));
@@ -1500,7 +1450,7 @@ mod tests {
         ))
         .unwrap();
         let entry = entry_for(&archive);
-        match futures::executor::block_on(build_preview(&entry)) {
+        match futures::executor::block_on(build_preview(&entry, None)) {
             PreviewContent::Archive { entries, truncated } => {
                 assert!(!truncated);
                 assert!(entries.iter().any(|e| e.ends_with("readme.md")));
@@ -1515,7 +1465,7 @@ mod tests {
         let path = dir.path().join("broken.zip");
         fs::write(&path, [0u8, 1, 2, 3]).unwrap();
         let entry = entry_for(&path);
-        let content = futures::executor::block_on(build_preview(&entry));
+        let content = futures::executor::block_on(build_preview(&entry, None));
         assert!(
             matches!(content, PreviewContent::Binary { .. }),
             "{content:?}"
@@ -1528,7 +1478,7 @@ mod tests {
         let path = dir.path().join("blob.dat");
         fs::write(&path, [0u8, 1, 2, 0x41]).unwrap();
         let entry = entry_for(&path);
-        match futures::executor::block_on(build_preview(&entry)) {
+        match futures::executor::block_on(build_preview(&entry, None)) {
             PreviewContent::Binary { dump, .. } => {
                 assert_eq!(dump.len(), 1);
                 assert!(dump[0].contains("00 01 02 41"));
@@ -1589,20 +1539,6 @@ mod tests {
         assert_eq!(rows[0], ("pkg".to_string(), true, 0));
         assert_eq!(rows[1], ("src".to_string(), true, 1));
         assert_eq!(rows[2], ("main.rs".to_string(), false, 2));
-    }
-
-    #[test]
-    fn thumbnail_cache_key_changes_with_the_file() {
-        let path = Path::new("/a/b.pdf");
-        let base = thumbnail_cache_key(path, 10, 1);
-        assert_eq!(base, thumbnail_cache_key(path, 10, 1), "deterministic");
-        assert_ne!(base, thumbnail_cache_key(path, 11, 1), "size");
-        assert_ne!(base, thumbnail_cache_key(path, 10, 2), "mtime");
-        assert_ne!(
-            base,
-            thumbnail_cache_key(Path::new("/a/c.pdf"), 10, 1),
-            "path"
-        );
     }
 }
 

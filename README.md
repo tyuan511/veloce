@@ -114,8 +114,11 @@ cannot be opened or is damaged it is moved aside and the app carries on without
 remembering.
 
 The icon view shows real previews: pictures through `sips`, everything else
-(PDF, video, documents, web pages) through Quick Look, cached in that database and
-pruned least-recently-used past 256 MB.
+(PDF, video, documents, web pages) through Quick Look. The preview panel's larger
+renders of those files come from the same code. Both sizes are cached in that
+database, told apart by pixel size in the key, and pruned least-recently-used past
+256 MB. Nothing is cached as loose files; the only temporary files are the
+short-lived work directories used while a thumbnail is being rendered.
 
 ## Layout
 
@@ -145,7 +148,7 @@ Drag the dividers to resize the sidebar, the preview panel and, when split, the 
 ## Tests
 
 ```sh
-cargo test              # 430 tests, no GPU or window server needed
+cargo test              # 431 tests, no GPU or window server needed
 cargo test -p vfs-core  # 156 core tests
 ```
 

@@ -168,7 +168,8 @@ impl Workspace {
             pane
         });
 
-        let preview = cx.new(PreviewView::new);
+        let preview_store = services.persist.store();
+        let preview = cx.new(|cx| PreviewView::new(preview_store, cx));
         let tasks = cx.new(|cx| TaskPanel::new(services.tasks.clone(), cx));
         if layout.tasks_open {
             tasks.update(cx, |panel, cx| panel.toggle(cx));
