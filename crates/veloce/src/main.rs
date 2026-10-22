@@ -18,6 +18,7 @@ mod file_icons_data;
 mod history;
 mod icons;
 mod info;
+mod keymap;
 mod listing;
 mod open_with;
 mod palette;
@@ -30,6 +31,7 @@ mod settings;
 mod settings_apply;
 mod settings_window;
 mod tasks_panel;
+mod terminals;
 mod text_input;
 mod theme;
 mod thumbs;
@@ -44,12 +46,10 @@ fn main() {
     let app = Application::new().with_assets(EmbeddedAssets);
 
     app.run(|cx: &mut App| {
-        text_input::init(cx);
-        actions::bind_keys(cx);
-
         // Load everything saved before the window exists, so the first frame is
         // already the restored layout.
         let (persist, startup) = persist::Persist::open();
+        actions::install_keymap(cx, &startup.settings.shortcuts);
         settings_apply::init(cx, startup.settings.clone());
         cx.set_global(persist.clone());
         let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);

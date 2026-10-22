@@ -15,11 +15,12 @@ use veloce_store::{SavedConnection, Store};
 
 use crate::{
     connections::{self, Draft, Field, Kind},
+    keymap::{self, Overrides},
     persist::Persist,
     settings::{
         AppSettings, CACHE_CHOICES_MB, Density, OnConflict, Startup, ThemePref, clean_terminal_name,
     },
-    settings_apply,
+    settings_apply, terminals,
     text_input::{TextInput, TextInputEvent},
     theme,
     view::ViewMode,
@@ -123,6 +124,12 @@ struct ConnectionForm {
     error: Option<String>,
 }
 
+/// An installed terminal application, with its icon once that has loaded.
+struct TerminalChoice {
+    name: String,
+    icon: Option<Arc<gpui::Image>>,
+}
+
 struct SettingsView {
     module: Module,
     persist: Persist,
@@ -131,6 +138,10 @@ struct SettingsView {
     terminal_input: Entity<TextInput>,
     terminal_error: bool,
     thumbnail_bytes: Option<u64>,
+    terminals: Vec<TerminalChoice>,
+    /// The command whose new shortcut is being recorded.
+    recording: Option<&'static str>,
+    shortcut_error: Option<String>,
     _subscriptions: Vec<gpui::Subscription>,
 }
 
@@ -152,6 +163,19 @@ impl SettingsView {
                 cx.notify();
             }
         });
+        // Registered once and gated on `recording`: removing an interceptor from
+        // inside its own callback is not safe.
+        let this = cx.entity().downgrade();
+        let record_keys = cx.intercept_keystrokes(move |event, window, cx| {
+            let is_settings = cx
+                .try_global::<SettingsWindow>()
+                .is_some_and(|w| w.0 == window.window_handle());
+            if !is_settings {
+                return;
+            }
+            let keystroke = event.keystroke.clone();
+            this.update(cx, |view, cx| view.record(&keystroke, cx)).ok();
+        });
         let mut view = Self {
             module: Module::General,
             persist,
@@ -160,11 +184,98 @@ impl SettingsView {
             terminal_input,
             terminal_error: false,
             thumbnail_bytes: None,
-            _subscriptions: vec![subscription],
+            terminals: Vec::new(),
+            recording: None,
+            shortcut_error: None,
+            _subscriptions: vec![subscription, record_keys],
         };
+        view.load_terminals(cx);
         view.reload_connections(cx);
         view.reload_cache_size(cx);
         view
+    }
+
+    /// Find installed terminals and load their icons, off the UI thread.
+    fn load_terminals(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let found = cx
+                .background_executor()
+                .spawn(async move {
+                    terminals::find_installed(&terminals::default_roots())
+                        .into_iter()
+                        .map(|terminal| {
+                            let icon = terminals::icon_png(&terminal.bundle, 64);
+                            (terminal.name, icon)
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update(cx, |view, cx| {
+                view.terminals = found
+                    .into_iter()
+                    .map(|(name, png)| TerminalChoice {
+                        name,
+                        icon: png.map(|bytes| {
+                            Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, bytes))
+                        }),
+                    })
+                    .collect();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn pick_terminal(&mut self, name: &str, cx: &mut Context<Self>) {
+        let name = name.to_string();
+        self.terminal_error = false;
+        // Keep the free-text field in step; setting its content emits no event.
+        self.terminal_input
+            .update(cx, |input, cx| input.set_content(name.clone(), cx));
+        settings_apply::commit(cx, |settings| settings.terminal_app = name);
+        cx.notify();
+    }
+
+    /// A key arrived while the window is open. Only acts while recording.
+    fn record(&mut self, keystroke: &gpui::Keystroke, cx: &mut Context<Self>) {
+        let Some(action) = self.recording else {
+            return;
+        };
+        if keymap::is_modifier_only(&keystroke.key) {
+            return;
+        }
+        cx.stop_propagation();
+        self.recording = None;
+        if keystroke.key == "escape" && !keystroke.modifiers.modified() {
+            self.shortcut_error = None;
+            cx.notify();
+            return;
+        }
+        let binding = keystroke.unparse();
+        let current = cx.global::<AppSettings>().shortcuts.clone();
+        match keymap::add_binding(&current, action, &binding) {
+            Ok(next) => {
+                self.shortcut_error = None;
+                settings_apply::commit(cx, |settings| settings.shortcuts = next);
+            }
+            Err(refusal) => {
+                self.shortcut_error = Some(refusal.message(&keymap::display(&binding)));
+            }
+        }
+        cx.notify();
+    }
+
+    fn change_shortcuts(
+        &mut self,
+        cx: &mut Context<Self>,
+        change: impl FnOnce(&Overrides) -> Overrides,
+    ) {
+        self.recording = None;
+        self.shortcut_error = None;
+        let next = change(&cx.global::<AppSettings>().shortcuts);
+        settings_apply::commit(cx, |settings| settings.shortcuts = next);
+        cx.notify();
     }
 
     fn store(&self) -> Option<Arc<Store>> {
@@ -298,6 +409,10 @@ impl SettingsView {
 
 // ---- small building blocks ---------------------------------------------------
 
+fn eid(name: String) -> gpui::ElementId {
+    gpui::ElementId::Name(name.into())
+}
+
 fn page(title: &str, children: Vec<AnyElement>) -> AnyElement {
     div()
         .flex()
@@ -388,7 +503,11 @@ fn note(text: &str) -> AnyElement {
 }
 
 /// An on/off switch.
-fn toggle(id: &'static str, on: bool, change: impl Fn(bool, &mut App) + 'static) -> AnyElement {
+fn toggle(
+    id: impl Into<gpui::ElementId>,
+    on: bool,
+    change: impl Fn(bool, &mut App) + 'static,
+) -> AnyElement {
     div()
         .id(id)
         .w(px(38.))
@@ -460,7 +579,7 @@ fn labels<T: Copy>(items: &[T], label: impl Fn(T) -> &'static str) -> Vec<(T, St
 }
 
 fn button(
-    id: &'static str,
+    id: impl Into<gpui::ElementId>,
     text: &str,
     on_click: impl Fn(&mut Window, &mut App) + 'static,
 ) -> AnyElement {
@@ -509,10 +628,10 @@ impl SettingsView {
         match self.module {
             Module::General => self.general(&settings),
             Module::Appearance => appearance(&settings),
-            Module::Files => self.files(&settings),
+            Module::Files => self.files(&settings, cx),
             Module::Preview => preview(&settings),
             Module::Search => search(&settings),
-            Module::Shortcuts => shortcuts(),
+            Module::Shortcuts => self.shortcuts_page(&settings, cx),
             Module::Connections => self.connections_page(cx),
             Module::Storage => self.storage(cx),
             Module::About => about(),
@@ -611,7 +730,60 @@ impl SettingsView {
         )
     }
 
-    fn files(&self, s: &AppSettings) -> AnyElement {
+    fn files(&self, s: &AppSettings, cx: &mut Context<Self>) -> AnyElement {
+        let entity = cx.entity();
+        let installed: Vec<AnyElement> = self
+            .terminals
+            .iter()
+            .map(|terminal| {
+                let name = terminal.name.clone();
+                let selected = s.terminal_app == terminal.name;
+                let entity = entity.clone();
+                let pick = name.clone();
+                div()
+                    .id(eid(format!("terminal-{name}")))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_3()
+                    .px_4()
+                    .py_2()
+                    .cursor_pointer()
+                    .hover(|this| this.bg(theme::bg_hover()))
+                    .on_click(move |_, _, cx| {
+                        entity.update(cx, |view, cx| view.pick_terminal(&pick, cx));
+                    })
+                    .child(match &terminal.icon {
+                        Some(icon) => gpui::img(icon.clone())
+                            .w(px(24.))
+                            .h(px(24.))
+                            .into_any_element(),
+                        None => div()
+                            .w(px(24.))
+                            .h(px(24.))
+                            .rounded_md()
+                            .bg(theme::bg_hover())
+                            .into_any_element(),
+                    })
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(theme::text())
+                            .child(name),
+                    )
+                    .child(if selected {
+                        div()
+                            .text_sm()
+                            .text_color(theme::accent())
+                            .child("✓")
+                            .into_any_element()
+                    } else {
+                        div().into_any_element()
+                    })
+                    .into_any_element()
+            })
+            .collect();
         page(
             "Files",
             vec![
@@ -628,12 +800,13 @@ impl SettingsView {
                         ),
                     )],
                 ),
+                section("Terminal", installed),
                 section(
-                    "Terminal",
+                    "Other terminal",
                     vec![
                         row(
-                            "Open in Terminal uses",
-                            Some("An application name, such as Terminal, iTerm or Ghostty."),
+                            "Application name",
+                            Some("For a terminal that is not listed above."),
                             field_box(&self.terminal_input, 200.0),
                         ),
                         if self.terminal_error {
@@ -683,13 +856,9 @@ impl SettingsView {
                             kind.map(|k| connections::summary(k, &connection.config))
                                 .unwrap_or_default()
                         )),
-                        button(
-                            Box::leak(format!("del-{id}").into_boxed_str()),
-                            "Remove",
-                            move |_, cx| {
-                                entity.update(cx, |view, cx| view.delete_connection(id, cx));
-                            },
-                        ),
+                        button(eid(format!("del-{id}")), "Remove", move |_, cx| {
+                            entity.update(cx, |view, cx| view.delete_connection(id, cx));
+                        }),
                     )
                 })
                 .collect()
@@ -704,7 +873,7 @@ impl SettingsView {
                         let kind = *kind;
                         let entity = entity.clone();
                         button(
-                            Box::leak(format!("add-{}", kind.key()).into_boxed_str()),
+                            eid(format!("add-{}", kind.key())),
                             &format!("Add {}", kind.label()),
                             move |_, cx| {
                                 entity.update(cx, |view, cx| view.open_form(kind, cx));
@@ -939,83 +1108,184 @@ fn search(s: &AppSettings) -> AnyElement {
     )
 }
 
-/// Keyboard shortcuts, grouped. Read-only for now.
-const SHORTCUT_GROUPS: &[(&str, &[(&str, &str)])] = &[
-    (
-        "Navigation",
-        &[
-            ("↑ ↓ ← →  /  j k", "Move the selection"),
-            ("Return  /  ⌘O", "Open"),
-            ("h  /  ⌘↑", "Go to the parent folder"),
-            ("⌘[  /  ⌘]", "Back / forward"),
-            ("⌘P", "Search, or type a path to go there"),
-            ("/", "Filter this folder"),
-        ],
-    ),
-    (
-        "View",
-        &[
-            ("⌘1  ⌘2  ⌘3", "Icons / list / columns"),
-            ("Space", "Show or hide the preview panel"),
-            ("⇧⌘.", "Show hidden files"),
-            ("⌘\\", "Split view"),
-            ("⌃1  ⌃2", "Focus the left / right pane"),
-            ("⌘T  ⌘W", "New tab / close tab"),
-        ],
-    ),
-    (
-        "Files",
-        &[
-            ("⌘X  ⌘C  ⌘V", "Cut / copy / paste"),
-            ("F2", "Rename"),
-            ("⌘⌫", "Move to Trash"),
-            ("⇧⌘N", "New folder"),
-            ("⇧⌘C", "Copy path"),
-            ("F5  F6", "Copy / move to the other pane"),
-        ],
-    ),
-    (
-        "App",
-        &[("⌘,", "Settings"), ("⌘J", "Task panel"), ("⌘Q", "Quit")],
-    ),
-];
+impl SettingsView {
+    fn shortcuts_page(&mut self, s: &AppSettings, cx: &mut Context<Self>) -> AnyElement {
+        let entity = cx.entity();
+        let mut children: Vec<AnyElement> = Vec::new();
 
-fn shortcuts() -> AnyElement {
-    let mut children: Vec<AnyElement> = SHORTCUT_GROUPS
-        .iter()
-        .map(|(title, items)| {
-            section(
-                title,
-                items
-                    .iter()
-                    .map(|(keys, what)| {
-                        row(
-                            what,
-                            None,
-                            div()
-                                .px_2()
-                                .py_0p5()
-                                .rounded_sm()
-                                .bg(theme::bg_hover())
-                                .font_family(theme::MONO_FAMILY)
-                                .text_xs()
-                                .text_color(theme::text_muted())
-                                .child(keys.to_string())
-                                .into_any_element(),
-                        )
+        let reset_all = entity.clone();
+        children.push(
+            div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .gap_3()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::text_faint())
+                        .child("Click + to add a key, ✕ to remove one. Esc cancels."),
+                )
+                .child(button("shortcuts-reset-all", "Reset all", move |_, cx| {
+                    reset_all.update(cx, |view, cx| {
+                        view.change_shortcuts(cx, |_| Overrides::new());
+                    });
+                }))
+                .into_any_element(),
+        );
+        if let Some(message) = &self.shortcut_error {
+            children.push(
+                div()
+                    .text_xs()
+                    .text_color(theme::red())
+                    .child(message.clone())
+                    .into_any_element(),
+            );
+        }
+
+        for group in keymap::groups() {
+            let rows = keymap::COMMANDS
+                .iter()
+                .filter(|command| command.group == group)
+                .map(|command| self.shortcut_row(command, s, &entity))
+                .collect();
+            children.push(section(group, rows));
+        }
+
+        children.push(section(
+            "Fixed",
+            keymap::RESERVED
+                .iter()
+                .map(|(binding, what)| row(what, None, key_chip(&keymap::display(binding))))
+                .collect(),
+        ));
+        page("Shortcuts", children)
+    }
+
+    fn shortcut_row(
+        &self,
+        command: &'static keymap::Command,
+        s: &AppSettings,
+        entity: &Entity<SettingsView>,
+    ) -> AnyElement {
+        let bindings = keymap::effective(command, &s.shortcuts);
+        let recording = self.recording == Some(command.action);
+        let mut chips: Vec<AnyElement> = Vec::new();
+        for (index, binding) in bindings.iter().enumerate() {
+            let remove = entity.clone();
+            let target = binding.clone();
+            chips.push(
+                div()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(key_chip(&keymap::display(binding)))
+                    .child(
+                        div()
+                            .id(eid(format!("rm-{}-{index}", command.action)))
+                            .px_1()
+                            .text_xs()
+                            .text_color(theme::text_faint())
+                            .cursor_pointer()
+                            .hover(|this| this.text_color(theme::red()))
+                            .on_click(move |_, _, cx| {
+                                let target = target.clone();
+                                remove.update(cx, |view, cx| {
+                                    view.change_shortcuts(cx, |current| {
+                                        keymap::remove_binding(current, command.action, &target)
+                                    });
+                                });
+                            })
+                            .child("✕"),
+                    )
+                    .into_any_element(),
+            );
+        }
+        let add = entity.clone();
+        chips.push(
+            div()
+                .id(eid(format!("add-{}", command.action)))
+                .px_2()
+                .h(px(22.))
+                .flex()
+                .items_center()
+                .rounded_sm()
+                .text_xs()
+                .cursor_pointer()
+                .when(recording, |this| {
+                    this.bg(theme::accent()).text_color(gpui::white())
+                })
+                .when(!recording, |this| {
+                    this.bg(theme::bg_hover())
+                        .text_color(theme::text_muted())
+                        .hover(|this| this.bg(theme::border()))
+                })
+                .on_click(move |_, _, cx| {
+                    add.update(cx, |view, cx| {
+                        view.shortcut_error = None;
+                        view.recording = if view.recording == Some(command.action) {
+                            None
+                        } else {
+                            Some(command.action)
+                        };
+                        cx.notify();
+                    });
+                })
+                .child(if recording { "Press keys…" } else { "+" })
+                .into_any_element(),
+        );
+        if keymap::is_customised(command.action, &s.shortcuts) {
+            let reset = entity.clone();
+            chips.push(
+                div()
+                    .id(eid(format!("reset-{}", command.action)))
+                    .px_1()
+                    .text_xs()
+                    .text_color(theme::text_faint())
+                    .cursor_pointer()
+                    .hover(|this| this.text_color(theme::text()))
+                    .on_click(move |_, _, cx| {
+                        reset.update(cx, |view, cx| {
+                            view.change_shortcuts(cx, |current| {
+                                keymap::reset_action(current, command.action)
+                            });
+                        });
                     })
-                    .collect(),
-            )
-        })
-        .collect();
-    children.push(
-        div()
-            .text_xs()
-            .text_color(theme::text_faint())
-            .child("Custom shortcuts are not editable yet.")
-            .into_any_element(),
-    );
-    page("Shortcuts", children)
+                    .child("Reset")
+                    .into_any_element(),
+            );
+        }
+        row(
+            command.label,
+            None,
+            div()
+                .flex()
+                .flex_row()
+                .flex_wrap()
+                .justify_end()
+                .items_center()
+                .gap_2()
+                .max_w(px(300.))
+                .children(chips)
+                .into_any_element(),
+        )
+    }
+}
+
+/// A key combination drawn as a small keycap.
+fn key_chip(text: &str) -> AnyElement {
+    div()
+        .px_2()
+        .py_0p5()
+        .rounded_sm()
+        .bg(theme::bg_hover())
+        .font_family(theme::MONO_FAMILY)
+        .text_xs()
+        .text_color(theme::text_muted())
+        .child(text.to_string())
+        .into_any_element()
 }
 
 fn about() -> AnyElement {

@@ -29,6 +29,9 @@ pub fn commit(cx: &mut App, change: impl FnOnce(&mut AppSettings)) {
         return;
     }
     apply_visuals(&after);
+    if after.shortcuts != before.shortcuts {
+        crate::actions::install_keymap(cx, &after.shortcuts);
+    }
     if let Some(persist) = cx.try_global::<Persist>().cloned() {
         persist.set_defaults(after.default_view, after.default_sort);
         persist.save_settings(cx, &after);

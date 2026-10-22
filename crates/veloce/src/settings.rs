@@ -8,6 +8,7 @@
 use vfs_core::{SortSpec, ops::ConflictPolicy};
 
 use crate::{
+    keymap::{self, Overrides},
     prefs::{parse_sort_key, parse_view, sort_key_name, view_key},
     view::ViewMode,
 };
@@ -178,6 +179,8 @@ pub struct AppSettings {
     pub search_hidden: bool,
     /// Skip what `.gitignore` excludes when searching.
     pub search_respects_gitignore: bool,
+    /// Customised key bindings; anything absent keeps its default.
+    pub shortcuts: Overrides,
 }
 
 impl gpui::Global for AppSettings {}
@@ -197,6 +200,7 @@ impl Default for AppSettings {
             terminal_app: "Terminal".to_string(),
             search_hidden: false,
             search_respects_gitignore: true,
+            shortcuts: Overrides::new(),
         }
     }
 }
@@ -215,6 +219,7 @@ const K_CONFLICT: &str = "app.on_conflict";
 const K_TERMINAL: &str = "app.terminal_app";
 const K_SEARCH_HIDDEN: &str = "app.search_hidden";
 const K_SEARCH_GIT: &str = "app.search_gitignore";
+const K_KEYS: &str = "app.shortcuts";
 
 fn parse_bool(value: &str) -> Option<bool> {
     match value {
@@ -280,6 +285,7 @@ impl AppSettings {
                 .unwrap_or(defaults.terminal_app),
             search_hidden: on_off(K_SEARCH_HIDDEN, defaults.search_hidden),
             search_respects_gitignore: on_off(K_SEARCH_GIT, defaults.search_respects_gitignore),
+            shortcuts: text(K_KEYS).map(|v| keymap::parse(&v)).unwrap_or_default(),
         }
     }
 
@@ -300,6 +306,7 @@ impl AppSettings {
             (K_TERMINAL, self.terminal_app.clone()),
             (K_SEARCH_HIDDEN, flag(self.search_hidden)),
             (K_SEARCH_GIT, flag(self.search_respects_gitignore)),
+            (K_KEYS, keymap::serialize(&self.shortcuts)),
         ]
     }
 
@@ -321,8 +328,8 @@ impl AppSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vfs_core::SortKey;
     use std::collections::HashMap;
+    use vfs_core::SortKey;
 
     fn lookup(pairs: &[(&str, &str)]) -> impl Fn(&str) -> Option<String> {
         let map: HashMap<String, String> = pairs
@@ -364,6 +371,7 @@ mod tests {
             terminal_app: "iTerm".into(),
             search_hidden: true,
             search_respects_gitignore: false,
+            shortcuts: Overrides::new(),
         };
         let entries = settings.entries();
         let restored = AppSettings::from_lookup(|key| {
@@ -399,7 +407,7 @@ mod tests {
         keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), before, "duplicate key");
-        assert_eq!(before, 14);
+        assert_eq!(before, 15);
     }
 
     #[test]

@@ -125,7 +125,11 @@ short-lived work directories used while a thumbnail is being rendered.
 `⌘,` (or *Settings…* in the toolbar's "…" menu) opens a separate Settings window
 with General, Appearance, Files, Preview, Search, Shortcuts, Connections, Storage
 and About. Changes apply immediately in every window and are saved to the same
-database. Connections (SSH, S3, WebDAV) are managed there too: the form validates
+database. *Open in Terminal* offers the terminals found on this Mac, with their icons.
+Shortcuts are editable: click **+** on a command and press the new keys (a key
+already used elsewhere, or Esc/⌘Q/⌘,, is refused); changes apply at once and are
+stored as overrides, so new defaults in later versions still reach you. Context-menu
+hints still show the default keys. Connections (SSH, S3, WebDAV) are managed there too: the form validates
 and stores the non-secret fields; passwords and secret keys are deliberately not
 saved, since the remote backends will keep them in the system keychain.
 
@@ -157,7 +161,7 @@ Drag the dividers to resize the sidebar, the preview panel and, when split, the 
 ## Tests
 
 ```sh
-cargo test              # 481 tests, no GPU or window server needed
+cargo test              # 513 tests, no GPU or window server needed
 cargo test -p vfs-core  # 156 core tests
 ```
 

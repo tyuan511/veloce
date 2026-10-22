@@ -107,7 +107,7 @@ pub fn quicklook_args(src: &Path, out_dir: &Path, pixels: u32) -> Vec<OsString> 
 }
 
 /// Run `command` and give up (killing it) after `limit`. True on a clean exit.
-fn run_with_timeout(mut command: Command, limit: Duration) -> bool {
+pub(crate) fn run_with_timeout(mut command: Command, limit: Duration) -> bool {
     let Ok(mut child) = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())

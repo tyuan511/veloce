@@ -4,7 +4,12 @@
 //! keeps its keystrokes: GPUI would otherwise fire both the action and the
 //! character insertion.
 
-use gpui::{App, KeyBinding, actions};
+use gpui::{App, KeyBinding, KeyBindingContextPredicate, actions};
+
+use crate::{
+    keymap::{self, Overrides},
+    text_input,
+};
 
 actions!(
     veloce,
@@ -74,82 +79,37 @@ actions!(
 /// The keymap context every list binding is scoped to.
 pub const CONTEXT: &str = "Workspace && !TextInput";
 
-/// Install the default keymap. Called once at startup.
-pub fn bind_keys(cx: &mut App) {
+/// Replace every key binding: text-field editing keys, the few fixed system keys,
+/// and the rebindable commands with the user's overrides applied. Safe to call
+/// again when the shortcuts change, because it starts from a cleared keymap.
+pub fn install_keymap(cx: &mut App, overrides: &Overrides) {
+    cx.clear_key_bindings();
+    text_input::init(cx);
     cx.bind_keys([
-        // ---- navigation (Vim-first, arrows as an alias) ----
-        KeyBinding::new("j", MoveDown, Some(CONTEXT)),
-        KeyBinding::new("down", MoveDown, Some(CONTEXT)),
-        KeyBinding::new("k", MoveUp, Some(CONTEXT)),
-        KeyBinding::new("up", MoveUp, Some(CONTEXT)),
-        KeyBinding::new("ctrl-d", MovePageDown, Some(CONTEXT)),
-        KeyBinding::new("pagedown", MovePageDown, Some(CONTEXT)),
-        KeyBinding::new("ctrl-u", MovePageUp, Some(CONTEXT)),
-        KeyBinding::new("pageup", MovePageUp, Some(CONTEXT)),
-        KeyBinding::new("g g", JumpTop, Some(CONTEXT)),
-        KeyBinding::new("home", JumpTop, Some(CONTEXT)),
-        KeyBinding::new("shift-g", JumpBottom, Some(CONTEXT)),
-        KeyBinding::new("end", JumpBottom, Some(CONTEXT)),
-        KeyBinding::new("h", GoParent, Some(CONTEXT)),
-        KeyBinding::new("left", MoveLeft, Some(CONTEXT)),
-        KeyBinding::new("backspace", GoParent, Some(CONTEXT)),
-        KeyBinding::new("cmd-up", GoParent, Some(CONTEXT)),
-        KeyBinding::new("cmd-[", GoBack, Some(CONTEXT)),
-        KeyBinding::new("cmd-]", GoForward, Some(CONTEXT)),
-        KeyBinding::new("l", OpenEntry, Some(CONTEXT)),
-        KeyBinding::new("right", MoveRight, Some(CONTEXT)),
-        KeyBinding::new("enter", OpenEntry, Some(CONTEXT)),
-        // ---- selection ----
-        KeyBinding::new("shift-j", ExtendDown, Some(CONTEXT)),
-        KeyBinding::new("shift-down", ExtendDown, Some(CONTEXT)),
-        KeyBinding::new("shift-k", ExtendUp, Some(CONTEXT)),
-        KeyBinding::new("shift-up", ExtendUp, Some(CONTEXT)),
-        KeyBinding::new("cmd-a", SelectAll, Some(CONTEXT)),
-        // ---- panes & tabs ----
-        KeyBinding::new("tab", SwitchPane, Some(CONTEXT)),
-        KeyBinding::new("cmd-t", NewTab, Some(CONTEXT)),
-        KeyBinding::new("cmd-w", CloseTab, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-]", NextTab, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-[", PrevTab, Some(CONTEXT)),
-        KeyBinding::new("cmd-\\", ToggleSplit, Some(CONTEXT)),
-        KeyBinding::new("ctrl-1", FocusLeft, Some(CONTEXT)),
-        KeyBinding::new("ctrl-2", FocusRight, Some(CONTEXT)),
-        // ---- views (Finder: ⌘1 icons, ⌘2 list, ⌘3 columns) ----
-        KeyBinding::new("cmd-1", ViewIcons, Some(CONTEXT)),
-        KeyBinding::new("cmd-2", ViewList, Some(CONTEXT)),
-        KeyBinding::new("cmd-3", ViewColumns, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-.", ToggleHidden, Some(CONTEXT)),
-        // ---- filtering & palette ----
-        KeyBinding::new("/", StartFilter, Some(CONTEXT)),
-        KeyBinding::new("cmd-p", OpenPalette, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-p", OpenCommands, Some(CONTEXT)),
-        // ---- preview ----
-        KeyBinding::new("space", TogglePreview, Some(CONTEXT)),
-        KeyBinding::new("cmd-alt-i", TogglePreview, Some(CONTEXT)),
-        // ---- transfers ----
-        KeyBinding::new("f5", CopyToOtherPane, Some(CONTEXT)),
-        KeyBinding::new("f6", MoveToOtherPane, Some(CONTEXT)),
-        KeyBinding::new("cmd-backspace", TrashSelection, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-n", NewFolder, Some(CONTEXT)),
-        KeyBinding::new("shift-r", RenameEntry, Some(CONTEXT)),
-        KeyBinding::new("cmd-o", OpenSelection, Some(CONTEXT)),
-        KeyBinding::new("cmd-c", CopyItems, Some(CONTEXT)),
-        KeyBinding::new("cmd-v", PasteItems, Some(CONTEXT)),
-        KeyBinding::new("cmd-x", CutItems, Some(CONTEXT)),
-        KeyBinding::new("cmd-shift-c", CopyAsPath, Some(CONTEXT)),
-        KeyBinding::new("delete", DeleteItems, Some(CONTEXT)),
-        KeyBinding::new("f2", RenameEntry, Some(CONTEXT)),
-        KeyBinding::new("alt-enter", Properties, Some(CONTEXT)),
-        // ---- panels ----
-        KeyBinding::new("cmd-j", ToggleTasks, Some(CONTEXT)),
-        KeyBinding::new("cmd-r", Refresh, Some(CONTEXT)),
-        KeyBinding::new("shift-s", CycleSort, Some(CONTEXT)),
-        // ---- misc ----
         KeyBinding::new("cmd-q", Quit, None),
         KeyBinding::new("cmd-,", OpenSettings, None),
         // Esc is the universal "back out": overlays first, then selection.
         KeyBinding::new("escape", CloseOverlay, None),
     ]);
+    let predicate = KeyBindingContextPredicate::parse(CONTEXT)
+        .ok()
+        .map(std::rc::Rc::new);
+    let bindings: Vec<KeyBinding> = keymap::all_bindings(overrides)
+        .into_iter()
+        .filter_map(|(action, binding)| {
+            let built = cx.build_action(&format!("veloce::{action}"), None).ok()?;
+            KeyBinding::load(
+                &binding,
+                built,
+                predicate.clone(),
+                false,
+                None,
+                cx.keyboard_mapper().as_ref(),
+            )
+            .ok()
+        })
+        .collect();
+    cx.bind_keys(bindings);
 }
 
 /// Human-readable cheat sheet shown in the empty preview state and the help row.
