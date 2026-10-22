@@ -25,6 +25,13 @@ pub struct Listing {
     pub selected: Vec<usize>,
     /// Position inside `visible`, not inside `entries`.
     pub cursor: usize,
+    /// Dot-files are hidden unless this is on (Finder's ⇧⌘.).
+    pub show_hidden: bool,
+}
+
+/// Unix convention, which Finder follows: a leading dot hides an entry.
+pub fn is_hidden(name: &str) -> bool {
+    name.starts_with('.')
 }
 
 impl Listing {
@@ -63,6 +70,11 @@ impl Listing {
         self.entries = sorted;
 
         self.visible = filter.matching_indices(&self.entries);
+        if !self.show_hidden {
+            let entries = &self.entries;
+            self.visible
+                .retain(|index| !is_hidden(&entries[*index].name));
+        }
         self.selected.retain(|index| *index < self.entries.len());
 
         if let Some(position) = cursor_id.and_then(|id| {
@@ -184,10 +196,26 @@ impl Listing {
     }
 
     /// The status line: item counts, folder counts and the selection's byte size.
+    /// Entries that could be shown: everything, or everything not hidden.
+    pub fn shown_total(&self) -> usize {
+        if self.show_hidden {
+            self.entries.len()
+        } else {
+            self.entries
+                .iter()
+                .filter(|entry| !is_hidden(&entry.name))
+                .count()
+        }
+    }
+
     pub fn status(&self) -> String {
-        let total = self.entries.len();
+        let total = self.shown_total();
         let visible = self.visible.len();
-        let dirs = self.entries.iter().filter(|entry| entry.is_dir()).count();
+        let dirs = self
+            .entries
+            .iter()
+            .filter(|entry| entry.is_dir() && (self.show_hidden || !is_hidden(&entry.name)))
+            .count();
         let mut status = if visible == total {
             format!("{total} items · {dirs} folders")
         } else {
@@ -505,6 +533,73 @@ mod tests {
         let mut filter = Filter::new();
         listing.set_entries(sample(), &SortSpec::default(), &mut filter);
         listing
+    }
+
+    fn with_hidden(show_hidden: bool) -> Listing {
+        let mut listing = Listing::new();
+        listing.show_hidden = show_hidden;
+        let mut filter = Filter::new();
+        let entries = vec![
+            entry(".git", 0, true),
+            entry(".env", 3, false),
+            entry("src", 0, true),
+            entry("main.rs", 10, false),
+        ];
+        listing.set_entries(entries, &SortSpec::default(), &mut filter);
+        listing
+    }
+
+    #[test]
+    fn dot_files_are_hidden_by_default() {
+        let listing = with_hidden(false);
+        let names: Vec<&str> = listing
+            .visible
+            .iter()
+            .map(|i| listing.entries[*i].name.as_str())
+            .collect();
+        assert_eq!(names, ["main.rs", "src"]);
+        assert!(!Listing::new().show_hidden);
+    }
+
+    #[test]
+    fn showing_hidden_files_lists_everything() {
+        assert_eq!(with_hidden(true).len(), 4);
+    }
+
+    #[test]
+    fn toggling_hidden_and_resyncing_changes_the_view() {
+        let mut listing = with_hidden(false);
+        listing.show_hidden = true;
+        listing.resync(&SortSpec::default(), &mut Filter::new());
+        assert_eq!(listing.len(), 4);
+        listing.show_hidden = false;
+        listing.resync(&SortSpec::default(), &mut Filter::new());
+        assert_eq!(listing.len(), 2);
+    }
+
+    #[test]
+    fn status_counts_only_what_can_be_shown() {
+        assert_eq!(with_hidden(false).status(), "2 items · 1 folders");
+        assert_eq!(with_hidden(true).status(), "4 items · 2 folders");
+    }
+
+    #[test]
+    fn a_folder_of_only_hidden_files_reads_as_empty() {
+        let mut listing = Listing::new();
+        listing.set_entries(
+            vec![entry(".hidden", 1, false)],
+            &SortSpec::default(),
+            &mut Filter::new(),
+        );
+        assert!(listing.is_empty());
+        assert_eq!(listing.entries.len(), 1);
+    }
+
+    #[test]
+    fn hidden_means_a_leading_dot() {
+        assert!(is_hidden(".gitignore"));
+        assert!(!is_hidden("a.rs"));
+        assert!(!is_hidden("dir.d"));
     }
 
     #[test]

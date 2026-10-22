@@ -35,6 +35,7 @@ pub enum MenuAction {
     SortDescending(bool),
     SortFoldersFirst,
     SetView(ViewMode),
+    ToggleHidden,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,7 +141,12 @@ pub fn sort_menu(spec: SortSpec) -> Vec<MenuItem> {
 /// Build the menu for `target`, laid out like Explorer's classic context menu:
 /// open actions, then Cut / Copy / Paste, then shortcut / Delete / Rename, then
 /// Properties. `can_paste` is whether the file clipboard holds anything.
-pub fn build_menu(target: &MenuTarget, can_paste: bool, view: ViewMode) -> Vec<MenuItem> {
+pub fn build_menu(
+    target: &MenuTarget,
+    can_paste: bool,
+    view: ViewMode,
+    show_hidden: bool,
+) -> Vec<MenuItem> {
     use MenuAction::*;
     match target {
         MenuTarget::Background => vec![
@@ -167,6 +173,11 @@ pub fn build_menu(target: &MenuTarget, can_paste: bool, view: ViewMode) -> Vec<M
                     true,
                 ),
                 view == ViewMode::Columns,
+            ),
+            MenuItem::Separator,
+            checked(
+                action(ToggleHidden, "Show hidden files", Some("⇧⌘."), true),
+                show_hidden,
             ),
         ],
         MenuTarget::Items {
@@ -310,7 +321,7 @@ mod tests {
 
     #[test]
     fn file_menu_has_the_explorer_core_in_order() {
-        let items = build_menu(&files(1), false, ViewMode::List);
+        let items = build_menu(&files(1), false, ViewMode::List, false);
         let labels = labels(&items);
         let at = |label: &str| labels.iter().position(|l| *l == label).unwrap();
         assert_eq!(labels[0], "Open");
@@ -323,7 +334,7 @@ mod tests {
     #[test]
     fn no_finder_only_commands_remain() {
         for target in [files(1), folder(), MenuTarget::Background] {
-            let labels = labels(&build_menu(&target, true, ViewMode::List))
+            let labels = labels(&build_menu(&target, true, ViewMode::List, false))
                 .iter()
                 .map(|l| l.to_string())
                 .collect::<Vec<_>>();
@@ -335,7 +346,7 @@ mod tests {
 
     #[test]
     fn several_items_disable_rename_and_properties_but_not_delete() {
-        let items = build_menu(&files(3), false, ViewMode::List);
+        let items = build_menu(&files(3), false, ViewMode::List, false);
         assert!(!find(&items, MenuAction::Rename).enabled);
         assert!(!find(&items, MenuAction::Properties).enabled);
         assert!(find(&items, MenuAction::Delete).enabled);
@@ -344,19 +355,19 @@ mod tests {
 
     #[test]
     fn folders_gain_tab_terminal_and_paste_into() {
-        let items = build_menu(&folder(), true, ViewMode::List);
+        let items = build_menu(&folder(), true, ViewMode::List, false);
         assert!(has(&items, MenuAction::OpenInNewTab));
         assert!(has(&items, MenuAction::OpenInTerminal));
         assert!(find(&items, MenuAction::PasteInto).enabled);
         assert!(
             !find(
-                &build_menu(&folder(), false, ViewMode::List),
+                &build_menu(&folder(), false, ViewMode::List, false),
                 MenuAction::PasteInto
             )
             .enabled
         );
         assert!(!has(
-            &build_menu(&files(1), true, ViewMode::List),
+            &build_menu(&files(1), true, ViewMode::List, false),
             MenuAction::PasteInto
         ));
     }
@@ -364,22 +375,24 @@ mod tests {
     #[test]
     fn every_compress_format_is_offered_for_any_selection() {
         for target in [files(1), files(3), folder(), archive()] {
-            let items = build_menu(&target, false, ViewMode::List);
+            let items = build_menu(&target, false, ViewMode::List, false);
             for format in CompressFormat::ALL {
                 assert!(has(&items, MenuAction::Compress(format)), "{format:?}");
             }
         }
         assert!(
-            labels(&build_menu(&files(1), false, ViewMode::List)).contains(&"Compress to ZIP file")
+            labels(&build_menu(&files(1), false, ViewMode::List, false))
+                .contains(&"Compress to ZIP file")
         );
         assert!(
-            labels(&build_menu(&files(1), false, ViewMode::List)).contains(&"Compress to TAR.GZ")
+            labels(&build_menu(&files(1), false, ViewMode::List, false))
+                .contains(&"Compress to TAR.GZ")
         );
     }
 
     #[test]
     fn archives_offer_extraction_named_after_their_stem() {
-        let items = build_menu(&archive(), false, ViewMode::List);
+        let items = build_menu(&archive(), false, ViewMode::List, false);
         assert!(has(&items, MenuAction::ExtractHere));
         assert!(labels(&items).contains(&"Extract to “photos/”"));
     }
@@ -387,11 +400,11 @@ mod tests {
     #[test]
     fn only_a_single_archive_offers_extraction() {
         assert!(!has(
-            &build_menu(&files(1), false, ViewMode::List),
+            &build_menu(&files(1), false, ViewMode::List, false),
             MenuAction::ExtractHere
         ));
         assert!(!has(
-            &build_menu(&folder(), false, ViewMode::List),
+            &build_menu(&folder(), false, ViewMode::List, false),
             MenuAction::ExtractTo
         ));
         let many = MenuTarget::Items {
@@ -400,7 +413,7 @@ mod tests {
             archive_stem: Some("a".into()),
         };
         assert!(!has(
-            &build_menu(&many, false, ViewMode::List),
+            &build_menu(&many, false, ViewMode::List, false),
             MenuAction::ExtractHere
         ));
     }
@@ -408,26 +421,26 @@ mod tests {
     #[test]
     fn single_files_can_be_previewed_but_folders_cannot() {
         assert!(has(
-            &build_menu(&files(1), false, ViewMode::List),
+            &build_menu(&files(1), false, ViewMode::List, false),
             MenuAction::Preview
         ));
         assert!(!has(
-            &build_menu(&folder(), false, ViewMode::List),
+            &build_menu(&folder(), false, ViewMode::List, false),
             MenuAction::Preview
         ));
         assert!(!has(
-            &build_menu(&files(2), false, ViewMode::List),
+            &build_menu(&files(2), false, ViewMode::List, false),
             MenuAction::Preview
         ));
     }
 
     #[test]
     fn background_menu_pastes_only_with_a_clipboard() {
-        let empty = build_menu(&MenuTarget::Background, false, ViewMode::List);
+        let empty = build_menu(&MenuTarget::Background, false, ViewMode::List, false);
         assert!(!find(&empty, MenuAction::Paste).enabled);
         assert!(
             find(
-                &build_menu(&MenuTarget::Background, true, ViewMode::List),
+                &build_menu(&MenuTarget::Background, true, ViewMode::List, false),
                 MenuAction::Paste
             )
             .enabled
@@ -438,7 +451,7 @@ mod tests {
     #[test]
     fn no_menu_starts_or_ends_with_a_separator_or_doubles_one() {
         for target in [MenuTarget::Background, files(1), files(2), folder()] {
-            let items = build_menu(&target, true, ViewMode::List);
+            let items = build_menu(&target, true, ViewMode::List, false);
             assert_ne!(items.first(), Some(&MenuItem::Separator));
             assert_ne!(items.last(), Some(&MenuItem::Separator));
             assert!(
@@ -504,13 +517,22 @@ mod tests {
     #[test]
     fn background_menu_checks_the_current_view() {
         for mode in [ViewMode::Icons, ViewMode::List, ViewMode::Columns] {
-            let items = build_menu(&MenuTarget::Background, false, mode);
+            let items = build_menu(&MenuTarget::Background, false, mode, false);
             assert_eq!(
                 checked_actions(&items),
                 [MenuAction::SetView(mode)],
                 "{mode:?}"
             );
         }
+    }
+
+    #[test]
+    fn background_menu_reflects_whether_hidden_files_are_shown() {
+        let off = build_menu(&MenuTarget::Background, false, ViewMode::List, false);
+        assert!(!checked_actions(&off).contains(&MenuAction::ToggleHidden));
+        let on = build_menu(&MenuTarget::Background, false, ViewMode::List, true);
+        assert!(checked_actions(&on).contains(&MenuAction::ToggleHidden));
+        assert!(has(&off, MenuAction::ToggleHidden));
     }
 
     #[test]

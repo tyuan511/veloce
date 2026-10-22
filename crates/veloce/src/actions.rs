@@ -44,6 +44,7 @@ actions!(
         ViewIcons,
         ViewList,
         ViewColumns,
+        ToggleHidden,
         // transfers
         CopyToOtherPane,
         MoveToOtherPane,
@@ -113,6 +114,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-1", ViewIcons, Some(CONTEXT)),
         KeyBinding::new("cmd-2", ViewList, Some(CONTEXT)),
         KeyBinding::new("cmd-3", ViewColumns, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-.", ToggleHidden, Some(CONTEXT)),
         // ---- filtering & palette ----
         KeyBinding::new("/", StartFilter, Some(CONTEXT)),
         KeyBinding::new("cmd-p", OpenPalette, Some(CONTEXT)),

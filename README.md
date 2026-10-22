@@ -78,6 +78,7 @@ compile once at first launch.
 | `shift-j` | extend selection |
 | `⌘A` / `esc` | select all / clear |
 | `space` | Quick Look: large preview of the selected file (`space` / `esc` to close, arrows keep moving) |
+| `⇧⌘.` | show / hide dot-files (hidden by default, per pane) |
 | `⌘1` / `⌘2` / `⌘3` | view as icons / list / columns |
 | `⌥⌘I` | toggle the inspector panel |
 | `⌃1` / `⌃2` | focus left / right pane |
@@ -123,7 +124,7 @@ compile once at first launch.
 ## Tests
 
 ```sh
-cargo test              # 286 tests, no GPU or window server needed
+cargo test              # 293 tests, no GPU or window server needed
 cargo test -p vfs-core  # 156 core tests
 ```
 

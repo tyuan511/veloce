@@ -97,6 +97,7 @@ impl Pane {
         let uri = VfsUri::local(path);
         let provider = self.services.provider.clone();
         let sort = self.sort;
+        let show_hidden = self.listing.show_hidden;
         cx.spawn(async move |this, cx| {
             use futures::StreamExt as _;
             let mut entries: Vec<FileEntry> = Vec::new();
@@ -105,6 +106,9 @@ impl Pane {
                 while let Some(Ok(chunk)) = stream.next().await {
                     entries.extend(chunk);
                 }
+            }
+            if !show_hidden {
+                entries.retain(|entry| !crate::listing::is_hidden(&entry.name));
             }
             sort.sort(&mut entries);
             this.update(cx, |pane, cx| {

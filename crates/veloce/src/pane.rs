@@ -434,6 +434,19 @@ impl Pane {
         cx.notify();
     }
 
+    /// Show or hide dot-files in every view of this pane.
+    pub fn set_show_hidden(&mut self, show: bool, cx: &mut Context<Self>) {
+        if self.listing.show_hidden == show {
+            return;
+        }
+        self.listing.show_hidden = show;
+        self.recompute_visible();
+        self.invalidate_columns();
+        self.refresh_status();
+        cx.emit(PaneEvent::ListingChanged);
+        cx.notify();
+    }
+
     pub fn set_sort(&mut self, sort: SortSpec, cx: &mut Context<Self>) {
         self.sort = sort;
         self.recompute_visible();
@@ -1319,7 +1332,7 @@ impl Pane {
 
     fn render_filter_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let matched = self.listing.len();
-        let total = self.listing.entries.len();
+        let total = self.listing.shown_total();
         let input = self.filter_input.clone();
         let _ = cx;
         div()

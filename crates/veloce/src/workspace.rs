@@ -241,6 +241,7 @@ impl Workspace {
                 &target,
                 !self.clipboard.is_empty(),
                 self.focused_pane().read(cx).view,
+                self.focused_pane().read(cx).listing.show_hidden,
             ),
         });
         cx.notify();
@@ -432,6 +433,10 @@ impl Workspace {
                 pane.update(cx, |pane, cx| pane.set_sort(spec, cx));
             }
             MenuAction::SetView(view) => self.set_view(view, cx),
+            MenuAction::ToggleHidden => {
+                let show = !pane.read(cx).listing.show_hidden;
+                pane.update(cx, |pane, cx| pane.set_show_hidden(show, cx));
+            }
             MenuAction::Refresh => pane.update(cx, |pane, cx| pane.refresh(cx)),
         }
         cx.notify();
@@ -816,6 +821,10 @@ impl Workspace {
         self.set_view(ViewMode::Icons, cx);
     }
 
+    fn on_toggle_hidden(&mut self, _: &ToggleHidden, w: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_action(MenuAction::ToggleHidden, w, cx);
+    }
+
     fn on_view_list(&mut self, _: &ViewList, _: &mut Window, cx: &mut Context<Self>) {
         self.set_view(ViewMode::List, cx);
     }
@@ -1148,6 +1157,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_quick_look))
             .on_action(cx.listener(Self::on_view_icons))
             .on_action(cx.listener(Self::on_view_list))
+            .on_action(cx.listener(Self::on_toggle_hidden))
             .on_action(cx.listener(Self::on_view_columns))
             .on_action(cx.listener(Self::on_page_down))
             .on_action(cx.listener(Self::on_page_up))
