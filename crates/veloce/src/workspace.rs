@@ -19,21 +19,38 @@ use vfs_core::{FsWatcher, VfsUri, WatchEvent};
 
 use crate::{
     actions::*,
-    file_icons, icons,
-    listing::{Place, expand_home, favorite_places, place_is_current},
+    context_menu::{
+        ActionItem, MENU_PADDING, MENU_WIDTH, MenuAction, MenuItem, MenuTarget, build_menu,
+        clamp_origin, menu_height,
+    },
+    icons,
+    info::info_rows,
+    listing::{Place, expand_home, favorite_places, location_places, place_is_current},
     palette::{Palette, PaletteChoice, PaletteEvent, PaletteMode},
     pane::{Pane, PaneEvent, PaneSide, Services},
     preview::PreviewView,
     tasks_panel::TaskPanel,
     text_input::{TextInput, TextInputEvent},
     theme,
-    tree::{TreeState, list_subdirs},
 };
 
 /// Files created by the inline "new folder / rename" prompt.
 pub(crate) enum InlinePrompt {
     NewFolder,
     Rename,
+}
+
+/// An open right-click menu. The origin is the raw cursor position; it is
+/// clamped to the window at render time, when the window size is known.
+pub(crate) struct OpenMenu {
+    origin: (f32, f32),
+    items: Vec<MenuItem>,
+}
+
+/// The Get Info window's subject plus its slowly computed folder size.
+pub(crate) struct InfoState {
+    entry: vfs_core::FileEntry,
+    folder_bytes: Option<u64>,
 }
 
 /// The application root view.
@@ -47,13 +64,12 @@ pub struct Workspace {
     pub tasks_open: bool,
     /// Second pane visible. Off by default, like Finder; ⌘\ turns it on.
     pub split: bool,
+    /// Paths copied with Copy / "Copy Item", pasted by Paste Item.
+    clipboard: Vec<PathBuf>,
+    menu: Option<OpenMenu>,
+    info: Option<InfoState>,
     /// Finder-style shortcuts down the left edge.
     places: Vec<Place>,
-    /// Lazy folder tree under the favorites, rooted at home.
-    tree: TreeState,
-    /// Folder the tree was last opened down to, so a refresh of the same
-    /// folder does not re-expand what the user collapsed.
-    revealed: Option<PathBuf>,
     /// Inline name prompt shown over the list (new folder / rename).
     pub(crate) prompt: Option<(InlinePrompt, Entity<TextInput>)>,
     focus_handle: FocusHandle,
@@ -104,9 +120,10 @@ impl Workspace {
             palette: palette.clone(),
             tasks_open: false,
             split: false,
+            clipboard: Vec::new(),
+            menu: None,
+            info: None,
             places: favorite_places(&home_dir),
-            tree: TreeState::new(home_dir.clone()),
-            revealed: None,
             prompt: None,
             focus_handle: cx.focus_handle(),
             watcher: None,
@@ -133,7 +150,6 @@ impl Workspace {
         self.right.update(cx, |pane, cx| pane.reload(cx));
         self.sync_preview(cx);
         self.retarget_watcher(cx);
-        self.reveal_in_tree(cx);
         let handle = self.focus_handle.clone();
         window.focus(&handle);
         self.focus_pane(PaneSide::Left, window, cx);
@@ -150,7 +166,6 @@ impl Workspace {
                         PaneEvent::ListingChanged => {
                             workspace.sync_preview(cx);
                             workspace.retarget_watcher(cx);
-                            workspace.reveal_in_tree(cx);
                         }
                         PaneEvent::OpenExternally(uri) => {
                             if let Some(path) = uri.as_local_path() {
@@ -160,8 +175,13 @@ impl Workspace {
                         PaneEvent::OpenTerminal(dir) => {
                             let _ = open::that_detached(dir);
                         }
+                        PaneEvent::ContextMenu { position, on_entry } => {
+                            workspace.open_context_menu(&pane, *position, *on_entry, cx);
+                        }
+                        PaneEvent::Notice(message) => {
+                            workspace.banner = Some((message.clone(), std::time::Instant::now()));
+                        }
                     }
-                    let _ = pane;
                     cx.notify();
                 }),
             );
@@ -179,43 +199,167 @@ impl Workspace {
         subscriptions
     }
 
-    /// Read one folder's sub-directories off the UI thread and cache them.
-    fn load_tree_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
-        cx.spawn(async move |this, cx| {
-            let target = dir.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move { list_subdirs(&target) })
-                .await;
-            this.update(cx, |workspace, cx| {
-                // An unreadable folder just shows no children rather than an error.
-                workspace.tree.set_children(dir, result.unwrap_or_default());
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
+    // ---- context menu & file-menu commands ----------------------------------
+
+    fn open_context_menu(
+        &mut self,
+        pane: &Entity<Pane>,
+        position: gpui::Point<gpui::Pixels>,
+        on_entry: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let (side, selection) = {
+            let pane = pane.read(cx);
+            (pane.side, pane.selection_or_cursor())
+        };
+        // Right-clicking the other pane acts there, as in any two-pane manager.
+        self.focused = if self.split { side } else { PaneSide::Left };
+        let target = match (on_entry, selection.first()) {
+            (true, Some(first)) => MenuTarget::Items {
+                count: selection.len(),
+                name: first.name.clone(),
+                is_dir: selection.len() == 1 && first.is_dir(),
+            },
+            _ => MenuTarget::Background,
+        };
+        self.menu = Some(OpenMenu {
+            origin: (f32::from(position.x), f32::from(position.y)),
+            items: build_menu(&target, !self.clipboard.is_empty()),
+        });
+        cx.notify();
     }
 
-    /// Open the tree down to the focused pane's folder so the user can see where they are.
-    fn reveal_in_tree(&mut self, cx: &mut Context<Self>) {
-        let Some(path) = self.focused_pane().read(cx).current_uri().as_local_path() else {
+    fn show_tasks(&mut self, cx: &mut Context<Self>) {
+        self.tasks_open = true;
+        self.tasks.update(cx, |panel, cx| {
+            if !panel.open {
+                panel.toggle(cx);
+            }
+        });
+    }
+
+    fn show_info(&mut self, cx: &mut Context<Self>) {
+        let Some(entry) = self.focused_pane().read(cx).cursor_entry().cloned() else {
             return;
         };
-        if self.revealed.as_ref() == Some(&path) {
-            return;
-        }
-        self.revealed = Some(path.clone());
-        for dir in self.tree.reveal(&path) {
-            self.load_tree_dir(dir, cx);
+        let path = entry.uri.as_local_path();
+        let is_dir = entry.is_dir();
+        let id = entry.id();
+        self.info = Some(InfoState {
+            entry,
+            folder_bytes: None,
+        });
+        cx.notify();
+        if let (true, Some(path)) = (is_dir, path) {
+            // Folder sizes need a full walk, so they arrive after the window opens.
+            cx.spawn(async move |this, cx| {
+                let (bytes, _) = cx
+                    .background_executor()
+                    .spawn(async move { vfs_core::ops::measure_tree(&path) })
+                    .await;
+                this.update(cx, |workspace, cx| {
+                    if let Some(info) = workspace.info.as_mut().filter(|i| i.entry.id() == id) {
+                        info.folder_bytes = Some(bytes);
+                        cx.notify();
+                    }
+                })
+                .ok();
+            })
+            .detach();
         }
     }
 
-    fn toggle_tree_dir(&mut self, path: PathBuf, cx: &mut Context<Self>) {
-        if self.tree.toggle(&path) {
-            self.load_tree_dir(path, cx);
+    fn copy_text_to_clipboard(paths: &[PathBuf], cx: &mut Context<Self>) {
+        let text = paths
+            .iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+            .join("\n");
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+    }
+
+    /// One entry point for the menu rows and their keyboard shortcuts, so both
+    /// always do the same thing.
+    fn run_menu_action(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.focused_pane();
+        match action {
+            MenuAction::Open => pane.update(cx, |pane, cx| pane.open_selection(cx)),
+            MenuAction::OpenInNewTab => {
+                if let Some(entry) = pane.read(cx).cursor_entry().cloned() {
+                    pane.update(cx, |pane, cx| pane.open_in_new_tab(entry.uri, cx));
+                }
+            }
+            MenuAction::OpenInTerminal => {
+                let target = {
+                    let pane = pane.read(cx);
+                    match pane.cursor_entry() {
+                        Some(entry) if entry.is_dir() && !pane.listing.selected.is_empty() => {
+                            entry.uri.as_local_path()
+                        }
+                        _ => pane.current_uri().as_local_path(),
+                    }
+                };
+                if let Some(dir) = target {
+                    Self::open_terminal_at(&dir);
+                }
+            }
+            MenuAction::Trash => {
+                pane.update(cx, |pane, cx| pane.trash_selection(cx));
+                self.show_tasks(cx);
+            }
+            MenuAction::GetInfo => self.show_info(cx),
+            MenuAction::Rename => {
+                if let Some(entry) = pane.read(cx).cursor_entry().cloned() {
+                    self.start_prompt(InlinePrompt::Rename, entry.name.clone(), window, cx);
+                }
+            }
+            MenuAction::Compress => {
+                pane.update(cx, |pane, cx| pane.compress_selection(cx));
+            }
+            MenuAction::Duplicate => {
+                pane.update(cx, |pane, cx| pane.duplicate_selection(cx));
+                self.show_tasks(cx);
+            }
+            MenuAction::MakeAlias => pane.update(cx, |pane, cx| pane.alias_selection(cx)),
+            MenuAction::QuickLook => pane.update(cx, |pane, cx| pane.show_preview(cx)),
+            MenuAction::Copy => {
+                self.clipboard = pane.read(cx).selection_paths();
+                Self::copy_text_to_clipboard(&self.clipboard, cx);
+            }
+            MenuAction::CopyPath => {
+                let paths = pane.read(cx).selection_paths();
+                Self::copy_text_to_clipboard(&paths, cx);
+            }
+            MenuAction::Paste => {
+                let sources = self.clipboard.clone();
+                if !sources.is_empty() {
+                    pane.update(cx, |pane, cx| pane.paste_paths(&sources, cx));
+                    self.show_tasks(cx);
+                }
+            }
+            MenuAction::NewFolder => self.start_prompt(
+                InlinePrompt::NewFolder,
+                "untitled folder".to_string(),
+                window,
+                cx,
+            ),
+            MenuAction::Refresh => pane.update(cx, |pane, cx| pane.reload(cx)),
         }
         cx.notify();
+    }
+
+    /// Open Terminal in `dir`. macOS only for now; elsewhere there is no single
+    /// "the terminal" to ask for, so this is a no-op rather than a wrong guess.
+    fn open_terminal_at(dir: &std::path::Path) {
+        #[cfg(target_os = "macos")]
+        {
+            let _ = std::process::Command::new("open")
+                .args(["-a", "Terminal"])
+                .arg(dir)
+                .spawn();
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = dir;
     }
 
     fn pane(&self, side: PaneSide) -> Entity<Pane> {
@@ -451,6 +595,10 @@ impl Workspace {
     }
 
     fn close_overlays(&mut self, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() || self.info.take().is_some() {
+            cx.notify();
+            return;
+        }
         if self.palette.read(cx).open {
             self.palette.update(cx, |palette, cx| palette.close(cx));
             return;
@@ -629,6 +777,30 @@ impl Workspace {
         self.toggle_split(window, cx);
     }
 
+    fn on_open_selection(&mut self, _: &OpenSelection, w: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_action(MenuAction::Open, w, cx);
+    }
+
+    fn on_copy_items(&mut self, _: &CopyItems, w: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_action(MenuAction::Copy, w, cx);
+    }
+
+    fn on_paste_items(&mut self, _: &PasteItems, w: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_action(MenuAction::Paste, w, cx);
+    }
+
+    fn on_duplicate(&mut self, _: &DuplicateEntry, w: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_action(MenuAction::Duplicate, w, cx);
+    }
+
+    fn on_make_alias(&mut self, _: &MakeAlias, w: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_action(MenuAction::MakeAlias, w, cx);
+    }
+
+    fn on_get_info(&mut self, _: &GetInfo, w: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_action(MenuAction::GetInfo, w, cx);
+    }
+
     fn on_start_filter(&mut self, _: &StartFilter, window: &mut Window, cx: &mut Context<Self>) {
         let pane = self.focused_pane();
         pane.update(cx, |pane, cx| pane.start_filter(window, cx));
@@ -700,7 +872,11 @@ impl Workspace {
 
     /// Esc is the universal "back out": overlay → filter → selection.
     fn on_close_overlay(&mut self, _: &CloseOverlay, _: &mut Window, cx: &mut Context<Self>) {
-        if self.palette.read(cx).open || self.prompt.is_some() {
+        if self.palette.read(cx).open
+            || self.prompt.is_some()
+            || self.menu.is_some()
+            || self.info.is_some()
+        {
             self.close_overlays(cx);
             return;
         }
@@ -788,6 +964,8 @@ impl Render for Workspace {
         let tasks_open = self.tasks_open;
         let palette = self.palette.clone();
         let sidebar = self.render_sidebar(cx);
+        let menu = self.render_context_menu(window, cx);
+        let info = self.render_info(cx);
 
         div()
             .key_context("Workspace")
@@ -812,6 +990,12 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_prev_tab))
             .on_action(cx.listener(Self::on_toggle_split))
+            .on_action(cx.listener(Self::on_open_selection))
+            .on_action(cx.listener(Self::on_copy_items))
+            .on_action(cx.listener(Self::on_paste_items))
+            .on_action(cx.listener(Self::on_duplicate))
+            .on_action(cx.listener(Self::on_make_alias))
+            .on_action(cx.listener(Self::on_get_info))
             .on_action(cx.listener(Self::on_start_filter))
             .on_action(cx.listener(Self::on_open_palette))
             .on_action(cx.listener(Self::on_open_commands))
@@ -854,11 +1038,208 @@ impl Render for Workspace {
                 this.child(render_prompt(title, input, cx))
             })
             .when(palette_open, |this| this.child(palette))
+            .when_some(menu, |this, menu| this.child(menu))
+            .when_some(info, |this, info| this.child(info))
             .when_some(banner, |this, message| this.child(render_banner(&message)))
     }
 }
 
 impl Workspace {
+    fn render_context_menu(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let menu = self.menu.as_ref()?;
+        let viewport = window.viewport_size();
+        let height = menu_height(&menu.items);
+        let (x, y) = clamp_origin(
+            menu.origin,
+            (MENU_WIDTH, height),
+            (f32::from(viewport.width), f32::from(viewport.height)),
+        );
+
+        let rows = menu
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, item)| match item {
+                MenuItem::Separator => div()
+                    .my(px(4.))
+                    .mx_2()
+                    .h(px(1.))
+                    .bg(theme::border_soft())
+                    .into_any_element(),
+                MenuItem::Action(ActionItem {
+                    action,
+                    label,
+                    shortcut,
+                    enabled,
+                }) => {
+                    let action = *action;
+                    let entity = cx.entity();
+                    let row = div()
+                        .id(gpui::ElementId::Name(format!("menu-item-{index}").into()))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .justify_between()
+                        .gap_4()
+                        .h(px(crate::context_menu::ITEM_HEIGHT))
+                        .px_2()
+                        .rounded_sm()
+                        .text_sm()
+                        .child(div().truncate().min_w_0().child(label.clone()))
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_xs()
+                                .opacity(0.7)
+                                .child(shortcut.unwrap_or("")),
+                        );
+                    if *enabled {
+                        row.text_color(theme::text())
+                            .cursor_pointer()
+                            .hover(|this| this.bg(theme::bg_selected()).text_color(gpui::white()))
+                            .on_click(move |_, window, cx| {
+                                entity.update(cx, |workspace, cx| {
+                                    workspace.menu = None;
+                                    workspace.run_menu_action(action, window, cx);
+                                });
+                            })
+                            .into_any_element()
+                    } else {
+                        row.text_color(theme::text_faint()).into_any_element()
+                    }
+                }
+            });
+
+        let entity = cx.entity();
+        let close_left = entity.clone();
+        Some(
+            div()
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .right(px(0.))
+                .bottom(px(0.))
+                .occlude()
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    close_left.update(cx, |workspace, cx| {
+                        workspace.menu = None;
+                        cx.notify();
+                    });
+                })
+                .on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                    entity.update(cx, |workspace, cx| {
+                        workspace.menu = None;
+                        cx.notify();
+                    });
+                })
+                .child(
+                    div()
+                        .absolute()
+                        .left(px(x))
+                        .top(px(y))
+                        .w(px(MENU_WIDTH))
+                        .flex()
+                        .flex_col()
+                        .p(px(MENU_PADDING))
+                        .rounded_lg()
+                        .bg(theme::bg_raised())
+                        .border_1()
+                        .border_color(theme::border())
+                        .shadow_lg()
+                        // Clicks inside the menu must not reach the dismissing backdrop.
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
+                        .children(rows),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn render_info(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let info = self.info.as_ref()?;
+        let rows = info_rows(&info.entry, info.folder_bytes);
+        let name = info.entry.name.clone();
+        let icon = crate::pane::entry_icon(&info.entry, 40.0);
+        let entity = cx.entity();
+
+        Some(
+            div()
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .right(px(0.))
+                .bottom(px(0.))
+                .occlude()
+                .flex()
+                .items_start()
+                .justify_center()
+                .pt(px(100.))
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    entity.update(cx, |workspace, cx| {
+                        workspace.info = None;
+                        cx.notify();
+                    });
+                })
+                .child(
+                    div()
+                        .w(px(380.))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_4()
+                        .rounded_lg()
+                        .bg(theme::bg_raised())
+                        .border_1()
+                        .border_color(theme::border())
+                        .shadow_lg()
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_3()
+                                .child(icon)
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .text_color(theme::text())
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .truncate()
+                                        .child(format!("{name} Info")),
+                                ),
+                        )
+                        .child(div().h(px(1.)).bg(theme::border_soft()))
+                        .children(rows.into_iter().map(|(label, value)| {
+                            div()
+                                .flex()
+                                .flex_row()
+                                .gap_3()
+                                .text_sm()
+                                .child(
+                                    div()
+                                        .w(px(84.))
+                                        .flex_shrink_0()
+                                        .text_color(theme::text_faint())
+                                        .child(label),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .text_color(theme::text())
+                                        .child(value),
+                                )
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
     /// Unified toolbar, as in Finder: window controls on the left, one search
     /// field in the middle, view toggles on the right. The path lives in the
     /// panes' breadcrumbs, so it is not repeated here.
@@ -983,151 +1364,73 @@ impl Workspace {
     /// the dual-pane analogue of Finder's single content area.
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let current = self.focused_pane().read(cx).current_uri().path.clone();
-        let mut list = div().flex().flex_col().gap_0p5().px_2().child(
-            div()
-                .px_2()
-                .pb_1()
-                .text_xs()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(theme::text_faint())
-                .child("Favorites"),
-        );
+        let sections = [
+            ("Favorites", self.places.clone()),
+            ("Locations", location_places()),
+        ];
 
-        for (index, place) in self.places.iter().enumerate() {
-            let active = place_is_current(place, &current);
-            let target = place.path.clone();
-            let entity = cx.entity();
-            list = list.child(
+        let mut column = div().flex().flex_col().gap_0p5().px_2();
+        let mut index = 0;
+        for (title, places) in sections {
+            column = column.child(
                 div()
-                    .id(gpui::ElementId::Name(format!("place-{index}").into()))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .h(px(26.))
                     .px_2()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_sm()
-                    .when(active, |this| {
-                        this.bg(theme::bg_hover()).text_color(theme::text())
-                    })
-                    .when(!active, |this| {
-                        this.text_color(theme::text_muted())
-                            .hover(|this| this.bg(theme::bg_raised()).text_color(theme::text()))
-                    })
-                    .on_click(move |_, window, cx| {
-                        let target = target.clone();
-                        entity.update(cx, |workspace, cx| {
-                            let side = workspace.focused;
-                            workspace.pane(side).update(cx, |pane, cx| {
-                                pane.navigate_to(VfsUri::local(&target), cx)
-                            });
-                            workspace.focus_pane(side, window, cx);
-                        });
-                    })
-                    .child(
-                        svg()
-                            .path(place.icon)
-                            .w(px(15.))
-                            .h(px(15.))
-                            .flex_shrink_0()
-                            .text_color(if active {
-                                theme::accent()
-                            } else {
-                                theme::text_faint()
-                            }),
-                    )
-                    .child(div().truncate().min_w_0().child(place.label)),
+                    .pt_3()
+                    .pb_1()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme::text_faint())
+                    .child(title),
             );
-        }
-
-        let mut tree = div().flex().flex_col().gap_0p5().px_2().pb_2().child(
-            div()
-                .px_2()
-                .pt_3()
-                .pb_1()
-                .text_xs()
-                .font_weight(gpui::FontWeight::SEMIBOLD)
-                .text_color(theme::text_faint())
-                .child("Folders"),
-        );
-        for (index, row) in self.tree.rows().into_iter().enumerate() {
-            let active =
-                row.path.to_string_lossy().trim_end_matches('/') == current.trim_end_matches('/');
-            let toggle_entity = cx.entity();
-            let open_entity = cx.entity();
-            let toggle_path = row.path.clone();
-            let open_path = row.path.clone();
-            let icon_id = file_icons::folder_icon_id(&row.name, row.expanded);
-            tree = tree.child(
-                div()
-                    .id(gpui::ElementId::Name(format!("tree-{index}").into()))
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .h(px(24.))
-                    .pl(px(4. + row.depth as f32 * 12.))
-                    .pr_2()
-                    .rounded_md()
-                    .cursor_pointer()
-                    .text_sm()
-                    .when(active, |this| {
-                        this.bg(theme::bg_hover()).text_color(theme::text())
-                    })
-                    .when(!active, |this| {
-                        this.text_color(theme::text_muted())
-                            .hover(|this| this.bg(theme::bg_raised()).text_color(theme::text()))
-                    })
-                    .on_click(move |_, window, cx| {
-                        let target = open_path.clone();
-                        open_entity.update(cx, |workspace, cx| {
-                            let side = workspace.focused;
-                            workspace.pane(side).update(cx, |pane, cx| {
-                                pane.navigate_to(VfsUri::local(&target), cx)
-                            });
-                            workspace.focus_pane(side, window, cx);
-                        });
-                    })
-                    .child(
-                        div()
-                            .id(gpui::ElementId::Name(format!("tree-{index}-toggle").into()))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .w(px(14.))
-                            .h(px(14.))
-                            .flex_shrink_0()
-                            .rounded_sm()
-                            .hover(|this| this.bg(theme::bg_hover()))
-                            .on_click(move |_, _, cx| {
-                                cx.stop_propagation();
-                                let path = toggle_path.clone();
-                                toggle_entity.update(cx, |workspace, cx| {
-                                    workspace.toggle_tree_dir(path, cx)
+            for place in places {
+                let active = place_is_current(&place, &current);
+                let target = place.path.clone();
+                let entity = cx.entity();
+                column = column.child(
+                    div()
+                        .id(gpui::ElementId::Name(format!("place-{index}").into()))
+                        .flex()
+                        .flex_row()
+                        .items_center()
+                        .gap_2()
+                        .h(px(26.))
+                        .px_2()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_sm()
+                        .when(active, |this| {
+                            this.bg(theme::bg_hover()).text_color(theme::text())
+                        })
+                        .when(!active, |this| {
+                            this.text_color(theme::text_muted())
+                                .hover(|this| this.bg(theme::bg_raised()).text_color(theme::text()))
+                        })
+                        .on_click(move |_, window, cx| {
+                            let target = target.clone();
+                            entity.update(cx, |workspace, cx| {
+                                let side = workspace.focused;
+                                workspace.pane(side).update(cx, |pane, cx| {
+                                    pane.navigate_to(VfsUri::local(&target), cx)
                                 });
-                            })
-                            .child(
-                                svg()
-                                    .path(if row.expanded {
-                                        icons::CHEVRON_DOWN
-                                    } else {
-                                        icons::CHEVRON_RIGHT
-                                    })
-                                    .w(px(10.))
-                                    .h(px(10.))
-                                    .text_color(theme::text_faint()),
-                            ),
-                    )
-                    .child(
-                        gpui::img(file_icons::asset_path(icon_id))
-                            .w(px(15.))
-                            .h(px(15.))
-                            .flex_shrink_0(),
-                    )
-                    .child(div().truncate().min_w_0().child(row.name)),
-            );
+                                workspace.focus_pane(side, window, cx);
+                            });
+                        })
+                        .child(
+                            svg()
+                                .path(place.icon)
+                                .w(px(15.))
+                                .h(px(15.))
+                                .flex_shrink_0()
+                                .text_color(if active {
+                                    theme::accent()
+                                } else {
+                                    theme::text_faint()
+                                }),
+                        )
+                        .child(div().truncate().min_w_0().child(place.label)),
+                );
+                index += 1;
+            }
         }
 
         div()
@@ -1135,21 +1438,11 @@ impl Workspace {
             .flex_col()
             .w(px(theme::SIDEBAR_WIDTH))
             .h_full()
-            .min_h_0()
             .flex_shrink_0()
-            .pt_3()
             .bg(theme::bg())
             .border_r_1()
             .border_color(theme::border_soft())
-            .child(list)
-            .child(
-                div()
-                    .id("sidebar-tree")
-                    .flex_1()
-                    .min_h_0()
-                    .overflow_y_scroll()
-                    .child(tree),
-            )
+            .child(column)
             .into_any_element()
     }
 }

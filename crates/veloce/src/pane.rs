@@ -21,7 +21,7 @@ use gpui::{
 use vfs_core::{
     FileEntry, FileKind, Filter, LocalProvider, SortKey, SortSpec, VfsProvider, VfsUri,
     entry::{format_relative, format_size},
-    ops::{ConflictPolicy, TaskManager},
+    ops::{ConflictPolicy, TaskManager, alias_path, archive_path, duplicate_path},
 };
 
 use crate::{
@@ -103,6 +103,13 @@ pub enum PaneEvent {
     /// The user asked to reveal something in a terminal (`⌘⇧O`, milestone 2).
     #[allow(dead_code)]
     OpenTerminal(PathBuf),
+    /// Right-click: `on_entry` says whether a row (vs. empty space) was hit.
+    ContextMenu {
+        position: gpui::Point<gpui::Pixels>,
+        on_entry: bool,
+    },
+    /// A background operation failed; the workspace shows it as a banner.
+    Notice(String),
 }
 
 /// Jump targets for `gg` / `G`.
@@ -617,6 +624,187 @@ impl Pane {
         self.reload_when_idle(cx);
     }
 
+    // ---- context-menu operations -------------------------------------------
+
+    /// Right-click bookkeeping: a click inside the selection keeps it (so the menu
+    /// acts on all of it); a click elsewhere selects just that row, like Finder.
+    pub fn context_click(
+        &mut self,
+        row: Option<usize>,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        match row {
+            Some(row) => {
+                let inside = self
+                    .listing
+                    .visible
+                    .get(row)
+                    .is_some_and(|index| self.listing.selected.contains(index));
+                if inside {
+                    self.listing.cursor = row;
+                } else {
+                    self.listing.set_cursor(row, false);
+                }
+            }
+            None => self.listing.clear_selection(),
+        }
+        cx.emit(PaneEvent::ContextMenu {
+            position,
+            on_entry: row.is_some(),
+        });
+        cx.emit(PaneEvent::ListingChanged);
+        cx.notify();
+    }
+
+    /// Local paths of the selection (or cursor entry).
+    pub fn selection_paths(&self) -> Vec<PathBuf> {
+        self.selection_or_cursor()
+            .iter()
+            .filter_map(|entry| entry.uri.as_local_path())
+            .collect()
+    }
+
+    /// `Open`: one entry behaves like Enter; several open every file (folders
+    /// cannot all be entered at once, so they are skipped).
+    pub fn open_selection(&mut self, cx: &mut Context<Self>) {
+        let entries = self.selection_or_cursor();
+        if entries.len() <= 1 {
+            self.activate_cursor(cx);
+            return;
+        }
+        for entry in entries.into_iter().filter(|entry| !entry.is_dir()) {
+            cx.emit(PaneEvent::OpenExternally(entry.uri));
+        }
+    }
+
+    pub fn open_in_new_tab(&mut self, uri: VfsUri, cx: &mut Context<Self>) {
+        self.new_tab(cx);
+        self.navigate_to(uri, cx);
+    }
+
+    /// `Duplicate`: `name copy.ext` next to the original, via the task manager.
+    pub fn duplicate_selection(&mut self, cx: &mut Context<Self>) {
+        for from in self.selection_paths() {
+            let to = duplicate_path(&from);
+            self.services.tasks.copy(from, to, ConflictPolicy::Rename);
+        }
+        self.reload_when_idle(cx);
+    }
+
+    /// `Paste Item`: copy into the current folder. Pasting where the source already
+    /// lives duplicates it instead of clobbering or silently doing nothing.
+    pub fn paste_paths(&mut self, sources: &[PathBuf], cx: &mut Context<Self>) {
+        let Some(dir) = self.current_uri().as_local_path() else {
+            return;
+        };
+        for from in sources {
+            let Some(name) = from.file_name() else {
+                continue;
+            };
+            let to = if from.parent() == Some(dir.as_path()) {
+                duplicate_path(from)
+            } else {
+                dir.join(name)
+            };
+            self.services
+                .tasks
+                .copy(from.clone(), to, ConflictPolicy::Rename);
+        }
+        self.reload_when_idle(cx);
+    }
+
+    /// `Make Alias`: a symlink named `name alias`. Off the UI thread like every
+    /// other filesystem write.
+    pub fn alias_selection(&mut self, cx: &mut Context<Self>) {
+        let pairs: Vec<(PathBuf, PathBuf)> = self
+            .selection_paths()
+            .into_iter()
+            .map(|from| {
+                let to = alias_path(&from);
+                (from, to)
+            })
+            .collect();
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    for (from, to) in pairs {
+                        std::os::unix::fs::symlink(&from, &to).map_err(|error| {
+                            format!("Cannot make an alias of {}: {error}", from.display())
+                        })?;
+                    }
+                    Ok::<(), String>(())
+                })
+                .await;
+            this.update(cx, |pane, cx| {
+                if let Err(message) = result {
+                    cx.emit(PaneEvent::Notice(message));
+                }
+                pane.reload(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// `Compress`: a zip next to the first item, written by the system `zip` so
+    /// symlinks and permissions survive.
+    pub fn compress_selection(&mut self, cx: &mut Context<Self>) {
+        let sources = self.selection_paths();
+        let Some(archive) = archive_path(&sources) else {
+            return;
+        };
+        let Some(dir) = archive.parent().map(|dir| dir.to_path_buf()) else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let target = archive.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut command = std::process::Command::new("zip");
+                    command
+                        .current_dir(&dir)
+                        .arg("-r")
+                        .arg("-q")
+                        .arg("-y")
+                        .arg(&target);
+                    for source in &sources {
+                        if let Some(name) = source.file_name() {
+                            command.arg(name);
+                        }
+                    }
+                    let output = command
+                        .output()
+                        .map_err(|error| format!("Cannot run zip: {error}"))?;
+                    if output.status.success() {
+                        Ok(())
+                    } else {
+                        Err(format!(
+                            "Compress failed: {}",
+                            String::from_utf8_lossy(&output.stderr).trim()
+                        ))
+                    }
+                })
+                .await;
+            this.update(cx, |pane, cx| {
+                if let Err(message) = result {
+                    cx.emit(PaneEvent::Notice(message));
+                }
+                pane.reload(cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub fn show_preview(&mut self, cx: &mut Context<Self>) {
+        self.preview_open = true;
+        cx.emit(PaneEvent::ListingChanged);
+        cx.notify();
+    }
+
     // ---- tabs -------------------------------------------------------------
 
     pub fn new_tab(&mut self, cx: &mut Context<Self>) {
@@ -677,6 +865,17 @@ impl Pane {
         let header = self.render_header(cx);
         let body = self.render_body(focused, cx);
         let status = self.render_status();
+        let entity = cx.entity();
+        let body_area = div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .on_mouse_down(MouseButton::Right, move |event, _, cx| {
+                let at = event.position;
+                entity.update(cx, |pane, cx| pane.context_click(None, at, cx));
+            })
+            .child(body);
 
         div()
             .flex()
@@ -696,7 +895,7 @@ impl Pane {
             .child(path_bar)
             .children(filter_bar)
             .child(header)
-            .child(body)
+            .child(body_area)
             .child(status)
             .into_any_element()
     }
@@ -1271,10 +1470,12 @@ fn render_row(
                         }
                     });
                 })
-                .on_mouse_down(MouseButton::Right, move |_, _, cx| {
-                    right_entity.update(cx, |pane, cx| {
-                        pane.set_cursor_position(position, false, cx);
-                    });
+                .on_mouse_down(MouseButton::Right, move |event, _, cx| {
+                    // The list background also listens for right-clicks; the row
+                    // owns this one.
+                    cx.stop_propagation();
+                    let at = event.position;
+                    right_entity.update(cx, |pane, cx| pane.context_click(Some(position), at, cx));
                 })
                 .child(
                     div()

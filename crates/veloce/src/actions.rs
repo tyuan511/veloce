@@ -44,6 +44,13 @@ actions!(
         TrashSelection,
         NewFolder,
         RenameEntry,
+        // file menu (Finder parity)
+        OpenSelection,
+        CopyItems,
+        PasteItems,
+        DuplicateEntry,
+        MakeAlias,
+        GetInfo,
         // panels
         ToggleTasks,
         // misc
@@ -107,6 +114,12 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-backspace", TrashSelection, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-n", NewFolder, Some(CONTEXT)),
         KeyBinding::new("shift-r", RenameEntry, Some(CONTEXT)),
+        KeyBinding::new("cmd-o", OpenSelection, Some(CONTEXT)),
+        KeyBinding::new("cmd-c", CopyItems, Some(CONTEXT)),
+        KeyBinding::new("cmd-v", PasteItems, Some(CONTEXT)),
+        KeyBinding::new("cmd-d", DuplicateEntry, Some(CONTEXT)),
+        KeyBinding::new("cmd-l", MakeAlias, Some(CONTEXT)),
+        KeyBinding::new("cmd-i", GetInfo, Some(CONTEXT)),
         // ---- panels ----
         KeyBinding::new("cmd-j", ToggleTasks, Some(CONTEXT)),
         KeyBinding::new("cmd-r", Refresh, Some(CONTEXT)),

@@ -19,6 +19,7 @@ pub const CLOSE: &str = "icons/x.svg";
 pub const PLUS: &str = "icons/plus.svg";
 pub const TERMINAL: &str = "icons/terminal.svg";
 pub const TASKS: &str = "icons/list-checks.svg";
+pub const APPS: &str = "icons/app-window.svg";
 pub const SPLIT: &str = "icons/columns-2.svg";
 pub const EYE: &str = "icons/eye.svg";
 pub const HOME: &str = "icons/house.svg";
@@ -44,6 +45,7 @@ const ICONS: &[(&str, &str)] = &[
     (PLUS, include_str!("../assets/icons/plus.svg")),
     (TERMINAL, include_str!("../assets/icons/terminal.svg")),
     (TASKS, include_str!("../assets/icons/list-checks.svg")),
+    (APPS, include_str!("../assets/icons/app-window.svg")),
     (SPLIT, include_str!("../assets/icons/columns-2.svg")),
     (EYE, include_str!("../assets/icons/eye.svg")),
     (HOME, include_str!("../assets/icons/house.svg")),

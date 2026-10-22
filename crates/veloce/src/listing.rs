@@ -346,44 +346,42 @@ pub fn visible_crumbs(crumbs: &[Crumb], max: usize) -> (&[Crumb], bool) {
 /// A fixed shortcut in the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Place {
-    pub label: &'static str,
+    pub label: String,
     pub path: PathBuf,
     pub icon: &'static str,
 }
 
-/// The Finder-style "Favorites" list rooted at the user's home directory.
+fn place(label: impl Into<String>, path: impl Into<PathBuf>, icon: &'static str) -> Place {
+    Place {
+        label: label.into(),
+        path: path.into(),
+        icon,
+    }
+}
+
+/// Finder's default "Favorites": Applications, Desktop, Documents, Downloads and
+/// the home folder, which Finder labels with the account name.
 ///
 /// Existence is deliberately not probed here (that would be file I/O on the UI
 /// thread); a missing folder just shows the pane's normal load error.
 pub fn favorite_places(home: &std::path::Path) -> Vec<Place> {
     use crate::icons;
+    let home_label = home
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Home".to_string());
     vec![
-        Place {
-            label: "Home",
-            path: home.to_path_buf(),
-            icon: icons::HOME,
-        },
-        Place {
-            label: "Desktop",
-            path: home.join("Desktop"),
-            icon: icons::DESKTOP,
-        },
-        Place {
-            label: "Documents",
-            path: home.join("Documents"),
-            icon: icons::FILE,
-        },
-        Place {
-            label: "Downloads",
-            path: home.join("Downloads"),
-            icon: icons::DOWNLOAD,
-        },
-        Place {
-            label: "Macintosh HD",
-            path: PathBuf::from("/"),
-            icon: icons::DISK,
-        },
+        place("Applications", "/Applications", icons::APPS),
+        place("Desktop", home.join("Desktop"), icons::DESKTOP),
+        place("Documents", home.join("Documents"), icons::FILE),
+        place("Downloads", home.join("Downloads"), icons::DOWNLOAD),
+        place(home_label, home, icons::HOME),
     ]
+}
+
+/// Finder's "Locations": the startup disk.
+pub fn location_places() -> Vec<Place> {
+    vec![place("Macintosh HD", "/", crate::icons::DISK)]
 }
 
 /// Whether `place` is the sidebar entry that matches `current` exactly.
@@ -442,23 +440,38 @@ mod tests {
     }
 
     #[test]
-    fn favorite_places_hang_off_home_and_end_with_root() {
+    fn favorites_follow_finder_and_end_with_the_home_folder() {
         let places = favorite_places(std::path::Path::new("/Users/me"));
-        assert_eq!(places[0].path, PathBuf::from("/Users/me"));
-        assert!(
-            places
-                .iter()
-                .any(|p| p.path == std::path::Path::new("/Users/me/Downloads"))
+        let labels: Vec<&str> = places.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(
+            labels,
+            ["Applications", "Desktop", "Documents", "Downloads", "me"]
         );
-        assert_eq!(places.last().unwrap().path, PathBuf::from("/"));
+        assert_eq!(places[0].path, PathBuf::from("/Applications"));
+        assert_eq!(places[3].path, PathBuf::from("/Users/me/Downloads"));
+        assert_eq!(places[4].path, PathBuf::from("/Users/me"));
+    }
+
+    #[test]
+    fn home_labelled_home_when_it_has_no_file_name() {
+        let places = favorite_places(std::path::Path::new("/"));
+        assert_eq!(places.last().unwrap().label, "Home");
+    }
+
+    #[test]
+    fn locations_list_the_startup_disk() {
+        let places = location_places();
+        assert_eq!(places.len(), 1);
+        assert_eq!(places[0].path, PathBuf::from("/"));
     }
 
     #[test]
     fn place_matches_current_ignoring_trailing_slash() {
         let places = favorite_places(std::path::Path::new("/Users/me"));
-        assert!(place_is_current(&places[0], "/Users/me/"));
-        assert!(!place_is_current(&places[0], "/Users/me/Desktop"));
-        let root = places.last().unwrap();
+        let home = places.last().unwrap();
+        assert!(place_is_current(home, "/Users/me/"));
+        assert!(!place_is_current(home, "/Users/me/Desktop"));
+        let root = &location_places()[0];
         assert!(place_is_current(root, "/"));
     }
 
