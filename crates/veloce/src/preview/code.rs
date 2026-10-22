@@ -63,13 +63,34 @@ fn find_syntax(file_name: &str, ext: &str) -> Option<&'static SyntaxReference> {
 }
 
 /// Display name of the language a file would be highlighted as.
-pub fn language_name(file_name: &str, ext: &str) -> Option<String> {
+fn syntect_language_name(file_name: &str, ext: &str) -> Option<String> {
     find_syntax(file_name, ext).map(|syntax| syntax.name.clone())
 }
 
-/// Highlight up to `max_lines` lines. `None` means "no grammar": the caller shows
-/// plain text rather than a pretend-highlighted wall of one colour.
+/// Display name of the language a file is highlighted as: tree-sitter's grammar
+/// when there is one, otherwise syntect's.
+pub fn language_name(file_name: &str, ext: &str) -> Option<String> {
+    super::ts::language_name(file_name, ext)
+        .map(str::to_string)
+        .or_else(|| syntect_language_name(file_name, ext))
+}
+
+/// Highlight up to `max_lines` lines. Tree-sitter goes first (a real syntax tree);
+/// syntect covers the languages it has no grammar for. `None` means neither knows
+/// the language: the caller shows plain text rather than a pretend-highlighted wall
+/// of one colour.
 pub fn highlight(
+    text: &str,
+    file_name: &str,
+    ext: &str,
+    dark: bool,
+    max_lines: usize,
+) -> Option<Vec<Line>> {
+    super::ts::highlight(text, file_name, ext, dark, max_lines)
+        .or_else(|| highlight_syntect(text, file_name, ext, dark, max_lines))
+}
+
+fn highlight_syntect(
     text: &str,
     file_name: &str,
     ext: &str,
@@ -135,9 +156,17 @@ mod tests {
     }
 
     #[test]
-    fn typescript_borrows_the_javascript_grammar() {
+    fn typescript_uses_its_own_tree_sitter_grammar() {
+        assert_eq!(language_name("a.ts", "ts").as_deref(), Some("TypeScript"));
+        assert_eq!(language_name("a.tsx", "tsx").as_deref(), Some("TSX"));
         assert!(highlight("const a: number = 1;", "a.ts", "ts", true, 10).is_some());
-        assert_eq!(language_name("a.tsx", "tsx"), language_name("a.js", "js"));
+    }
+
+    #[test]
+    fn languages_without_a_tree_sitter_grammar_fall_back_to_syntect() {
+        assert!(super::super::ts::language_name("q.sql", "sql").is_none());
+        assert!(highlight("SELECT 1;", "q.sql", "sql", true, 10).is_some());
+        assert!(language_name("q.sql", "sql").is_some());
     }
 
     #[test]

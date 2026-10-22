@@ -7,6 +7,7 @@
 mod code;
 mod markdown;
 mod table;
+mod ts;
 mod views;
 
 use std::{

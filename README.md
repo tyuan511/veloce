@@ -107,7 +107,7 @@ compile once at first launch.
 - **Fixed row height + `uniform_list`.** Virtualization is arithmetic, so cost per frame
   is independent of directory size.
 - **Bounded preview.** Text previews read 64 KiB and render at most 400 lines: a 10 GB
-  log opens instantly instead of freezing the window. Markdown renders natively (headings, lists, tasks, quotes, tables, highlighted code blocks); source files are syntax-highlighted (syntect); JSON is pretty-printed; CSV/TSV become tables; HTML renders through a Quick Look snapshot on macOS. Archives list their first 500
+  log opens instantly instead of freezing the window. Markdown renders natively (headings, lists, tasks, quotes, tables, highlighted code blocks); source files are highlighted with tree-sitter (the engine Zed uses: Rust, JS/TS/TSX, Python, Go, JSON, TOML, YAML, Kotlin, Bash, C/C++/C#, Java, HTML, CSS, Ruby, Lua) with syntect covering the rest; JSON is pretty-printed; CSV/TSV become tables; HTML renders through a Quick Look snapshot on macOS. Archives list their first 500
   entries, binaries show a 512-byte hex dump, and on macOS PDFs, video, audio artwork,
   Office/iWork documents, HEIC, RAW, fonts and 3D models render through Quick Look
   thumbnails (cached, with a timeout) — all off the UI thread.
@@ -124,7 +124,7 @@ compile once at first launch.
 ## Tests
 
 ```sh
-cargo test              # 358 tests, no GPU or window server needed
+cargo test              # 370 tests, no GPU or window server needed
 cargo test -p vfs-core  # 156 core tests
 ```
 
@@ -154,3 +154,8 @@ UI glyphs are from [Lucide](https://lucide.dev) (ISC) and file/folder icons from
 [Material Icon Theme](https://github.com/material-extensions/vscode-material-icon-theme)
 (MIT); licenses sit next to the assets. Regenerate the file-icon tables with
 `scripts/gen-file-icons.py`.
+
+Source highlighting uses [tree-sitter](https://tree-sitter.github.io) and its grammar
+crates (MIT). The Kotlin highlight query is vendored from
+[fwcd/tree-sitter-kotlin](https://github.com/fwcd/tree-sitter-kotlin), itself derived
+from nvim-treesitter (Apache-2.0); see `crates/veloce/assets/queries/`.
