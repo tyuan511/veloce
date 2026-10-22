@@ -1,0 +1,3 @@
+[alias]
+# `cargo dev [-- <dir>]` launches the GUI from the workspace root.
+dev = "run -p veloce --"
