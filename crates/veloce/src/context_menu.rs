@@ -5,6 +5,9 @@
 //! folded into submenus. Only the model and the geometry live here; the workspace
 //! draws it and runs the chosen action.
 
+use crate::i18n::{tr, trf};
+use std::path::PathBuf;
+
 use vfs_core::{SortKey, SortSpec, archive::CompressFormat};
 
 use crate::view::ViewMode;
@@ -20,6 +23,8 @@ pub enum MenuAction {
     /// Pick any application from a file dialog.
     OpenWithOther,
     OpenInNewTab,
+    /// Enter an application bundle like a folder.
+    ShowPackageContents,
     OpenInTerminal,
     Preview,
     Compress(CompressFormat),
@@ -33,10 +38,20 @@ pub enum MenuAction {
     /// Paste into the right-clicked folder.
     PasteInto,
     CreateShortcut,
+    /// Star or unstar the item in the sidebar.
+    ToggleFavorite,
+    // The sidebar's starred items act on that item, not on the list's selection.
+    FavOpen,
+    FavOpenInNewTab,
+    FavReveal,
+    FavCopyPath,
+    FavOpenInTerminal,
+    FavRemove,
     Delete,
     Rename,
     Properties,
     NewFolder,
+    NewFile,
     Refresh,
     SortBy(SortKey),
     SortDescending(bool),
@@ -58,6 +73,8 @@ pub struct ActionItem {
     pub enabled: bool,
     /// Draws a check mark (current sort key, current view ...).
     pub checked: bool,
+    /// A small PNG drawn before the label (an application's icon).
+    pub icon: Option<PathBuf>,
 }
 
 /// A row that opens a flyout to its right.
@@ -84,6 +101,8 @@ pub enum MenuTarget {
         count: usize,
         /// A single folder is selected.
         is_dir: bool,
+        /// A single application bundle is selected: it launches, but can be entered.
+        app_bundle: bool,
         /// Nothing but files is selected (Open With only makes sense then).
         files_only: bool,
         /// A single archive is selected: the folder name "Extract to" would create.
@@ -91,12 +110,20 @@ pub enum MenuTarget {
     },
 }
 
+/// One row of the Open With list.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppEntry {
+    pub name: String,
+    /// PNG of the application's icon, when one could be produced.
+    pub icon: Option<PathBuf>,
+}
+
 /// Applications that can open the selection, which arrive asynchronously.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OpenWith {
     Loading,
-    /// Display names; the first is the default application.
-    Apps(Vec<String>),
+    /// The first is the default application.
+    Apps(Vec<AppEntry>),
 }
 
 /// State the menu content depends on besides what was clicked.
@@ -107,6 +134,9 @@ pub struct MenuContext {
     pub show_hidden: bool,
     pub sort: SortSpec,
     pub open_with: OpenWith,
+    /// Whether the single selected item is starred; `None` when it cannot be (several
+    /// items, or not on a local disk).
+    pub favorite: Option<bool>,
 }
 
 impl Default for MenuContext {
@@ -117,6 +147,7 @@ impl Default for MenuContext {
             show_hidden: false,
             sort: SortSpec::default(),
             open_with: OpenWith::Loading,
+            favorite: None,
         }
     }
 }
@@ -133,6 +164,7 @@ fn action(
         shortcut,
         enabled,
         checked: false,
+        icon: None,
     })
 }
 
@@ -156,11 +188,11 @@ fn checked(item: MenuItem, on: bool) -> MenuItem {
 /// Finder's wording for sort keys ("Date Modified", not "Modified").
 pub fn sort_key_label(key: SortKey) -> &'static str {
     match key {
-        SortKey::Name => "Name",
-        SortKey::Kind => "Kind",
-        SortKey::Modified => "Date Modified",
-        SortKey::Created => "Date Created",
-        SortKey::Size => "Size",
+        SortKey::Name => tr("Name"),
+        SortKey::Kind => tr("Kind"),
+        SortKey::Modified => tr("Date Modified"),
+        SortKey::Created => tr("Date Created"),
+        SortKey::Size => tr("Size"),
     }
 }
 
@@ -177,18 +209,28 @@ pub fn sort_menu(spec: SortSpec) -> Vec<MenuItem> {
         .collect();
     items.push(MenuItem::Separator);
     items.push(checked(
-        action(MenuAction::SortDescending(false), "Ascending", None, true),
+        action(
+            MenuAction::SortDescending(false),
+            tr("Ascending"),
+            None,
+            true,
+        ),
         !spec.descending,
     ));
     items.push(checked(
-        action(MenuAction::SortDescending(true), "Descending", None, true),
+        action(
+            MenuAction::SortDescending(true),
+            tr("Descending"),
+            None,
+            true,
+        ),
         spec.descending,
     ));
     items.push(MenuItem::Separator);
     items.push(checked(
         action(
             MenuAction::SortFoldersFirst,
-            "Keep Folders on Top",
+            tr("Keep Folders on Top"),
             None,
             true,
         ),
@@ -202,15 +244,20 @@ pub fn view_menu(view: ViewMode) -> Vec<MenuItem> {
     use MenuAction::SetView;
     vec![
         checked(
-            action(SetView(ViewMode::Icons), "as Icons", Some("⌘1"), true),
+            action(SetView(ViewMode::Icons), tr("as Icons"), Some("⌘1"), true),
             view == ViewMode::Icons,
         ),
         checked(
-            action(SetView(ViewMode::List), "as List", Some("⌘2"), true),
+            action(SetView(ViewMode::List), tr("as List"), Some("⌘2"), true),
             view == ViewMode::List,
         ),
         checked(
-            action(SetView(ViewMode::Columns), "as Columns", Some("⌘3"), true),
+            action(
+                SetView(ViewMode::Columns),
+                tr("as Columns"),
+                Some("⌘3"),
+                true,
+            ),
             view == ViewMode::Columns,
         ),
     ]
@@ -226,21 +273,30 @@ fn compress_menu() -> Vec<MenuItem> {
 /// Open With submenu: the default app first, the rest alphabetical, then "Other…".
 pub fn open_with_menu(open_with: &OpenWith) -> Vec<MenuItem> {
     let mut items = match open_with {
-        OpenWith::Loading => vec![action(MenuAction::Nothing, "Loading…", None, false)],
-        OpenWith::Apps(names) if names.is_empty() => {
-            vec![action(MenuAction::Nothing, "No applications", None, false)]
+        OpenWith::Loading => vec![action(MenuAction::Nothing, tr("Loading…"), None, false)],
+        OpenWith::Apps(apps) if apps.is_empty() => {
+            vec![action(
+                MenuAction::Nothing,
+                tr("No applications"),
+                None,
+                false,
+            )]
         }
-        OpenWith::Apps(names) => {
-            let mut rows: Vec<MenuItem> = names
+        OpenWith::Apps(apps) => {
+            let mut rows: Vec<MenuItem> = apps
                 .iter()
                 .enumerate()
-                .map(|(index, name)| {
+                .map(|(index, app)| {
                     let label = if index == 0 {
-                        format!("{name} (default)")
+                        trf("{} (default)", &[&app.name])
                     } else {
-                        name.clone()
+                        app.name.clone()
                     };
-                    action(MenuAction::OpenWith(index), &label, None, true)
+                    let mut row = action(MenuAction::OpenWith(index), &label, None, true);
+                    if let MenuItem::Action(item) = &mut row {
+                        item.icon = app.icon.clone();
+                    }
+                    row
                 })
                 .collect();
             if rows.len() > 1 {
@@ -250,7 +306,7 @@ pub fn open_with_menu(open_with: &OpenWith) -> Vec<MenuItem> {
         }
     };
     items.push(MenuItem::Separator);
-    items.push(action(MenuAction::OpenWithOther, "Other…", None, true));
+    items.push(action(MenuAction::OpenWithOther, tr("Other…"), None, true));
     items
 }
 
@@ -268,31 +324,58 @@ pub struct MoreState {
 pub fn more_menu(state: MoreState) -> Vec<MenuItem> {
     use MenuAction::*;
     vec![
-        action(NewFolder, "New folder", Some("⇧⌘N"), true),
+        action(NewFolder, tr("New folder"), Some("⇧⌘N"), true),
+        action(NewFile, tr("New file"), None, true),
         MenuItem::Separator,
         checked(
-            action(ToggleHidden, "Show hidden files", Some("⇧⌘."), true),
+            action(ToggleHidden, tr("Show hidden files"), Some("⇧⌘."), true),
             state.show_hidden,
         ),
         checked(
-            action(ToggleSplit, "Split view", Some("⌘\\"), true),
+            action(ToggleSplit, tr("Split view"), Some("⌘\\"), true),
             state.split,
         ),
         checked(
-            action(TogglePreviewPanel, "Preview panel", Some("Space"), true),
+            action(TogglePreviewPanel, tr("Preview panel"), Some("Space"), true),
             state.preview_open,
         ),
         checked(
-            action(ToggleTasks, "Task panel", Some("⌘J"), true),
+            action(ToggleTasks, tr("Task panel"), Some("⌘J"), true),
             state.tasks_open,
         ),
         MenuItem::Separator,
-        action(Refresh, "Refresh", Some("⌘R"), true),
-        action(OpenInTerminal, "Open in Terminal", None, true),
-        action(CommandPalette, "Command palette…", Some("⇧⌘P"), true),
+        action(Refresh, tr("Refresh"), Some("⌘R"), true),
+        action(OpenInTerminal, tr("Open in Terminal"), None, true),
+        action(CommandPalette, tr("Command palette…"), Some("⇧⌘P"), true),
         MenuItem::Separator,
-        action(OpenSettings, "Settings…", Some("⌘,"), true),
+        action(OpenSettings, tr("Settings…"), Some("⌘,"), true),
     ]
+}
+
+/// The menu for an item in the sidebar. Built-in places (Desktop, the disk ...)
+/// cannot be un-starred, so they get no "Remove" row.
+pub fn favorite_menu(is_dir: bool, removable: bool) -> Vec<MenuItem> {
+    use MenuAction::*;
+    let mut items = vec![action(FavOpen, tr("Open"), None, true)];
+    if is_dir {
+        items.push(action(FavOpenInNewTab, tr("Open in new tab"), None, true));
+    }
+    items.push(action(FavReveal, tr("Show in folder"), None, true));
+    items.push(MenuItem::Separator);
+    items.push(action(FavCopyPath, tr("Copy as path"), None, true));
+    if is_dir {
+        items.push(action(
+            FavOpenInTerminal,
+            tr("Open in Terminal"),
+            None,
+            true,
+        ));
+    }
+    if removable {
+        items.push(MenuItem::Separator);
+        items.push(action(FavRemove, tr("Remove from Favorites"), None, true));
+    }
+    items
 }
 
 /// Build the menu for `target`.
@@ -300,63 +383,85 @@ pub fn build_menu(target: &MenuTarget, ctx: &MenuContext) -> Vec<MenuItem> {
     use MenuAction::*;
     match target {
         MenuTarget::Background => vec![
-            action(Refresh, "Refresh", Some("⌘R"), true),
+            action(Refresh, tr("Refresh"), Some("⌘R"), true),
             MenuItem::Separator,
-            action(Paste, "Paste", Some("⌘V"), ctx.can_paste),
+            action(Paste, tr("Paste"), Some("⌘V"), ctx.can_paste),
             MenuItem::Separator,
-            action(NewFolder, "New folder", Some("⇧⌘N"), true),
-            action(OpenInTerminal, "Open in Terminal", None, true),
+            action(NewFolder, tr("New folder"), Some("⇧⌘N"), true),
+            action(NewFile, tr("New file"), None, true),
+            action(OpenInTerminal, tr("Open in Terminal"), None, true),
             MenuItem::Separator,
-            submenu("Sort By", sort_menu(ctx.sort)),
-            submenu("View", view_menu(ctx.view)),
+            submenu(tr("Sort By"), sort_menu(ctx.sort)),
+            submenu(tr("View"), view_menu(ctx.view)),
             checked(
-                action(ToggleHidden, "Show hidden files", Some("⇧⌘."), true),
+                action(ToggleHidden, tr("Show hidden files"), Some("⇧⌘."), true),
                 ctx.show_hidden,
             ),
         ],
         MenuTarget::Items {
             count,
             is_dir,
+            app_bundle,
             files_only,
             archive_stem,
         } => {
             let single = *count == 1;
             let folder = single && *is_dir;
-            let mut items = vec![action(Open, "Open", Some("⌘O"), true)];
+            // 按用途分五组：打开 / 剪贴板 / 文件变换 / 删除 / 位置与属性。
+            // 删除单独成组，避免和重命名挨在一起误点。
+            let mut items = vec![action(Open, tr("Open"), Some("⌘O"), true)];
             if *files_only {
-                items.push(submenu("Open With", open_with_menu(&ctx.open_with)));
+                items.push(submenu(tr("Open With"), open_with_menu(&ctx.open_with)));
             }
             if folder {
-                items.push(action(OpenInNewTab, "Open in new tab", None, true));
-                items.push(action(OpenInTerminal, "Open in Terminal", None, true));
+                items.push(action(OpenInNewTab, tr("Open in new tab"), None, true));
             }
-            if single && !*is_dir {
-                items.push(action(Preview, "Preview", Some("Space"), true));
-            }
-            items.push(MenuItem::Separator);
-            if let (true, Some(stem)) = (single, archive_stem) {
-                items.push(action(ExtractHere, "Extract Here", None, true));
+            if *app_bundle {
                 items.push(action(
-                    ExtractTo,
-                    &format!("Extract to “{stem}/”"),
+                    ShowPackageContents,
+                    "Show Package Contents",
                     None,
                     true,
                 ));
             }
-            items.push(submenu("Compress to", compress_menu()));
-            items.push(action(CopyPath, "Copy as path", Some("⇧⌘C"), true));
-            items.push(MenuItem::Separator);
-            items.push(action(Cut, "Cut", Some("⌘X"), true));
-            items.push(action(Copy, "Copy", Some("⌘C"), true));
-            if folder {
-                items.push(action(PasteInto, "Paste", Some("⌘V"), ctx.can_paste));
+            if single && !*is_dir {
+                items.push(action(Preview, tr("Preview"), Some("Space"), true));
             }
             items.push(MenuItem::Separator);
-            items.push(action(CreateShortcut, "Create shortcut", None, true));
-            items.push(action(Delete, "Delete", Some("Del"), true));
-            items.push(action(Rename, "Rename", Some("F2"), single));
+            items.push(action(Cut, tr("Cut"), Some("⌘X"), true));
+            items.push(action(Copy, tr("Copy"), Some("⌘C"), true));
+            if folder {
+                items.push(action(PasteInto, tr("Paste"), Some("⌘V"), ctx.can_paste));
+            }
+            items.push(action(CopyPath, tr("Copy as path"), Some("⇧⌘C"), true));
             items.push(MenuItem::Separator);
-            items.push(action(Properties, "Properties", Some("⌥↵"), single));
+            items.push(action(Rename, tr("Rename"), Some("F2"), single));
+            items.push(action(CreateShortcut, tr("Create shortcut"), None, true));
+            if let Some(starred) = ctx.favorite {
+                let label = if starred {
+                    tr("Remove from Favorites")
+                } else {
+                    tr("Add to Favorites")
+                };
+                items.push(action(ToggleFavorite, label, None, true));
+            }
+            if let (true, Some(stem)) = (single, archive_stem) {
+                items.push(action(ExtractHere, tr("Extract Here"), None, true));
+                items.push(action(
+                    ExtractTo,
+                    &trf("Extract to “{}/”", &[stem]),
+                    None,
+                    true,
+                ));
+            }
+            items.push(submenu(tr("Compress to"), compress_menu()));
+            items.push(MenuItem::Separator);
+            items.push(action(Delete, tr("Delete"), Some("Del"), true));
+            items.push(MenuItem::Separator);
+            if folder {
+                items.push(action(OpenInTerminal, tr("Open in Terminal"), None, true));
+            }
+            items.push(action(Properties, tr("Properties"), Some("⌥↵"), single));
             items
         }
     }
@@ -435,8 +540,71 @@ pub fn submenu_origin(
 mod tests {
     use super::*;
 
+    fn app(name: &str) -> AppEntry {
+        AppEntry {
+            name: name.into(),
+            icon: None,
+        }
+    }
+
     fn ctx() -> MenuContext {
         MenuContext::default()
+    }
+
+    #[test]
+    fn favorite_row_appears_only_when_it_applies_and_names_the_next_state() {
+        let label = |favorite| {
+            let ctx = MenuContext { favorite, ..ctx() };
+            let items = build_menu(&folder(), &ctx);
+            flatten(&items)
+                .into_iter()
+                .find(|a| a.action == MenuAction::ToggleFavorite)
+                .map(|a| a.label.clone())
+        };
+        assert_eq!(label(None), None);
+        assert_eq!(label(Some(false)).as_deref(), Some("Add to Favorites"));
+        assert_eq!(label(Some(true)).as_deref(), Some("Remove from Favorites"));
+    }
+
+    #[test]
+    fn favorite_menu_offers_folder_only_rows_for_folders_and_always_remove() {
+        let actions = |is_dir| {
+            flatten(&favorite_menu(is_dir, true))
+                .into_iter()
+                .map(|a| a.action)
+                .collect::<Vec<_>>()
+        };
+        let folder = actions(true);
+        let file = actions(false);
+        for only_folders in [MenuAction::FavOpenInNewTab, MenuAction::FavOpenInTerminal] {
+            assert!(folder.contains(&only_folders));
+            assert!(!file.contains(&only_folders));
+        }
+        for always in [
+            MenuAction::FavOpen,
+            MenuAction::FavReveal,
+            MenuAction::FavCopyPath,
+            MenuAction::FavRemove,
+        ] {
+            assert!(folder.contains(&always) && file.contains(&always));
+        }
+    }
+
+    #[test]
+    fn built_in_places_have_no_remove_row() {
+        let builtin = favorite_menu(true, false);
+        assert!(
+            !flatten(&builtin)
+                .iter()
+                .any(|a| a.action == MenuAction::FavRemove)
+        );
+        assert!(
+            flatten(&builtin)
+                .iter()
+                .any(|a| a.action == MenuAction::FavOpenInTerminal)
+        );
+        // No dangling separator where the Remove row would have been.
+        assert!(!matches!(builtin.last(), Some(MenuItem::Separator)));
     }
 
     /// Every action in the menu, descending into submenus.
@@ -497,6 +665,7 @@ mod tests {
             count,
             is_dir: false,
             files_only: true,
+            app_bundle: false,
             archive_stem: None,
         }
     }
@@ -506,6 +675,7 @@ mod tests {
             count: 1,
             is_dir: true,
             files_only: false,
+            app_bundle: false,
             archive_stem: None,
         }
     }
@@ -515,6 +685,7 @@ mod tests {
             count: 1,
             is_dir: false,
             files_only: true,
+            app_bundle: false,
             archive_stem: Some("photos".to_string()),
         }
     }
@@ -526,8 +697,8 @@ mod tests {
         let at = |label: &str| labels.iter().position(|l| *l == label).unwrap();
         assert_eq!(labels[0], "Open");
         assert!(at("Cut") < at("Copy"));
-        assert!(at("Copy") < at("Delete"));
-        assert!(at("Delete") < at("Rename"));
+        assert!(at("Copy") < at("Rename"));
+        assert!(at("Rename") < at("Delete"));
         assert_eq!(*labels.last().unwrap(), "Properties");
     }
 
@@ -625,9 +796,35 @@ mod tests {
             count: 2,
             is_dir: false,
             files_only: true,
+            app_bundle: false,
             archive_stem: Some("a".into()),
         };
         assert!(!has(&build_menu(&many, &ctx()), MenuAction::ExtractHere));
+    }
+
+    #[test]
+    fn groups_are_separated_by_exactly_one_separator() {
+        for target in [files(1), files(3), MenuTarget::Background] {
+            let items = build_menu(&target, &ctx());
+            assert!(!matches!(items.first(), Some(MenuItem::Separator)));
+            assert!(!matches!(items.last(), Some(MenuItem::Separator)));
+            assert!(
+                !items
+                    .windows(2)
+                    .any(|w| matches!(w, [MenuItem::Separator, MenuItem::Separator]))
+            );
+        }
+    }
+
+    #[test]
+    fn delete_stands_alone_in_its_own_group() {
+        let items = build_menu(&files(1), &ctx());
+        let at = items
+            .iter()
+            .position(|i| matches!(i, MenuItem::Action(a) if a.action == MenuAction::Delete))
+            .unwrap();
+        assert!(matches!(items[at - 1], MenuItem::Separator));
+        assert!(matches!(items[at + 1], MenuItem::Separator));
     }
 
     #[test]
@@ -639,6 +836,7 @@ mod tests {
             count: 2,
             is_dir: false,
             files_only: false,
+            app_bundle: false,
             archive_stem: None,
         };
         assert!(!top_labels(&build_menu(&mixed, &ctx())).contains(&"Open With"));
@@ -657,7 +855,7 @@ mod tests {
     #[test]
     fn open_with_lists_apps_with_the_default_first_and_marked() {
         let ready = MenuContext {
-            open_with: OpenWith::Apps(vec!["Preview".into(), "Pixelmator".into()]),
+            open_with: OpenWith::Apps(vec![app("Preview"), app("Pixelmator")]),
             ..ctx()
         };
         let items = build_menu(&files(1), &ready);
@@ -672,6 +870,23 @@ mod tests {
         );
         assert!(!has(&open_with.items, MenuAction::Nothing));
         assert!(find(&open_with.items, MenuAction::OpenWithOther).enabled);
+    }
+
+    #[test]
+    fn open_with_rows_carry_the_app_icon() {
+        let ready = MenuContext {
+            open_with: OpenWith::Apps(vec![AppEntry {
+                name: "Preview".into(),
+                icon: Some(PathBuf::from("/cache/Preview.png")),
+            }]),
+            ..ctx()
+        };
+        let items = build_menu(&files(1), &ready);
+        let open_with = sub(&items, "Open With");
+        assert_eq!(
+            find(&open_with.items, MenuAction::OpenWith(0)).icon,
+            Some(PathBuf::from("/cache/Preview.png"))
+        );
     }
 
     #[test]
@@ -705,6 +920,7 @@ mod tests {
             .enabled
         );
         assert!(has(&empty, MenuAction::NewFolder));
+        assert!(has(&empty, MenuAction::NewFile));
     }
 
     #[test]

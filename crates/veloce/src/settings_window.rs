@@ -5,6 +5,7 @@
 //! is live in the main window at once. Connection management (SSH, S3, WebDAV) also
 //! lives here: new kinds of remote just add a module section and a form.
 
+use crate::i18n::{LanguagePref, tr, trf};
 use std::sync::Arc;
 
 use gpui::{
@@ -17,11 +18,10 @@ use crate::{
     connections::{self, Draft, Field, Kind},
     keymap::{self, Overrides},
     persist::Persist,
-    settings::{
-        AppSettings, CACHE_CHOICES_MB, Density, OnConflict, Startup, ThemePref, clean_terminal_name,
-    },
+    remote, secrets,
+    settings::{AppSettings, CACHE_CHOICES_MB, Density, OnConflict, Startup, ThemePref},
     settings_apply, terminals,
-    text_input::{TextInput, TextInputEvent},
+    text_input::TextInput,
     theme,
     view::ViewMode,
 };
@@ -51,7 +51,7 @@ pub fn open(cx: &mut App) {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             window_min_size: Some(size(px(640.0), px(420.0))),
             titlebar: Some(gpui::TitlebarOptions {
-                title: Some("Settings".into()),
+                title: Some(tr("Settings").into()),
                 appears_transparent: true,
                 traffic_light_position: Some(gpui::point(px(18.0), px(12.0))),
             }),
@@ -103,21 +103,23 @@ impl Module {
 
     fn label(self) -> &'static str {
         match self {
-            Module::General => "General",
-            Module::Appearance => "Appearance",
-            Module::Files => "Files",
-            Module::Preview => "Preview",
-            Module::Search => "Search",
-            Module::Shortcuts => "Shortcuts",
-            Module::Connections => "Connections",
-            Module::Storage => "Storage",
-            Module::About => "About",
+            Module::General => tr("General"),
+            Module::Appearance => tr("Appearance"),
+            Module::Files => tr("Files"),
+            Module::Preview => tr("Preview"),
+            Module::Search => tr("Search"),
+            Module::Shortcuts => tr("Shortcuts"),
+            Module::Connections => tr("Connections"),
+            Module::Storage => tr("Storage"),
+            Module::About => tr("About"),
         }
     }
 }
 
 /// An "add connection" form in progress.
 struct ConnectionForm {
+    /// The saved connection being edited; `None` when adding a new one.
+    editing: Option<i64>,
     kind: Kind,
     name: Entity<TextInput>,
     fields: Vec<(Field, Entity<TextInput>)>,
@@ -135,8 +137,7 @@ struct SettingsView {
     persist: Persist,
     connections: Vec<SavedConnection>,
     form: Option<ConnectionForm>,
-    terminal_input: Entity<TextInput>,
-    terminal_error: bool,
+    terminal_menu_open: bool,
     thumbnail_bytes: Option<u64>,
     terminals: Vec<TerminalChoice>,
     /// The command whose new shortcut is being recorded.
@@ -147,22 +148,6 @@ struct SettingsView {
 
 impl SettingsView {
     fn new(persist: Persist, cx: &mut Context<Self>) -> Self {
-        let terminal_input = cx.new(|cx| TextInput::new("Terminal", cx));
-        let current = cx.global::<AppSettings>().terminal_app.clone();
-        terminal_input.update(cx, |input, cx| input.set_content(current, cx));
-        let subscription = cx.subscribe(&terminal_input, |view, _, event: &TextInputEvent, cx| {
-            if let TextInputEvent::Change(text) = event {
-                // Only a usable name is saved; the field flags anything else.
-                match clean_terminal_name(text) {
-                    Some(name) => {
-                        view.terminal_error = false;
-                        settings_apply::commit(cx, |settings| settings.terminal_app = name);
-                    }
-                    None => view.terminal_error = true,
-                }
-                cx.notify();
-            }
-        });
         // Registered once and gated on `recording`: removing an interceptor from
         // inside its own callback is not safe.
         let this = cx.entity().downgrade();
@@ -181,13 +166,12 @@ impl SettingsView {
             persist,
             connections: Vec::new(),
             form: None,
-            terminal_input,
-            terminal_error: false,
+            terminal_menu_open: false,
             thumbnail_bytes: None,
             terminals: Vec::new(),
             recording: None,
             shortcut_error: None,
-            _subscriptions: vec![subscription, record_keys],
+            _subscriptions: vec![record_keys],
         };
         view.load_terminals(cx);
         view.reload_connections(cx);
@@ -229,10 +213,7 @@ impl SettingsView {
 
     fn pick_terminal(&mut self, name: &str, cx: &mut Context<Self>) {
         let name = name.to_string();
-        self.terminal_error = false;
-        // Keep the free-text field in step; setting its content emits no event.
-        self.terminal_input
-            .update(cx, |input, cx| input.set_content(name.clone(), cx));
+        self.terminal_menu_open = false;
         settings_apply::commit(cx, |settings| settings.terminal_app = name);
         cx.notify();
     }
@@ -319,15 +300,63 @@ impl SettingsView {
     }
 
     fn open_form(&mut self, kind: Kind, cx: &mut Context<Self>) {
-        let name = cx.new(|cx| TextInput::new("Name, e.g. Production server", cx));
+        self.open_form_for(kind, None, cx);
+    }
+
+    fn edit_connection(&mut self, id: i64, cx: &mut Context<Self>) {
+        let Some(connection) = self.connections.iter().find(|c| c.id == id).cloned() else {
+            return;
+        };
+        let Some(kind) = Kind::from_key(&connection.kind) else {
+            return;
+        };
+        self.open_form_for(kind, Some(connection), cx);
+    }
+
+    fn open_form_for(
+        &mut self,
+        kind: Kind,
+        existing: Option<SavedConnection>,
+        cx: &mut Context<Self>,
+    ) {
+        let editing = existing.as_ref().map(|connection| connection.id);
+        let stored = existing
+            .as_ref()
+            .map(|connection| connections::stored_values(&connection.config))
+            .unwrap_or_default();
+        let name = cx.new(|cx| {
+            let mut input = TextInput::new(tr("Name, e.g. Production server"), cx);
+            if let Some(connection) = &existing {
+                input.set_content(connection.name.clone(), cx);
+            }
+            input
+        });
         let fields = connections::fields_for(kind)
             .iter()
             .map(|field| {
-                let input = cx.new(|cx| TextInput::new(field.placeholder, cx));
+                let value = stored
+                    .iter()
+                    .find(|(key, _)| key == field.key)
+                    .map(|(_, value)| value.clone());
+                let input = cx.new(|cx| {
+                    // A saved secret is not shown again; blank means "keep it".
+                    let placeholder = if editing.is_some() && field.secret {
+                        tr("Leave blank to keep the saved one")
+                    } else {
+                        field.placeholder
+                    };
+                    let mut input = TextInput::new(placeholder, cx);
+                    input.set_masked(field.secret);
+                    if let Some(value) = value {
+                        input.set_content(value, cx);
+                    }
+                    input
+                });
                 (*field, input)
             })
             .collect();
         self.form = Some(ConnectionForm {
+            editing,
             kind,
             name,
             fields,
@@ -350,7 +379,8 @@ impl SettingsView {
                 .map(|(field, input)| (field.key.to_string(), input.read(cx).content().to_string()))
                 .collect(),
         };
-        let config = match connections::validate(&draft) {
+        let editing = form.editing;
+        let config = match connections::validate_with(&draft, editing.is_some()) {
             Ok(config) => config,
             Err(message) => {
                 form.error = Some(message);
@@ -360,27 +390,53 @@ impl SettingsView {
         };
         let Some(store) = store else {
             form.error =
-                Some("Saving is unavailable: the state database could not be opened".into());
+                Some(tr("Saving is unavailable: the state database could not be opened").into());
             cx.notify();
             return;
         };
         let kind = draft.kind.key();
         let name = draft.name.trim().to_string();
+        let secret = connections::secret_of(&draft);
         cx.spawn(async move |this, cx| {
+            // Row first, then the keychain; if the keychain refuses on a new
+            // connection the row is removed again, so one never exists without
+            // its secret.
             let result = cx
                 .background_executor()
-                .spawn(async move { store.add_connection(kind, &name, &config) })
+                .spawn(async move {
+                    let duplicate = || tr("A connection with this name already exists").to_string();
+                    let id = match editing {
+                        Some(id) => {
+                            store
+                                .update_connection(id, &name, &config)
+                                .map_err(|_| duplicate())?;
+                            id
+                        }
+                        None => store
+                            .add_connection(kind, &name, &config)
+                            .map_err(|_| duplicate())?,
+                    };
+                    if let Some(secret) = secret
+                        && let Err(error) = secrets::save(id, &secret)
+                    {
+                        if editing.is_none() {
+                            let _ = store.delete_connection(id);
+                        }
+                        return Err(trf("Cannot save to the keychain: {}", &[&error]));
+                    }
+                    Ok(id)
+                })
                 .await;
             this.update(cx, |view, cx| {
                 match result {
-                    Ok(_) => {
+                    Ok(id) => {
                         view.form = None;
                         view.reload_connections(cx);
+                        remote::notify_changed(cx, editing.map(|_| id));
                     }
-                    Err(_) => {
+                    Err(message) => {
                         if let Some(form) = view.form.as_mut() {
-                            form.error =
-                                Some("A connection with this name already exists".to_string());
+                            form.error = Some(message);
                         }
                     }
                 }
@@ -398,10 +454,16 @@ impl SettingsView {
         cx.spawn(async move |this, cx| {
             cx.background_executor()
                 .spawn(async move {
-                    let _ = store.delete_connection(id);
+                    if store.delete_connection(id).is_ok() {
+                        secrets::delete(id);
+                    }
                 })
                 .await;
-            this.update(cx, |view, cx| view.reload_connections(cx)).ok();
+            this.update(cx, |view, cx| {
+                view.reload_connections(cx);
+                remote::notify_changed(cx, Some(id));
+            })
+            .ok();
         })
         .detach();
     }
@@ -644,18 +706,36 @@ impl SettingsView {
             .map(|key| {
                 (
                     *key,
-                    crate::context_menu::sort_key_label(*key).replace("Date ", ""),
+                    match key {
+                        vfs_core::SortKey::Modified => tr("Modified"),
+                        vfs_core::SortKey::Created => tr("Created"),
+                        other => crate::context_menu::sort_key_label(*other),
+                    }
+                    .to_string(),
                 )
             })
             .collect();
         page(
-            "General",
+            tr("General"),
             vec![
                 section(
-                    "Startup",
+                    tr("Language"),
                     vec![row(
-                        "When Veloce starts",
-                        Some("The command-line folder, if you pass one, always wins."),
+                        tr("Interface language"),
+                        Some(tr("System follows the macOS language setting.")),
+                        segmented(
+                            "language",
+                            &labels(&LanguagePref::ALL, LanguagePref::label),
+                            s.language,
+                            |value, cx| settings_apply::commit(cx, |s| s.language = value),
+                        ),
+                    )],
+                ),
+                section(
+                    tr("Startup"),
+                    vec![row(
+                        tr("When Veloce starts"),
+                        Some(tr("The command-line folder, if you pass one, always wins.")),
                         segmented(
                             "startup",
                             &labels(&Startup::ALL, Startup::label),
@@ -665,24 +745,24 @@ impl SettingsView {
                     )],
                 ),
                 section(
-                    "New folders",
+                    tr("New folders"),
                     vec![
                         row(
-                            "Default view",
-                            Some("For folders you have not customised, as in Finder."),
+                            tr("Default view"),
+                            Some(tr("For folders you have not customised, as in Finder.")),
                             segmented(
                                 "view",
                                 &[
-                                    (ViewMode::Icons, "Icons".to_string()),
-                                    (ViewMode::List, "List".to_string()),
-                                    (ViewMode::Columns, "Columns".to_string()),
+                                    (ViewMode::Icons, tr("Icons").to_string()),
+                                    (ViewMode::List, tr("List").to_string()),
+                                    (ViewMode::Columns, tr("Columns").to_string()),
                                 ],
                                 s.default_view,
                                 |value, cx| settings_apply::commit(cx, |s| s.default_view = value),
                             ),
                         ),
                         row(
-                            "Sort by",
+                            tr("Sort by"),
                             None,
                             segmented(
                                 "sort-key",
@@ -694,13 +774,13 @@ impl SettingsView {
                             ),
                         ),
                         row(
-                            "Order",
+                            tr("Order"),
                             None,
                             segmented(
                                 "sort-order",
                                 &[
-                                    (false, "Ascending".to_string()),
-                                    (true, "Descending".to_string()),
+                                    (false, tr("Ascending").to_string()),
+                                    (true, tr("Descending").to_string()),
                                 ],
                                 s.default_sort.descending,
                                 |value, cx| {
@@ -711,15 +791,15 @@ impl SettingsView {
                             ),
                         ),
                         row(
-                            "Keep folders on top",
+                            tr("Keep folders on top"),
                             None,
                             toggle("folders-first", s.default_sort.dirs_first, |on, cx| {
                                 settings_apply::commit(cx, |s| s.default_sort.dirs_first = on)
                             }),
                         ),
                         row(
-                            "Show hidden files",
-                            Some("Files whose names start with a dot. Also ⇧⌘."),
+                            tr("Show hidden files"),
+                            Some(tr("Files whose names start with a dot. Also ⇧⌘.")),
                             toggle("show-hidden", s.show_hidden, |on, cx| {
                                 settings_apply::commit(cx, |s| s.show_hidden = on)
                             }),
@@ -732,7 +812,59 @@ impl SettingsView {
 
     fn files(&self, s: &AppSettings, cx: &mut Context<Self>) -> AnyElement {
         let entity = cx.entity();
-        let installed: Vec<AnyElement> = self
+        let icon_of = |icon: &Option<Arc<gpui::Image>>| match icon {
+            Some(icon) => gpui::img(icon.clone())
+                .w(px(18.))
+                .h(px(18.))
+                .into_any_element(),
+            None => div()
+                .w(px(18.))
+                .h(px(18.))
+                .rounded_md()
+                .bg(theme::bg_hover())
+                .into_any_element(),
+        };
+        // The saved app may not be installed (or the scan may still be running);
+        // it still has to show up as the current value.
+        let current = self
+            .terminals
+            .iter()
+            .find(|terminal| terminal.name == s.terminal_app)
+            .map(|terminal| terminal.icon.clone())
+            .unwrap_or(None);
+        let menu_open = self.terminal_menu_open;
+        let toggle_entity = entity.clone();
+        let trigger = div()
+            .id("terminal-select")
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap_2()
+            .h(px(28.))
+            .px_2()
+            .min_w(px(180.))
+            .rounded_md()
+            .bg(theme::bg())
+            .border_1()
+            .border_color(theme::border())
+            .cursor_pointer()
+            .hover(|this| this.bg(theme::bg_hover()))
+            .on_click(move |_, _, cx| {
+                toggle_entity.update(cx, |view, cx| {
+                    view.terminal_menu_open = !view.terminal_menu_open;
+                    cx.notify();
+                });
+            })
+            .child(icon_of(&current))
+            .child(
+                div()
+                    .flex_1()
+                    .text_sm()
+                    .text_color(theme::text())
+                    .child(s.terminal_app.clone()),
+            )
+            .child(div().text_xs().text_color(theme::text_faint()).child("⌄"));
+        let options: Vec<AnyElement> = self
             .terminals
             .iter()
             .map(|terminal| {
@@ -745,26 +877,16 @@ impl SettingsView {
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_3()
-                    .px_4()
-                    .py_2()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
                     .cursor_pointer()
                     .hover(|this| this.bg(theme::bg_hover()))
                     .on_click(move |_, _, cx| {
                         entity.update(cx, |view, cx| view.pick_terminal(&pick, cx));
                     })
-                    .child(match &terminal.icon {
-                        Some(icon) => gpui::img(icon.clone())
-                            .w(px(24.))
-                            .h(px(24.))
-                            .into_any_element(),
-                        None => div()
-                            .w(px(24.))
-                            .h(px(24.))
-                            .rounded_md()
-                            .bg(theme::bg_hover())
-                            .into_any_element(),
-                    })
+                    .child(icon_of(&terminal.icon))
                     .child(
                         div()
                             .flex_1()
@@ -772,26 +894,47 @@ impl SettingsView {
                             .text_color(theme::text())
                             .child(name),
                     )
-                    .child(if selected {
+                    .child(
                         div()
+                            .w(px(14.))
                             .text_sm()
                             .text_color(theme::accent())
-                            .child("✓")
-                            .into_any_element()
-                    } else {
-                        div().into_any_element()
-                    })
+                            .child(if selected { "✓" } else { "" }),
+                    )
                     .into_any_element()
             })
             .collect();
+        let control = div()
+            .relative()
+            .child(trigger)
+            .when(menu_open && !options.is_empty(), |this| {
+                this.child(gpui::deferred(
+                    div()
+                        .absolute()
+                        .top(px(32.))
+                        .right_0()
+                        .min_w(px(220.))
+                        .p_1()
+                        .flex()
+                        .flex_col()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(theme::border())
+                        .bg(theme::bg_raised())
+                        .shadow_lg()
+                        .occlude()
+                        .children(options),
+                ))
+            })
+            .into_any_element();
         page(
-            "Files",
+            tr("Files"),
             vec![
                 section(
-                    "Copy and move",
+                    tr("Copy and move"),
                     vec![row(
-                        "When a file with the same name exists",
-                        Some("Applies to paste, F5 and F6."),
+                        tr("When a file with the same name exists"),
+                        Some(tr("Applies to paste, F5 and F6.")),
                         segmented(
                             "conflict",
                             &labels(&OnConflict::ALL, OnConflict::label),
@@ -800,33 +943,19 @@ impl SettingsView {
                         ),
                     )],
                 ),
-                section("Terminal", installed),
                 section(
-                    "Other terminal",
-                    vec![
-                        row(
-                            "Application name",
-                            Some("For a terminal that is not listed above."),
-                            field_box(&self.terminal_input, 200.0),
-                        ),
-                        if self.terminal_error {
-                            div()
-                                .px_4()
-                                .pb_3()
-                                .text_xs()
-                                .text_color(theme::red())
-                                .child("Enter just the application's name: no slashes, no leading dash.")
-                                .into_any_element()
-                        } else {
-                            div().into_any_element()
-                        },
-                    ],
+                    tr("Terminal"),
+                    vec![row(
+                        tr("Default terminal"),
+                        Some(tr("Used by Open in Terminal.")),
+                        control,
+                    )],
                 ),
                 section(
-                    "Deleting",
-                    vec![note(
+                    tr("Deleting"),
+                    vec![note(tr(
                         "Delete always moves items to the Trash. Veloce has no way to delete permanently.",
-                    )],
+                    ))],
                 ),
             ],
         )
@@ -837,9 +966,9 @@ impl SettingsView {
         let has_store = self.store().is_some();
         let list: Vec<AnyElement> = if self.connections.is_empty() {
             vec![note(if has_store {
-                "No connections yet. Add one to reach a server from the file list."
+                tr("No connections yet. Add one to reach a server from the file list.")
             } else {
-                "Connections cannot be saved: the state database could not be opened."
+                tr("Connections cannot be saved: the state database could not be opened.")
             })]
         } else {
             self.connections
@@ -848,23 +977,36 @@ impl SettingsView {
                     let kind = Kind::from_key(&connection.kind);
                     let id = connection.id;
                     let entity = entity.clone();
+                    let edit_entity = entity.clone();
                     row(
                         &connection.name,
                         Some(&format!(
                             "{} · {}",
-                            kind.map(Kind::label).unwrap_or("Unknown"),
+                            kind.map(Kind::label).unwrap_or(tr("Unknown")),
                             kind.map(|k| connections::summary(k, &connection.config))
                                 .unwrap_or_default()
                         )),
-                        button(eid(format!("del-{id}")), "Remove", move |_, cx| {
-                            entity.update(cx, |view, cx| view.delete_connection(id, cx));
-                        }),
+                        div()
+                            .flex()
+                            .flex_row()
+                            .gap_2()
+                            .child(button(
+                                eid(format!("edit-{id}")),
+                                tr("Edit"),
+                                move |_, cx| {
+                                    edit_entity.update(cx, |view, cx| view.edit_connection(id, cx));
+                                },
+                            ))
+                            .child(button(eid(format!("del-{id}")), "Remove", move |_, cx| {
+                                entity.update(cx, |view, cx| view.delete_connection(id, cx));
+                            }))
+                            .into_any_element(),
                     )
                 })
                 .collect()
         };
 
-        let mut children = vec![section("Saved connections", list)];
+        let mut children = vec![section(tr("Saved connections"), list)];
         match &self.form {
             None => {
                 let adders: Vec<AnyElement> = Kind::ALL
@@ -874,7 +1016,7 @@ impl SettingsView {
                         let entity = entity.clone();
                         button(
                             eid(format!("add-{}", kind.key())),
-                            &format!("Add {}", kind.label()),
+                            &trf("Add {}", &[kind.label()]),
                             move |_, cx| {
                                 entity.update(cx, |view, cx| view.open_form(kind, cx));
                             },
@@ -894,20 +1036,24 @@ impl SettingsView {
                     div()
                         .text_xs()
                         .text_color(theme::text_faint())
-                        .child("Passwords and secret keys are never saved here; they will be kept in the system keychain when the remote backends arrive.")
+                        .child(tr("Passwords and secret keys are never saved here; they will be kept in the system keychain when the remote backends arrive."))
                         .into_any_element(),
                 );
             }
             Some(form) => children.push(self.connection_form(form, &entity)),
         }
-        page("Connections", children)
+        page(tr("Connections"), children)
     }
 
     fn connection_form(&self, form: &ConnectionForm, entity: &Entity<SettingsView>) -> AnyElement {
-        let mut rows = vec![row("Name", None, field_box(&form.name, 260.0))];
+        let mut rows = vec![row(tr("Name"), None, field_box(&form.name, 260.0))];
         for (field, input) in &form.fields {
             rows.push(row(
-                &format!("{}{}", field.label, if field.required { " *" } else { "" }),
+                &format!(
+                    "{}{}",
+                    tr(field.label),
+                    if field.required { " *" } else { "" }
+                ),
                 None,
                 field_box(input, 260.0),
             ));
@@ -933,18 +1079,23 @@ impl SettingsView {
                 .gap_2()
                 .px_4()
                 .py_3()
-                .child(button("form-cancel", "Cancel", move |_, cx| {
+                .child(button("form-cancel", tr("Cancel"), move |_, cx| {
                     cancel.update(cx, |view, cx| {
                         view.form = None;
                         cx.notify();
                     });
                 }))
-                .child(button("form-save", "Save connection", move |_, cx| {
+                .child(button("form-save", tr("Save connection"), move |_, cx| {
                     save.update(cx, |view, cx| view.save_form(cx));
                 }))
                 .into_any_element(),
         );
-        section(&format!("New {} connection", form.kind.label()), rows)
+        let title = if form.editing.is_some() {
+            trf("Edit {} connection", &[form.kind.label()])
+        } else {
+            trf("New {} connection", &[form.kind.label()])
+        };
+        section(&title, rows)
     }
 
     fn storage(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -953,39 +1104,39 @@ impl SettingsView {
         let path_text = path
             .as_ref()
             .map(|p| p.display().to_string())
-            .unwrap_or_else(|| "Unavailable".to_string());
+            .unwrap_or_else(|| tr("Unavailable").to_string());
         let reveal = path.and_then(|p| p.parent().map(|dir| dir.to_path_buf()));
         let persist = self.persist.clone();
         let clear_entity = entity.clone();
         page(
-            "Storage",
+            tr("Storage"),
             vec![
                 section(
-                    "Saved state",
+                    tr("Saved state"),
                     vec![
                         row(
-                            "Database",
+                            tr("Database"),
                             Some(&path_text),
-                            button("reveal-db", "Show in Finder", move |_, _| {
+                            button("reveal-db", tr("Show in Finder"), move |_, _| {
                                 if let Some(dir) = &reveal {
                                     let _ = open::that_detached(dir);
                                 }
                             }),
                         ),
-                        note(
+                        note(tr(
                             "Holds your settings, folder views, tabs, recent folders, connections and the thumbnail cache.",
-                        ),
+                        )),
                     ],
                 ),
                 section(
-                    "Thumbnail cache",
+                    tr("Thumbnail cache"),
                     vec![row(
-                        "Cached thumbnails",
+                        tr("Cached thumbnails"),
                         Some(&match self.thumbnail_bytes {
-                            Some(bytes) => format!("Using {}", human_bytes(bytes)),
-                            None => "Size unknown".to_string(),
+                            Some(bytes) => trf("Using {}", &[&human_bytes(bytes)]),
+                            None => tr("Size unknown").to_string(),
                         }),
-                        button("clear-cache", "Clear cache", move |_, cx| {
+                        button("clear-cache", tr("Clear cache"), move |_, cx| {
                             persist.clear_thumbnails(cx);
                             // The delete runs in the background; show the empty state now.
                             clear_entity.update(cx, |view, cx| {
@@ -996,11 +1147,11 @@ impl SettingsView {
                     )],
                 ),
                 section(
-                    "Reset",
+                    tr("Reset"),
                     vec![row(
-                        "Restore default settings",
-                        Some("Connections, folder views and tabs are kept."),
-                        button("reset-settings", "Reset settings", |_, cx| {
+                        tr("Restore default settings"),
+                        Some(tr("Connections, folder views and tabs are kept.")),
+                        button("reset-settings", tr("Reset settings"), |_, cx| {
                             settings_apply::commit(cx, |s| *s = AppSettings::default());
                         }),
                     )],
@@ -1012,13 +1163,13 @@ impl SettingsView {
 
 fn appearance(s: &AppSettings) -> AnyElement {
     page(
-        "Appearance",
+        tr("Appearance"),
         vec![section(
-            "Look",
+            tr("Look"),
             vec![
                 row(
-                    "Theme",
-                    Some("System follows the macOS light/dark setting."),
+                    tr("Theme"),
+                    Some(tr("System follows the macOS light/dark setting.")),
                     segmented(
                         "theme",
                         &labels(&ThemePref::ALL, ThemePref::label),
@@ -1027,8 +1178,8 @@ fn appearance(s: &AppSettings) -> AnyElement {
                     ),
                 ),
                 row(
-                    "Row density",
-                    Some("Height of rows in the list view."),
+                    tr("Row density"),
+                    Some(tr("Height of rows in the list view.")),
                     segmented(
                         "density",
                         &labels(&Density::ALL, Density::label),
@@ -1043,22 +1194,22 @@ fn appearance(s: &AppSettings) -> AnyElement {
 
 fn preview(s: &AppSettings) -> AnyElement {
     page(
-        "Preview",
+        tr("Preview"),
         vec![section(
-            "Thumbnails",
+            tr("Thumbnails"),
             vec![
                 row(
-                    "Show thumbnails in the icon view",
-                    Some(
+                    tr("Show thumbnails in the icon view"),
+                    Some(tr(
                         "Pictures, PDFs, videos and documents show a preview instead of a type icon.",
-                    ),
+                    )),
                     toggle("thumbnails", s.thumbnails, |on, cx| {
                         settings_apply::commit(cx, |s| s.thumbnails = on)
                     }),
                 ),
                 row(
-                    "Cache size limit",
-                    Some("Least recently used thumbnails are removed past this."),
+                    tr("Cache size limit"),
+                    Some(tr("Least recently used thumbnails are removed past this.")),
                     segmented(
                         "cache",
                         &CACHE_CHOICES_MB
@@ -1085,20 +1236,22 @@ fn preview(s: &AppSettings) -> AnyElement {
 
 fn search(s: &AppSettings) -> AnyElement {
     page(
-        "Search",
+        tr("Search"),
         vec![section(
-            "Searching folders (⌘P)",
+            tr("Searching folders (⌘P)"),
             vec![
                 row(
-                    "Include hidden files",
+                    tr("Include hidden files"),
                     None,
                     toggle("search-hidden", s.search_hidden, |on, cx| {
                         settings_apply::commit(cx, |s| s.search_hidden = on)
                     }),
                 ),
                 row(
-                    "Skip files ignored by .gitignore",
-                    Some("Keeps build output and dependencies out of the results."),
+                    tr("Skip files ignored by .gitignore"),
+                    Some(tr(
+                        "Keeps build output and dependencies out of the results.",
+                    )),
                     toggle("search-git", s.search_respects_gitignore, |on, cx| {
                         settings_apply::commit(cx, |s| s.search_respects_gitignore = on)
                     }),
@@ -1125,13 +1278,17 @@ impl SettingsView {
                     div()
                         .text_xs()
                         .text_color(theme::text_faint())
-                        .child("Click + to add a key, ✕ to remove one. Esc cancels."),
+                        .child(tr("Click + to add a key, ✕ to remove one. Esc cancels.")),
                 )
-                .child(button("shortcuts-reset-all", "Reset all", move |_, cx| {
-                    reset_all.update(cx, |view, cx| {
-                        view.change_shortcuts(cx, |_| Overrides::new());
-                    });
-                }))
+                .child(button(
+                    "shortcuts-reset-all",
+                    tr("Reset all"),
+                    move |_, cx| {
+                        reset_all.update(cx, |view, cx| {
+                            view.change_shortcuts(cx, |_| Overrides::new());
+                        });
+                    },
+                ))
                 .into_any_element(),
         );
         if let Some(message) = &self.shortcut_error {
@@ -1150,17 +1307,17 @@ impl SettingsView {
                 .filter(|command| command.group == group)
                 .map(|command| self.shortcut_row(command, s, &entity))
                 .collect();
-            children.push(section(group, rows));
+            children.push(section(tr(group), rows));
         }
 
         children.push(section(
-            "Fixed",
+            tr("Fixed"),
             keymap::RESERVED
                 .iter()
-                .map(|(binding, what)| row(what, None, key_chip(&keymap::display(binding))))
+                .map(|(binding, what)| row(tr(what), None, key_chip(&keymap::display(binding))))
                 .collect(),
         ));
-        page("Shortcuts", children)
+        page(tr("Shortcuts"), children)
     }
 
     fn shortcut_row(
@@ -1233,7 +1390,7 @@ impl SettingsView {
                         cx.notify();
                     });
                 })
-                .child(if recording { "Press keys…" } else { "+" })
+                .child(if recording { tr("Press keys…") } else { "+" })
                 .into_any_element(),
         );
         if keymap::is_customised(command.action, &s.shortcuts) {
@@ -1253,12 +1410,12 @@ impl SettingsView {
                             });
                         });
                     })
-                    .child("Reset")
+                    .child(tr("Reset"))
                     .into_any_element(),
             );
         }
         row(
-            command.label,
+            tr(command.label),
             None,
             div()
                 .flex()
@@ -1290,12 +1447,12 @@ fn key_chip(text: &str) -> AnyElement {
 
 fn about() -> AnyElement {
     page(
-        "About",
+        tr("About"),
         vec![section(
             "Veloce",
             vec![
                 row(
-                    "Version",
+                    tr("Version"),
                     None,
                     div()
                         .text_sm()
@@ -1303,10 +1460,10 @@ fn about() -> AnyElement {
                         .child(env!("CARGO_PKG_VERSION"))
                         .into_any_element(),
                 ),
-                note("A keyboard-first file manager built on Rust and GPUI."),
-                note(
+                note(tr("A keyboard-first file manager built on Rust and GPUI.")),
+                note(tr(
                     "Icons: Lucide (ISC) and Material Icon Theme (MIT). Highlighting: tree-sitter and syntect. Storage: SQLite.",
-                ),
+                )),
             ],
         )],
     )

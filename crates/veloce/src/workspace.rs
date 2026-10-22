@@ -5,10 +5,12 @@
 //! choke point is what keeps the keymap honest: the keymap binds actions, and this
 //! file is the only place that decides what each one means.
 
+use crate::i18n::{tr, trf};
 use std::{
+    collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use gpui::{
@@ -18,27 +20,31 @@ use gpui::{
 };
 mod menu_view;
 
+use veloce_store::SavedConnection;
 use vfs_core::{FsWatcher, VfsUri, WatchEvent};
 
 use crate::{
     actions::*,
     clipboard::FileClipboard,
+    connections::Kind,
     context_menu::{
-        ActionItem, MENU_PADDING, MENU_WIDTH, MenuAction, MenuContext, MenuItem, MenuTarget,
-        MoreState, OpenWith, build_menu, clamp_origin, menu_height, more_menu, open_with_menu,
-        sort_menu, view_menu,
+        ActionItem, AppEntry, MENU_PADDING, MENU_WIDTH, MenuAction, MenuContext, MenuItem,
+        MenuTarget, MoreState, OpenWith, build_menu, clamp_origin, favorite_menu, menu_height,
+        more_menu, open_with_menu, sort_menu, view_menu,
     },
     icons,
     info::info_rows,
     listing::{
-        Place, expand_home, favorite_places, location_places, place_is_current, recent_places,
+        Favorite, Place, expand_home, favorite_places, favorite_rows, is_favorite, location_places,
+        place_is_current, toggle_favorite,
     },
     open_with::{self, AppInfo},
     palette::{Palette, PaletteChoice, PaletteEvent, PaletteMode},
-    pane::{Pane, PaneEvent, PaneSide, Services},
-    persist::{Persist, RECENT_SHOWN, Startup as SavedStartup},
+    pane::{Pane, PaneEvent, PaneSide, Services, is_app},
+    persist::{Persist, Startup as SavedStartup},
     prefs::LayoutPrefs,
     preview::{PreviewEvent, PreviewView},
+    remote::{self, ConnectionsRevision},
     settings::{AppSettings, Startup},
     settings_apply,
     tasks_panel::TaskPanel,
@@ -53,7 +59,18 @@ use crate::{
 /// Files created by the inline "new folder / rename" prompt.
 pub(crate) enum InlinePrompt {
     NewFolder,
+    NewFile,
     Rename,
+    /// Permanently delete these remote items; runs only when the word is typed.
+    ConfirmDelete(Vec<VfsUri>),
+}
+
+/// The word that must be typed to confirm a permanent remote delete. Typing a word,
+/// not pressing Enter on a default button, so a stray key can't destroy data.
+pub(crate) const DELETE_WORD: &str = "DELETE";
+
+pub(crate) fn delete_confirmed(typed: &str) -> bool {
+    typed.trim() == DELETE_WORD
 }
 
 /// An open right-click menu. The origin is the raw cursor position; it is
@@ -65,6 +82,9 @@ pub(crate) struct OpenMenu {
     items: Vec<MenuItem>,
     /// Index of the top-level submenu row whose flyout is showing.
     open_sub: Option<usize>,
+    /// The row under the cursor, as (in flyout, index). Tracked here because
+    /// text colour baked in at layout can't follow a style-level `:hover`.
+    hovered: Option<(bool, usize)>,
     target: MenuTarget,
     ctx: MenuContext,
     /// Applications behind the Open With rows, in menu order.
@@ -72,6 +92,34 @@ pub(crate) struct OpenMenu {
     /// The menu is just the Open With list (the inspector's Open button).
     open_with_only: bool,
 }
+
+/// Ask LaunchServices (and the icon cache) about `path`. `None` when the file is
+/// gone or the lookup failed, so callers can keep what they had.
+fn query_apps(
+    path: &std::path::Path,
+    home: &std::path::Path,
+) -> Option<(Vec<AppInfo>, Vec<Option<PathBuf>>)> {
+    if !path.exists() {
+        return None;
+    }
+    let apps = open_with::list_apps(path, home).ok()?;
+    let cache = home.join("Library/Caches/veloce/app-icons");
+    let icons = open_with::app_icons(&apps, &cache, open_with::MENU_ICON_PIXELS);
+    Some((apps, icons))
+}
+
+/// One file type's cached Open With answer.
+#[derive(Clone)]
+struct AppsEntry {
+    at: Instant,
+    /// A real file of this type, to re-ask LaunchServices with.
+    sample: PathBuf,
+    apps: Vec<AppInfo>,
+    icons: Vec<Option<PathBuf>>,
+}
+
+/// How often the known file types are re-queried in the background.
+const APPS_REFRESH_EVERY: Duration = Duration::from_secs(300);
 
 /// The Get Info window's subject plus its slowly computed folder size.
 pub(crate) struct InfoState {
@@ -92,7 +140,10 @@ pub struct Workspace {
     pub split: bool,
     persist: Persist,
     /// Recently visited folders, newest first.
-    recents: Vec<PathBuf>,
+    /// Files and folders the user starred; shown after the built-in favorites.
+    favorites: Vec<Favorite>,
+    /// The starred item whose menu is (or was last) open.
+    favorite_target: Option<(PathBuf, bool)>,
     /// User-resizable layout: sidebar and inspector widths, and the left pane's
     /// share when split.
     sidebar_width: f32,
@@ -106,6 +157,9 @@ pub struct Workspace {
     menu_counter: u64,
     /// Open With applications of the menu that was just closed by a click.
     menu_apps: Vec<AppInfo>,
+    /// Applications that can open each file type, so the menu does not wait on
+    /// LaunchServices every time. Keyed by `open_with::app_cache_key`.
+    open_with_cache: HashMap<String, AppsEntry>,
     home: PathBuf,
     info: Option<InfoState>,
     /// Finder-style shortcuts down the left edge.
@@ -116,6 +170,9 @@ pub struct Workspace {
     watcher: Option<Arc<Mutex<FsWatcher>>>,
     watched_dir: Option<PathBuf>,
     subscriptions: Vec<Subscription>,
+    /// Saved remote connections, for the sidebar.
+    connections: Vec<SavedConnection>,
+    services: Services,
     /// Last error surfaced to the user (transient banner).
     banner: Option<(String, std::time::Instant)>,
 }
@@ -177,7 +234,7 @@ impl Workspace {
         });
 
         let preview_store = services.persist.store();
-        let preview = cx.new(|cx| PreviewView::new(preview_store, cx));
+        let preview = cx.new(|cx| PreviewView::new(preview_store, services.registry.clone(), cx));
         let tasks = cx.new(|cx| TaskPanel::new(services.tasks.clone(), cx));
         if layout.tasks_open {
             tasks.update(cx, |panel, cx| panel.toggle(cx));
@@ -197,12 +254,14 @@ impl Workspace {
             inspector_width: layout.inspector_width,
             split_ratio: layout.split_ratio,
             persist,
-            recents: startup.recents.iter().map(PathBuf::from).collect(),
+            favorites: startup.favorites.clone(),
+            favorite_target: None,
             drag: None,
             clipboard: FileClipboard::default(),
             menu: None,
             menu_counter: 0,
             menu_apps: Vec::new(),
+            open_with_cache: HashMap::new(),
             home: home_dir.clone(),
             info: None,
             places: favorite_places(&home_dir),
@@ -212,14 +271,76 @@ impl Workspace {
             watched_dir: None,
             subscriptions: Vec::new(),
             banner: None,
+            connections: Vec::new(),
+            services,
         };
 
         workspace.subscriptions = workspace.wire(cx);
+        workspace.reload_connections(cx);
+        workspace.spawn_apps_refresher(cx);
         workspace
+    }
+
+    /// Keep the Open With cache warm so the menu never has to wait: every few
+    /// minutes, re-ask LaunchServices about each file type seen so far, one at a
+    /// time so it never spikes the machine.
+    fn spawn_apps_refresher(&self, cx: &mut Context<Self>) {
+        let home = self.home.clone();
+        cx.spawn(async move |this, cx| {
+            loop {
+                cx.background_executor().timer(APPS_REFRESH_EVERY).await;
+                let Ok(samples) = this.update(cx, |workspace, _| {
+                    workspace
+                        .open_with_cache
+                        .iter()
+                        .map(|(key, entry)| (key.clone(), entry.sample.clone()))
+                        .collect::<Vec<_>>()
+                }) else {
+                    return;
+                };
+                for (key, sample) in samples {
+                    let home = home.clone();
+                    let fresh = cx
+                        .background_executor()
+                        .spawn(async move { query_apps(&sample, &home).map(|r| (sample, r)) })
+                        .await;
+                    // The sample may be gone or the query may fail: keep the old answer.
+                    let Some((sample, (apps, icons))) = fresh else {
+                        continue;
+                    };
+                    let stored = this.update(cx, |workspace, _| {
+                        workspace.open_with_cache.insert(
+                            key,
+                            AppsEntry {
+                                at: Instant::now(),
+                                sample,
+                                apps,
+                                icons,
+                            },
+                        );
+                    });
+                    if stored.is_err() {
+                        return;
+                    }
+                }
+            }
+        })
+        .detach();
     }
 
     /// Load both panes and start watching the focused one.
     pub fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Palette → workspace: run the chosen row. Subscribed with the window,
+        // since some commands (a confirmation prompt) need to take focus.
+        let palette = self.palette.clone();
+        self.subscriptions.push(cx.subscribe_in(
+            &palette,
+            window,
+            |workspace, _, event: &PaletteEvent, window, cx| {
+                let PaletteEvent::Chosen(choice) = event;
+                workspace.run_palette_choice(choice.clone(), window, cx);
+            },
+        ));
         // Follow the OS light/dark setting, now and whenever it flips.
         theme::set_appearance(window.appearance());
         self.subscriptions
@@ -249,22 +370,17 @@ impl Workspace {
                             workspace.sync_preview(cx);
                             workspace.retarget_watcher(cx);
                         }
-                        PaneEvent::OpenExternally(uri) => {
-                            if let Some(path) = uri.as_local_path() {
+                        PaneEvent::OpenExternally(uri) => match uri.as_local_path() {
+                            Some(path) => {
                                 let _ = open::that_detached(path);
                             }
-                        }
+                            None => workspace.open_remote_file(uri.clone(), cx),
+                        },
                         PaneEvent::OpenTerminal(dir) => {
                             let _ = open::that_detached(dir);
                         }
                         PaneEvent::ContextMenu { position, on_entry } => {
                             workspace.open_context_menu(&pane, *position, *on_entry, cx);
-                        }
-                        PaneEvent::Navigated(uri) => {
-                            if let Some(path) = uri.as_local_path() {
-                                workspace.persist.record_visit(cx, &path.to_string_lossy());
-                                workspace.note_recent(path);
-                            }
                         }
                         PaneEvent::TabsChanged => workspace.save_tabs(cx),
                         PaneEvent::SelectionChanged => {
@@ -290,6 +406,15 @@ impl Workspace {
         subscriptions.push(cx.observe_global::<AppSettings>(|workspace, cx| {
             workspace.on_settings_changed(cx);
         }));
+        subscriptions.push(cx.observe_global::<ConnectionsRevision>(|workspace, cx| {
+            if let Some(id) = cx.global::<ConnectionsRevision>().edited
+                && let Ok(mut registry) = workspace.services.registry.write()
+            {
+                // Reconnect with the new settings the next time it is opened.
+                registry.retain_connections(|_, key| key != id.to_string());
+            }
+            workspace.reload_connections(cx);
+        }));
 
         // Inspector → workspace: its Open button and application list.
         subscriptions.push(cx.subscribe(
@@ -300,15 +425,6 @@ impl Workspace {
                     pane.update(cx, |pane, cx| pane.open_selection(cx));
                 }
                 PreviewEvent::OpenWith(at) => workspace.open_apps_menu(*at, cx),
-            },
-        ));
-
-        // Palette → workspace: run the chosen row.
-        subscriptions.push(cx.subscribe(
-            &self.palette,
-            |workspace, _, event: &PaletteEvent, cx| {
-                let PaletteEvent::Chosen(choice) = event;
-                workspace.run_palette_choice(choice.clone(), cx);
             },
         ));
 
@@ -324,13 +440,219 @@ impl Workspace {
         cx.notify();
     }
 
+    // ---- remote connections --------------------------------------------------
+
+    /// Re-read the saved connections and unmount any that no longer exist.
+    fn reload_connections(&mut self, cx: &mut Context<Self>) {
+        let Some(store) = self.persist.store() else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let list = cx
+                .background_executor()
+                .spawn(async move { store.list_connections().unwrap_or_default() })
+                .await;
+            this.update(cx, |workspace, cx| {
+                if let Ok(mut registry) = workspace.services.registry.write() {
+                    registry.retain_connections(|scheme, id| {
+                        list.iter().any(|connection| {
+                            remote::uri_id(connection) == id
+                                && Kind::from_key(&connection.kind)
+                                    .is_some_and(|kind| kind.scheme() == scheme)
+                        })
+                    });
+                }
+                workspace.connections = list;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Browse a saved connection in the focused pane, connecting first if needed.
+    fn open_connection(&mut self, id: i64, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(connection) = self.connections.iter().find(|c| c.id == id).cloned() else {
+            return;
+        };
+        let Some(root) = remote::root_uri(&connection) else {
+            return;
+        };
+        let side = self.focused;
+        let mounted = self.services.registry.read().is_ok_and(|registry| {
+            registry.has_connection(root.scheme, &remote::uri_id(&connection))
+        });
+        if mounted {
+            self.pane(side)
+                .update(cx, |pane, cx| pane.navigate_to(root, cx));
+            self.focus_pane(side, window, cx);
+            return;
+        }
+        self.banner = Some((
+            trf("Connecting to {}…", &[&connection.name]),
+            std::time::Instant::now(),
+        ));
+        cx.notify();
+        let registry = self.services.registry.clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let name = connection.name.clone();
+            let mounted = cx
+                .background_executor()
+                .spawn(async move { remote::mount(&connection) })
+                .await;
+            this.update_in(cx, |workspace, window, cx| match mounted {
+                Ok(mounted) => {
+                    if let Ok(mut registry) = registry.write() {
+                        registry.register_connection(mounted.id, mounted.provider);
+                    }
+                    workspace.banner = None;
+                    workspace
+                        .pane(side)
+                        .update(cx, |pane, cx| pane.navigate_to(root, cx));
+                    workspace.focus_pane(side, window, cx);
+                    cx.notify();
+                }
+                Err(message) => {
+                    workspace.banner = Some((
+                        trf("Cannot connect to {}: {}", &[&name, &message]),
+                        std::time::Instant::now(),
+                    ));
+                    cx.notify();
+                }
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Download a remote file to a scratch folder and open it with its default app.
+    /// The copy shows in the task panel like any other transfer.
+    fn open_remote_file(&mut self, uri: VfsUri, cx: &mut Context<Self>) {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let local = std::env::temp_dir()
+            .join("veloce-remote")
+            .join(stamp.to_string())
+            .join(uri.file_name());
+        let tasks = self.services.tasks.clone();
+        let id = tasks.transfer(
+            uri,
+            VfsUri::local(&local),
+            self.services.registry.clone(),
+            vfs_core::ops::ConflictPolicy::Overwrite,
+            false,
+        );
+        cx.spawn(async move |this, cx| {
+            let state = loop {
+                cx.background_executor()
+                    .timer(std::time::Duration::from_millis(100))
+                    .await;
+                let finished = tasks
+                    .snapshots()
+                    .into_iter()
+                    .find(|task| task.id == id)
+                    .filter(|task| task.is_terminal());
+                if let Some(task) = finished {
+                    break task.state;
+                }
+            };
+            this.update(cx, |workspace, cx| {
+                match state {
+                    vfs_core::TaskState::Done => {
+                        let _ = open::that_detached(&local);
+                    }
+                    vfs_core::TaskState::Failed(message) => {
+                        workspace.banner = Some((message, std::time::Instant::now()));
+                    }
+                    _ => {}
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
     // ---- persistence -------------------------------------------------------
 
-    /// Move `path` to the front of the recent list.
-    fn note_recent(&mut self, path: PathBuf) {
-        self.recents.retain(|existing| existing != &path);
-        self.recents.insert(0, path);
-        self.recents.truncate(64);
+    /// Right-click on a starred item in the sidebar.
+    fn open_favorite_menu(
+        &mut self,
+        path: PathBuf,
+        is_dir: bool,
+        removable: bool,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.favorite_target = Some((path, is_dir));
+        self.menu_counter += 1;
+        self.menu = Some(OpenMenu {
+            id: self.menu_counter,
+            origin: (f32::from(position.x), f32::from(position.y)),
+            items: favorite_menu(is_dir, removable),
+            open_sub: None,
+            hovered: None,
+            target: MenuTarget::Background,
+            ctx: MenuContext::default(),
+            apps: Vec::new(),
+            open_with_only: false,
+        });
+        cx.notify();
+    }
+
+    /// Run a sidebar-favorite menu row on the item it was opened for.
+    fn run_favorite_action(&mut self, action: MenuAction, cx: &mut Context<Self>) {
+        let Some((path, is_dir)) = self.favorite_target.clone() else {
+            return;
+        };
+        let pane = self.focused_pane();
+        match action {
+            MenuAction::FavOpen if is_dir => {
+                pane.update(cx, |pane, cx| pane.navigate_to(VfsUri::local(&path), cx));
+            }
+            MenuAction::FavOpen => {
+                let _ = open::that_detached(&path);
+            }
+            MenuAction::FavOpenInNewTab => {
+                pane.update(cx, |pane, cx| {
+                    pane.open_in_new_tab(VfsUri::local(&path), cx)
+                });
+            }
+            MenuAction::FavReveal => pane.update(cx, |pane, cx| pane.reveal_file(&path, cx)),
+            MenuAction::FavCopyPath => Self::copy_text_to_clipboard(&[path], cx),
+            MenuAction::FavOpenInTerminal => {
+                let app = cx.global::<AppSettings>().terminal_app.clone();
+                Self::open_terminal_at(&path, &app);
+            }
+            MenuAction::FavRemove => {
+                self.favorites.retain(|favorite| favorite.path != path);
+                self.persist.save_favorites(cx, &self.favorites);
+                self.favorite_target = None;
+            }
+            _ => {}
+        }
+        cx.notify();
+    }
+
+    /// Star or unstar the single selected local item.
+    fn toggle_favorite_of_cursor(&mut self, cx: &mut Context<Self>) {
+        let entries = self.focused_pane().read(cx).selection_or_cursor();
+        let [entry] = entries.as_slice() else {
+            return;
+        };
+        let Some(path) = entry.uri.as_local_path() else {
+            return;
+        };
+        toggle_favorite(
+            &mut self.favorites,
+            Favorite {
+                path,
+                is_dir: entry.is_dir(),
+            },
+        );
+        self.persist.save_favorites(cx, &self.favorites);
+        cx.notify();
     }
 
     fn layout_prefs(&self, cx: &App) -> LayoutPrefs {
@@ -373,7 +695,8 @@ impl Workspace {
         let target = match (on_entry, selection.first()) {
             (true, Some(first)) => MenuTarget::Items {
                 count: selection.len(),
-                is_dir: selection.len() == 1 && first.is_dir(),
+                is_dir: selection.len() == 1 && first.is_dir() && !is_app(first),
+                app_bundle: selection.len() == 1 && is_app(first),
                 files_only: selection.iter().all(|entry| !entry.is_dir()),
                 archive_stem: (selection.len() == 1 && !first.is_dir())
                     .then(|| vfs_core::archive::ArchiveKind::detect(&first.name))
@@ -392,6 +715,13 @@ impl Workspace {
             show_hidden,
             sort,
             open_with: OpenWith::Loading,
+            favorite: match selection.as_slice() {
+                [entry] => entry
+                    .uri
+                    .as_local_path()
+                    .map(|path| is_favorite(&self.favorites, &path)),
+                _ => None,
+            },
         };
         self.menu_counter += 1;
         let id = self.menu_counter;
@@ -407,6 +737,7 @@ impl Workspace {
             origin: (f32::from(position.x), f32::from(position.y)),
             items: build_menu(&target, &ctx),
             open_sub: None,
+            hovered: None,
             target,
             ctx,
             apps: Vec::new(),
@@ -421,29 +752,65 @@ impl Workspace {
         }
     }
 
-    /// Ask LaunchServices which apps can open `path`, off the UI thread, and fill
-    /// the Open With submenu when the answer lands (if that menu is still open).
+    /// Fill the Open With submenu of menu `id` (if that menu is still open).
+    fn apply_open_with(
+        &mut self,
+        id: u64,
+        apps: Vec<AppInfo>,
+        icons: Vec<Option<PathBuf>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(menu) = self.menu.as_mut().filter(|menu| menu.id == id) else {
+            return;
+        };
+        menu.ctx.open_with = OpenWith::Apps(
+            apps.iter()
+                .zip(icons)
+                .map(|(app, icon)| AppEntry {
+                    name: app.name.clone(),
+                    icon,
+                })
+                .collect(),
+        );
+        menu.apps = apps;
+        menu.items = if menu.open_with_only {
+            open_with_menu(&menu.ctx.open_with)
+        } else {
+            build_menu(&menu.target, &menu.ctx)
+        };
+        cx.notify();
+    }
+
+    /// Fill the Open With submenu: straight from the per-file-type cache when
+    /// there is one, otherwise ask LaunchServices off the UI thread. A stale
+    /// cache entry is shown at once and refreshed behind the menu's back.
     fn load_open_with(&mut self, id: u64, path: PathBuf, cx: &mut Context<Self>) {
+        const FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(600);
+        let key = open_with::app_cache_key(&path);
+        if let Some(entry) = self.open_with_cache.get(&key).cloned() {
+            self.apply_open_with(id, entry.apps, entry.icons, cx);
+            if entry.at.elapsed() < FRESH_FOR {
+                return;
+            }
+        }
         let home = self.home.clone();
         cx.spawn(async move |this, cx| {
-            let apps = cx
+            let sample = path.clone();
+            let (apps, icons) = cx
                 .background_executor()
-                .spawn(async move { open_with::list_apps(&path, &home) })
-                .await
-                .unwrap_or_default();
+                .spawn(async move { query_apps(&path, &home).unwrap_or_default() })
+                .await;
             this.update(cx, |workspace, cx| {
-                let Some(menu) = workspace.menu.as_mut().filter(|menu| menu.id == id) else {
-                    return;
-                };
-                menu.ctx.open_with =
-                    OpenWith::Apps(apps.iter().map(|app| app.name.clone()).collect());
-                menu.apps = apps;
-                menu.items = if menu.open_with_only {
-                    open_with_menu(&menu.ctx.open_with)
-                } else {
-                    build_menu(&menu.target, &menu.ctx)
-                };
-                cx.notify();
+                workspace.open_with_cache.insert(
+                    key,
+                    AppsEntry {
+                        at: Instant::now(),
+                        sample,
+                        apps: apps.clone(),
+                        icons: icons.clone(),
+                    },
+                );
+                workspace.apply_open_with(id, apps, icons, cx);
             })
             .ok();
         })
@@ -467,6 +834,7 @@ impl Workspace {
             origin: (f32::from(at.x) - MENU_WIDTH + 24.0, f32::from(at.y) + 14.0),
             items: open_with_menu(&ctx.open_with),
             open_sub: None,
+            hovered: None,
             target: MenuTarget::Background,
             ctx,
             apps: Vec::new(),
@@ -476,6 +844,22 @@ impl Workspace {
         // Folders have no "open with": the list simply stays at its placeholder.
         if !entry.is_dir() {
             self.load_open_with(id, path, cx);
+        }
+    }
+
+    fn set_menu_hover(&mut self, row: (bool, usize), hovered: bool, cx: &mut Context<Self>) {
+        if let Some(menu) = self.menu.as_mut() {
+            let next = if hovered {
+                Some(row)
+            } else if menu.hovered == Some(row) {
+                None
+            } else {
+                return;
+            };
+            if menu.hovered != next {
+                menu.hovered = next;
+                cx.notify();
+            }
         }
     }
 
@@ -541,15 +925,6 @@ impl Workspace {
         .detach();
     }
 
-    fn show_tasks(&mut self, cx: &mut Context<Self>) {
-        self.tasks_open = true;
-        self.tasks.update(cx, |panel, cx| {
-            if !panel.open {
-                panel.toggle(cx);
-            }
-        });
-    }
-
     fn show_info(&mut self, cx: &mut Context<Self>) {
         let Some(entry) = self.focused_pane().read(cx).cursor_entry().cloned() else {
             return;
@@ -610,7 +985,6 @@ impl Workspace {
             .update(cx, |pane, cx| pane.apply_paste(ops, cx));
         let clipboard = std::mem::take(&mut self.clipboard).after_paste();
         self.set_clipboard(clipboard, cx);
-        self.show_tasks(cx);
     }
 
     /// One entry point for the menu rows and their keyboard shortcuts, so both
@@ -618,6 +992,12 @@ impl Workspace {
     fn run_menu_action(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
         let pane = self.focused_pane();
         match action {
+            MenuAction::FavOpen
+            | MenuAction::FavOpenInNewTab
+            | MenuAction::FavReveal
+            | MenuAction::FavCopyPath
+            | MenuAction::FavOpenInTerminal
+            | MenuAction::FavRemove => self.run_favorite_action(action, cx),
             MenuAction::Nothing => {}
             MenuAction::Open => pane.update(cx, |pane, cx| pane.open_selection(cx)),
             MenuAction::OpenWith(index) => {
@@ -630,6 +1010,9 @@ impl Workspace {
                 if let Some(entry) = pane.read(cx).cursor_entry().cloned() {
                     pane.update(cx, |pane, cx| pane.open_in_new_tab(entry.uri, cx));
                 }
+            }
+            MenuAction::ShowPackageContents => {
+                pane.update(cx, |pane, cx| pane.show_package_contents(cx));
             }
             MenuAction::OpenInTerminal => {
                 let target = {
@@ -683,18 +1066,25 @@ impl Workspace {
             }
             MenuAction::CreateShortcut => pane.update(cx, |pane, cx| pane.shortcut_selection(cx)),
             MenuAction::Delete => {
-                pane.update(cx, |pane, cx| pane.trash_selection(cx));
-                self.show_tasks(cx);
+                // 回收站操作几乎瞬间完成，不值得为它弹出任务面板。
+                self.delete_selection(window, cx);
             }
             MenuAction::Rename => {
                 if let Some(entry) = pane.read(cx).cursor_entry().cloned() {
                     self.start_prompt(InlinePrompt::Rename, entry.name.clone(), window, cx);
                 }
             }
+            MenuAction::ToggleFavorite => self.toggle_favorite_of_cursor(cx),
             MenuAction::Properties => self.show_info(cx),
             MenuAction::NewFolder => self.start_prompt(
                 InlinePrompt::NewFolder,
                 "New folder".to_string(),
+                window,
+                cx,
+            ),
+            MenuAction::NewFile => self.start_prompt(
+                InlinePrompt::NewFile,
+                "untitled.txt".to_string(),
                 window,
                 cx,
             ),
@@ -875,7 +1265,12 @@ impl Workspace {
         }
     }
 
-    fn run_palette_choice(&mut self, choice: PaletteChoice, cx: &mut Context<Self>) {
+    fn run_palette_choice(
+        &mut self,
+        choice: PaletteChoice,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         match choice {
             PaletteChoice::File(path) => {
                 let pane = self.focused_pane();
@@ -923,7 +1318,7 @@ impl Workspace {
                         self.move_to_other_pane(cx);
                     }
                     crate::palette::CommandId::TrashSelection => {
-                        pane.update(cx, |pane, cx| pane.trash_selection(cx));
+                        self.delete_selection(window, cx);
                     }
                     crate::palette::CommandId::Refresh => {
                         pane.update(cx, |pane, cx| pane.refresh(cx));
@@ -957,7 +1352,7 @@ impl Workspace {
     fn require_split(&mut self, cx: &mut Context<Self>) -> bool {
         if !self.split {
             self.banner = Some((
-                "Open the second pane first (⌘\\) to choose a destination".to_string(),
+                tr("Open the second pane first (⌘\\) to choose a destination").to_string(),
                 std::time::Instant::now(),
             ));
             cx.notify();
@@ -966,43 +1361,31 @@ impl Workspace {
     }
 
     fn copy_to_other_pane(&mut self, cx: &mut Context<Self>) {
-        if !self.require_split(cx) {
-            return;
-        }
-        let other_dir = self.other_pane().read(cx).current_uri().as_local_path();
-        let Some(dir) = other_dir else {
-            self.banner = Some((
-                "Copying into a remote backend arrives with the SFTP milestone".to_string(),
-                std::time::Instant::now(),
-            ));
-            return;
-        };
-        let pane = self.focused_pane();
-        pane.update(cx, |pane, cx| pane.copy_selection_to(&dir, cx));
-        self.tasks_open = true;
-        self.tasks.update(cx, |panel, cx| {
-            if !panel.open {
-                panel.toggle(cx);
-            }
-        });
+        self.send_to_other_pane(false, cx);
     }
 
     fn move_to_other_pane(&mut self, cx: &mut Context<Self>) {
+        self.send_to_other_pane(true, cx);
+    }
+
+    /// Copy or move the focused pane's selection into the other pane's folder,
+    /// whichever backends the two panes are showing.
+    fn send_to_other_pane(&mut self, remove_source: bool, cx: &mut Context<Self>) {
         if !self.require_split(cx) {
             return;
         }
-        let other_dir = self.other_pane().read(cx).current_uri().as_local_path();
-        let Some(dir) = other_dir else {
-            return;
-        };
-        let pane = self.focused_pane();
-        pane.update(cx, |pane, cx| pane.move_selection_to(&dir, cx));
-        self.tasks_open = true;
-        self.tasks.update(cx, |panel, cx| {
-            if !panel.open {
-                panel.toggle(cx);
+        let dir = self.other_pane().read(cx).current_uri();
+        self.focused_pane().update(cx, |pane, cx| {
+            if remove_source {
+                pane.move_selection_to(&dir, cx)
+            } else {
+                pane.copy_selection_to(&dir, cx)
             }
         });
+        // Remote folders have no watcher, so the destination would otherwise keep
+        // showing its old contents.
+        self.other_pane()
+            .update(cx, |pane, cx| pane.reload_when_idle(cx));
     }
 
     fn open_palette(&mut self, mode: PaletteMode, window: &mut Window, cx: &mut Context<Self>) {
@@ -1059,14 +1442,31 @@ impl Workspace {
             return;
         };
         let value = value.trim().to_string();
+        if let InlinePrompt::ConfirmDelete(uris) = kind {
+            if delete_confirmed(&value) {
+                self.focused_pane()
+                    .update(cx, |pane, cx| pane.delete_remote(uris, cx));
+            } else {
+                self.banner = Some((
+                    tr("Nothing was deleted: the confirmation word did not match").to_string(),
+                    std::time::Instant::now(),
+                ));
+            }
+            cx.notify();
+            return;
+        }
         if value.is_empty() {
             cx.notify();
             return;
         }
         let pane = self.focused_pane();
         match kind {
+            InlinePrompt::ConfirmDelete(_) => {}
             InlinePrompt::NewFolder => {
                 pane.update(cx, |pane, cx| pane.create_dir(&value, cx));
+            }
+            InlinePrompt::NewFile => {
+                pane.update(cx, |pane, cx| pane.create_file(&value, cx));
             }
             InlinePrompt::Rename => {
                 pane.update(cx, |pane, cx| pane.rename_cursor(&value, cx));
@@ -1351,15 +1751,31 @@ impl Workspace {
         self.move_to_other_pane(cx);
     }
 
-    fn on_trash(&mut self, _: &TrashSelection, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_trash(&mut self, _: &TrashSelection, window: &mut Window, cx: &mut Context<Self>) {
+        self.delete_selection(window, cx);
+    }
+
+    /// Local items go to the Trash. Remote ones have no Trash, so they are deleted
+    /// for good, but only after the user types the confirmation word.
+    fn delete_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let pane = self.focused_pane();
-        pane.update(cx, |pane, cx| pane.trash_selection(cx));
-        self.tasks_open = true;
-        self.tasks.update(cx, |panel, cx| {
-            if !panel.open {
-                panel.toggle(cx);
-            }
-        });
+        let remote: Vec<VfsUri> = pane
+            .read(cx)
+            .selection_or_cursor()
+            .into_iter()
+            .map(|entry| entry.uri)
+            .filter(|uri| !uri.scheme.is_local())
+            .collect();
+        if remote.is_empty() {
+            pane.update(cx, |pane, cx| pane.trash_selection(cx));
+        } else {
+            self.start_prompt(
+                InlinePrompt::ConfirmDelete(remote),
+                String::new(),
+                window,
+                cx,
+            );
+        }
     }
 
     fn on_new_folder(&mut self, _: &NewFolder, window: &mut Window, cx: &mut Context<Self>) {
@@ -1455,7 +1871,7 @@ impl Workspace {
                 let choice = self.palette.read(cx).activated();
                 self.palette.update(cx, |palette, cx| palette.close(cx));
                 if let Some(choice) = choice {
-                    self.run_palette_choice(choice, cx);
+                    self.run_palette_choice(choice, window, cx);
                 }
                 cx.stop_propagation();
             }
@@ -1513,8 +1929,13 @@ impl Render for Workspace {
         let palette_open = self.palette.read(cx).open;
         let prompt = self.prompt.as_ref().map(|(kind, input)| {
             let title = match kind {
-                InlinePrompt::NewFolder => "New folder name",
-                InlinePrompt::Rename => "Rename to",
+                InlinePrompt::NewFolder => tr("New folder name").to_string(),
+                InlinePrompt::NewFile => tr("New file name").to_string(),
+                InlinePrompt::Rename => tr("Rename to").to_string(),
+                InlinePrompt::ConfirmDelete(uris) => trf(
+                    "Permanently delete {} remote item(s)? Type {} to confirm",
+                    &[&uris.len().to_string(), DELETE_WORD],
+                ),
             };
             (title, input.clone())
         });
@@ -1641,7 +2062,7 @@ impl Render for Workspace {
                     }),
             )
             .when_some(prompt, |this, (title, input)| {
-                this.child(render_prompt(title, input, cx))
+                this.child(render_prompt(&title, input, cx))
             })
             .when(palette_open, |this| this.child(palette))
             .when_some(info, |this, info| this.child(info))
@@ -1945,6 +2366,7 @@ impl Workspace {
             origin: (f32::from(at.x) - 24.0, f32::from(at.y) + 18.0),
             items,
             open_sub: None,
+            hovered: None,
             target: MenuTarget::Background,
             ctx: MenuContext::default(),
             apps: Vec::new(),
@@ -1956,15 +2378,16 @@ impl Workspace {
     /// Favorites list. Clicking navigates whichever pane has focus, which is
     /// the dual-pane analogue of Finder's single content area.
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let current = self.focused_pane().read(cx).current_uri().path.clone();
-        let recent = recent_places(&self.recents, &self.places, RECENT_SHOWN);
-        let mut sections = vec![
-            ("Favorites", self.places.clone()),
-            ("Locations", location_places()),
+        let here = self.focused_pane().read(cx).current_uri();
+        // 远程目录的路径可能和本地某个位置同名，只有本地目录才能高亮本地条目。
+        let local_here = here.scheme.is_local();
+        let current = here.path.clone();
+        let mut favorites = self.places.clone();
+        favorites.extend(favorite_rows(&self.favorites, &self.places));
+        let sections = vec![
+            (tr("Favorites"), favorites),
+            (tr("Locations"), location_places()),
         ];
-        if !recent.is_empty() {
-            sections.push(("Recent", recent));
-        }
 
         // Room for the window's traffic lights, which sit in the sidebar.
         let mut column = div().flex().flex_col().gap_0p5().px_2().pt(px(46.));
@@ -1981,53 +2404,71 @@ impl Workspace {
                     .child(title),
             );
             for place in places {
-                let active = place_is_current(&place, &current);
+                let active = local_here && !place.is_file && place_is_current(&place, &current);
                 let target = place.path.clone();
+                let is_file = place.is_file;
+                let starred = place.starred;
                 let entity = cx.entity();
+                let menu_entity = cx.entity();
+                let menu_path = place.path.clone();
                 column = column.child(
-                    div()
-                        .id(gpui::ElementId::Name(format!("place-{index}").into()))
-                        .flex()
-                        .flex_row()
-                        .items_center()
-                        .gap_2()
-                        .h(px(26.))
-                        .px_2()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .text_sm()
-                        .when(active, |this| {
-                            this.bg(theme::bg_hover()).text_color(theme::text())
-                        })
-                        .when(!active, |this| {
-                            this.text_color(theme::text_muted())
-                                .hover(|this| this.bg(theme::bg_raised()).text_color(theme::text()))
+                    sidebar_row(format!("place-{index}"), active, place.icon, place.label)
+                        .on_mouse_down(MouseButton::Right, move |event, _, cx| {
+                            let path = menu_path.clone();
+                            let position = event.position;
+                            menu_entity.update(cx, |workspace, cx| {
+                                workspace.open_favorite_menu(path, !is_file, starred, position, cx)
+                            });
                         })
                         .on_click(move |_, window, cx| {
                             let target = target.clone();
                             entity.update(cx, |workspace, cx| {
                                 let side = workspace.focused;
                                 workspace.pane(side).update(cx, |pane, cx| {
-                                    pane.navigate_to(VfsUri::local(&target), cx)
+                                    if is_file {
+                                        pane.reveal_file(&target, cx)
+                                    } else {
+                                        pane.navigate_to(VfsUri::local(&target), cx)
+                                    }
                                 });
                                 workspace.focus_pane(side, window, cx);
                             });
-                        })
-                        .child(
-                            svg()
-                                .path(place.icon)
-                                .w(px(15.))
-                                .h(px(15.))
-                                .flex_shrink_0()
-                                .text_color(if active {
-                                    theme::accent()
-                                } else {
-                                    theme::text_faint()
-                                }),
-                        )
-                        .child(div().truncate().min_w_0().child(place.label)),
+                        }),
                 );
                 index += 1;
+            }
+        }
+
+        if !self.connections.is_empty() {
+            column = column.child(
+                div()
+                    .px_2()
+                    .pt_3()
+                    .pb_1()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme::text_faint())
+                    .child(tr("Connections")),
+            );
+            let here = self.focused_pane().read(cx).current_uri();
+            for connection in &self.connections {
+                let id = connection.id;
+                let active = here.connection_id.as_deref() == Some(&remote::uri_id(connection))
+                    && !here.scheme.is_local();
+                let entity = cx.entity();
+                column = column.child(
+                    sidebar_row(
+                        format!("connection-{id}"),
+                        active,
+                        icons::DISK,
+                        connection.name.clone(),
+                    )
+                    .on_click(move |_, window, cx| {
+                        entity.update(cx, |workspace, cx| {
+                            workspace.open_connection(id, window, cx)
+                        });
+                    }),
+                );
             }
         }
 
@@ -2041,6 +2482,46 @@ impl Workspace {
             .child(column)
             .into_any_element()
     }
+}
+
+/// One clickable row in the sidebar: icon and label, highlighted when `active`.
+fn sidebar_row(
+    id: String,
+    active: bool,
+    icon: &'static str,
+    label: String,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(gpui::ElementId::Name(id.into()))
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .h(px(26.))
+        .px_2()
+        .rounded_md()
+        .cursor_pointer()
+        .text_sm()
+        .when(active, |this| {
+            this.bg(theme::bg_hover()).text_color(theme::text())
+        })
+        .when(!active, |this| {
+            this.text_color(theme::text_muted())
+                .hover(|this| this.bg(theme::bg_raised()).text_color(theme::text()))
+        })
+        .child(
+            svg()
+                .path(icon)
+                .w(px(15.))
+                .h(px(15.))
+                .flex_shrink_0()
+                .text_color(if active {
+                    theme::accent()
+                } else {
+                    theme::text_faint()
+                }),
+        )
+        .child(div().truncate().min_w_0().child(label))
 }
 
 /// A draggable divider between two regions.
@@ -2171,24 +2652,38 @@ fn dropdown_button(id: &'static str, icon: &'static str) -> gpui::Stateful<gpui:
         )
 }
 
-fn render_prompt(
-    title: &str,
-    input: Entity<TextInput>,
-    _cx: &mut Context<Workspace>,
-) -> AnyElement {
+fn render_prompt(title: &str, input: Entity<TextInput>, cx: &mut Context<Workspace>) -> AnyElement {
+    let close_left = cx.entity();
+    let close_right = cx.entity();
+    // 与命令面板一致：整窗背板，点卡片外面取消，且不穿透到下面。
     div()
         .absolute()
         .top(px(0.))
         .left(px(0.))
         .right(px(0.))
         .bottom(px(0.))
+        .occlude()
         .flex()
         .items_start()
         .justify_center()
         .pt(px(120.))
+        .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+            close_left.update(cx, |workspace, cx| {
+                workspace.prompt = None;
+                cx.notify();
+            });
+        })
+        .on_mouse_down(gpui::MouseButton::Right, move |_, _, cx| {
+            close_right.update(cx, |workspace, cx| {
+                workspace.prompt = None;
+                cx.notify();
+            });
+        })
         .child(
             div()
                 .w(px(420.))
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(gpui::MouseButton::Right, |_, _, cx| cx.stop_propagation())
                 .flex()
                 .flex_col()
                 .gap_2()
@@ -2220,7 +2715,7 @@ fn render_prompt(
                     div()
                         .text_xs()
                         .text_color(theme::text_faint())
-                        .child("enter to confirm · esc to cancel"),
+                        .child(tr("enter to confirm · esc to cancel")),
                 ),
         )
         .into_any_element()
@@ -2255,3 +2750,17 @@ pub fn new_workspace(persist: Persist, startup: SavedStartup, cx: &mut App) -> E
 
 /// Kept so the module compiles if mouse handlers are added later.
 fn _unused(_: MouseButton, _: &mut Window, _: &mut App, _: &Subscription) {}
+
+#[cfg(test)]
+mod delete_tests {
+    use super::delete_confirmed;
+
+    #[test]
+    fn only_the_exact_word_confirms_a_permanent_delete() {
+        assert!(delete_confirmed("DELETE"));
+        assert!(delete_confirmed("  DELETE \n"));
+        for no in ["", "delete", "Delete", "DELET", "DELETE all", "y", "yes"] {
+            assert!(!delete_confirmed(no), "{no:?}");
+        }
+    }
+}

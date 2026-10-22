@@ -1,6 +1,7 @@
 //! The icon grid and the column browser: the two Finder view modes besides the
 //! list. They live beside `pane.rs` because they read the pane's private state.
 
+use crate::i18n::tr;
 use std::path::Path;
 
 use gpui::{ClickEvent, Stateful};
@@ -31,7 +32,7 @@ impl Pane {
         let rows = grid_rows(count, cols);
         let entity = cx.entity();
         let selected = self.listing.selected.clone();
-        let cursor = self.listing.cursor;
+        let cursor = self.listing.visible_cursor();
 
         div()
             .flex_1()
@@ -59,12 +60,13 @@ impl Pane {
                                         continue;
                                     };
                                     let highlighted =
-                                        selected.contains(&index) || position == cursor;
+                                        selected.contains(&index) || Some(position) == cursor;
                                     let look = CellLook {
                                         highlighted,
                                         pane_focused: focused,
                                         dimmed: pane.is_cut(&entry),
                                         thumb: pane.thumbnail_for(&entry, cx),
+                                        app_icon: pane.app_icon_for(&entry, cx),
                                     };
                                     line = line.child(render_cell(
                                         pane.side.index(),
@@ -102,8 +104,15 @@ impl Pane {
         if !thumbs::is_thumbnailable(&ext) {
             return None;
         }
-        let path = entry.uri.as_local_path()?;
+        // A thumbnail needs the whole file, and a folder of remote photos would mean
+        // downloading all of them just to draw the list. Remote files only get a
+        // picture when the user previews one by hand.
+        if !entry.uri.scheme.is_local() {
+            return None;
+        }
+        let path = entry.uri.clone();
         let stamp = thumbs::Stamp::new(entry.size, entry.modified);
+        let provider = self.services.provider_for(&entry.uri).ok()?;
         if let Some(known) = self.thumbs.get(&path).filter(|known| known.stamp == stamp) {
             return match &known.state {
                 ThumbState::Ready(image) => Some(image.clone()),
@@ -127,18 +136,18 @@ impl Pane {
         );
         self.thumbs_in_flight += 1;
         let store = self.services.persist.store();
+        let job_entry = entry.clone();
         cx.spawn(async move |this, cx| {
-            let job_path = path.clone();
             let bytes = cx
                 .background_executor()
                 .spawn(async move {
                     thumbs::thumbnail_bytes(
                         store.as_deref(),
-                        &job_path,
-                        &ext,
-                        stamp,
+                        provider.as_ref(),
+                        &job_entry,
                         thumbs::THUMB_PIXELS,
                     )
+                    .await
                 })
                 .await;
             this.update(cx, |pane, cx| {
@@ -157,6 +166,81 @@ impl Pane {
         })
         .detach();
         None
+    }
+
+    /// The rendered icon of an `.app` entry, starting its generation if nobody has
+    /// yet. Icons are requested in batches because every request costs an
+    /// `osascript` launch; the pane repaints as each batch lands.
+    pub(super) fn app_icon_for(
+        &mut self,
+        entry: &FileEntry,
+        cx: &mut Context<Self>,
+    ) -> Option<PathBuf> {
+        if !super::is_app(entry) {
+            return None;
+        }
+        let path = entry.uri.as_local_path()?;
+        if let Some(known) = self.app_icons.get(&path) {
+            return known.clone();
+        }
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from)
+            && let Some(icon) = crate::open_with::cached_icon(
+                &crate::open_with::icon_cache_dir(&home),
+                &path,
+                crate::open_with::TILE_ICON_PIXELS,
+            )
+        {
+            self.app_icons.insert(path, Some(icon.clone()));
+            return Some(icon);
+        }
+        self.app_icons.insert(path.clone(), None);
+        self.app_icon_queue.push(path);
+        self.pump_app_icons(cx);
+        None
+    }
+
+    fn pump_app_icons(&mut self, cx: &mut Context<Self>) {
+        const BATCH: usize = 24;
+        if self.app_icons_busy || self.app_icon_queue.is_empty() {
+            return;
+        }
+        let Some(home) = std::env::var_os("HOME").map(PathBuf::from) else {
+            self.app_icon_queue.clear();
+            return;
+        };
+        self.app_icons_busy = true;
+        let take = self.app_icon_queue.len().min(BATCH);
+        let batch: Vec<PathBuf> = self.app_icon_queue.drain(..take).collect();
+        cx.spawn(async move |this, cx| {
+            let job = batch.clone();
+            let icons = cx
+                .background_executor()
+                .spawn(async move {
+                    let apps: Vec<crate::open_with::AppInfo> = job
+                        .into_iter()
+                        .map(|path| crate::open_with::AppInfo {
+                            name: String::new(),
+                            path,
+                        })
+                        .collect();
+                    crate::open_with::app_icons(
+                        &apps,
+                        &crate::open_with::icon_cache_dir(&home),
+                        crate::open_with::TILE_ICON_PIXELS,
+                    )
+                })
+                .await;
+            this.update(cx, |pane, cx| {
+                for (path, icon) in batch.into_iter().zip(icons) {
+                    pane.app_icons.insert(path, icon);
+                }
+                pane.app_icons_busy = false;
+                pane.pump_app_icons(cx);
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Whether `entry` is waiting to be moved by a Paste.
@@ -307,7 +391,7 @@ impl Pane {
         let side = self.side.index();
         let entity = cx.entity();
         let selected = self.listing.selected.clone();
-        let cursor = self.listing.cursor;
+        let cursor = self.listing.visible_cursor();
         uniform_list(
             gpui::ElementId::Name(format!("pane{side}-activecol").into()),
             count,
@@ -316,7 +400,7 @@ impl Pane {
                     .filter_map(|position| {
                         let index = *pane.listing.visible.get(position)?;
                         let entry = pane.listing.entries.get(index)?.clone();
-                        let highlighted = selected.contains(&index) || position == cursor;
+                        let highlighted = selected.contains(&index) || Some(position) == cursor;
                         let (background, on_accent) = highlight_colors(highlighted, focused);
                         let click = entity.clone();
                         let right = entity.clone();
@@ -369,7 +453,7 @@ impl Pane {
                 .p_3()
                 .text_xs()
                 .text_color(theme::text_faint())
-                .child("Loading…")
+                .child(tr("Loading…"))
                 .into_any_element();
         };
 
@@ -394,7 +478,7 @@ impl Pane {
                 .p_3()
                 .text_xs()
                 .text_color(theme::text_faint())
-                .child("Empty")
+                .child(tr("Empty"))
                 .into_any_element()
         } else {
             uniform_list(
@@ -462,22 +546,23 @@ pub(super) fn attach_pointer(
     entity: Entity<Pane>,
 ) -> Stateful<gpui::Div> {
     let click_entity = entity.clone();
-    item.on_click(move |event, _, cx| {
-        let shift = event.modifiers().shift;
-        let double = event.click_count() >= 2;
-        click_entity.update(cx, |pane, cx| {
-            pane.set_cursor_position(position, shift, cx);
-            if double {
-                pane.activate_cursor(cx);
-            }
-        });
-    })
-    .on_mouse_down(MouseButton::Right, move |event, _, cx| {
-        // The list background also listens for right-clicks; the item owns this one.
-        cx.stop_propagation();
-        let at = event.position;
-        entity.update(cx, |pane, cx| pane.context_click(Some(position), at, cx));
-    })
+    item.on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        .on_click(move |event, _, cx| {
+            let shift = event.modifiers().shift;
+            let double = event.click_count() >= 2;
+            click_entity.update(cx, |pane, cx| {
+                pane.set_cursor_position(position, shift, cx);
+                if double {
+                    pane.activate_cursor(cx);
+                }
+            });
+        })
+        .on_mouse_down(MouseButton::Right, move |event, _, cx| {
+            // The list background also listens for right-clicks; the item owns this one.
+            cx.stop_propagation();
+            let at = event.position;
+            entity.update(cx, |pane, cx| pane.context_click(Some(position), at, cx));
+        })
 }
 
 fn highlight_colors(highlighted: bool, pane_focused: bool) -> (Option<Hsla>, bool) {
@@ -499,6 +584,8 @@ struct CellLook {
     dimmed: bool,
     /// The file's picture, when one has been generated.
     thumb: Option<Arc<gpui::Image>>,
+    /// The application's icon, for `.app` bundles.
+    app_icon: Option<PathBuf>,
 }
 
 /// Square the icon or thumbnail is fitted into.
@@ -517,6 +604,7 @@ fn render_cell(
         pane_focused,
         dimmed,
         thumb,
+        app_icon,
     } = look;
     let (background, on_accent) = highlight_colors(highlighted, pane_focused);
     // A picture of the file where there is one, the file-type icon otherwise.
@@ -541,7 +629,10 @@ fn render_cell(
             .flex()
             .items_center()
             .justify_center()
-            .child(entry_icon(entry, 48.0))
+            .child(match app_icon {
+                Some(_) => super::bundle_icon(entry, app_icon, THUMB_BOX),
+                None => entry_icon(entry, 48.0),
+            })
             .into_any_element(),
     };
     // Finder 式选中：灰底只托住图片，名字单独一枚强调色胶囊，整格不上色。
@@ -563,7 +654,7 @@ fn render_cell(
         .w(px(ICON_CELL_W))
         .h(px(ICON_CELL_H))
         .flex_shrink_0()
-        .pt_2()
+        .pt_1()
         .px_1()
         .gap_1()
         .cursor_pointer()
@@ -574,13 +665,19 @@ fn render_cell(
             div()
                 .max_w_full()
                 .px_1()
+                .py(px(1.0))
                 .rounded_md()
                 .text_xs()
+                // 默认 text_xs 行高偏松，两行名字显得散，且会顶到格子底部被裁。
+                .line_height(px(14.0))
                 .text_center()
                 .line_clamp(2)
                 .when_some(background, |this, color| this.bg(color))
                 .when(on_accent, |this| this.text_color(gpui::white()))
-                .child(entry.name.clone()),
+                .child(crate::view::middle_ellipsis(
+                    crate::open_with::display_name(&entry.name),
+                    150.0,
+                )),
         );
     attach_pointer(cell, position, entity).into_any_element()
 }
@@ -619,6 +716,7 @@ pub(super) fn render_column_row(
                 .text_color(text)
                 .when(dimmed, |this| this.opacity(0.5))
                 .when_some(background, |this, color| this.bg(color))
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(on_click)
                 .when_some(right_click, |this, (entity, position)| {
                     this.on_mouse_down(MouseButton::Right, move |event, _, cx| {
@@ -656,9 +754,9 @@ pub(super) fn render_column_row(
 /// The rightmost column when a file is selected: icon plus basic facts.
 fn render_file_detail(entry: &FileEntry) -> AnyElement {
     let rows = [
-        ("Kind", kind_label(entry)),
-        ("Size", format_size(entry.size)),
-        ("Modified", format_relative(entry.modified)),
+        (tr("Kind"), kind_label(entry)),
+        (tr("Size"), format_size(entry.size)),
+        (tr("Modified"), format_relative(entry.modified)),
     ];
     div()
         .flex_1()

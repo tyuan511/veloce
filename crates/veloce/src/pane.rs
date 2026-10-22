@@ -7,11 +7,12 @@
 
 mod views;
 
+use crate::i18n::{tr, trf};
 use std::{
     collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
-        Arc,
+        Arc, RwLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -22,7 +23,8 @@ use gpui::{
     Subscription, UniformListScrollHandle, Window, div, img, prelude::*, px, svg, uniform_list,
 };
 use vfs_core::{
-    FileEntry, FileKind, Filter, LocalProvider, SortKey, SortSpec, VfsProvider, VfsUri,
+    FileEntry, FileKind, Filter, LocalProvider, ProviderRegistry, SortKey, SortSpec, VfsProvider,
+    VfsUri,
     archive::{
         self, ArchiveKind, CommandSpec, CompressFormat, compress_archive_path, compress_command,
         extract_command, extract_dir_path,
@@ -37,7 +39,7 @@ use crate::{
     history::History,
     icons,
     listing::{Listing, cycle_index, index_after_close},
-    persist::Persist,
+    persist::{Persist, folder_key},
     settings::AppSettings,
     text_input::{TextInput, TextInputEvent},
     theme,
@@ -103,20 +105,42 @@ pub enum ThumbState {
 /// Shared services the panes borrow.
 #[derive(Clone)]
 pub struct Services {
+    /// The local provider, for the parts of the UI that only ever touch the disk.
     pub provider: Arc<dyn VfsProvider>,
+    /// Every mounted backend, local and remote; remote connections are added as the
+    /// user connects to them.
+    pub registry: Arc<RwLock<ProviderRegistry>>,
     pub tasks: Arc<TaskManager>,
     /// Saved per-folder views, and the queue for writing new ones.
     pub persist: Persist,
 }
 
 impl Services {
+    /// The backend that serves `uri`, or why there is none (not connected yet).
+    pub fn provider_for(&self, uri: &VfsUri) -> vfs_core::Result<Arc<dyn VfsProvider>> {
+        match self.registry.read() {
+            Ok(registry) => registry.for_uri(uri),
+            Err(_) => Err(vfs_core::Error::Other(
+                "provider registry is poisoned".into(),
+            )),
+        }
+    }
+
     pub fn new(persist: Persist) -> Self {
         Self {
             provider: Arc::new(LocalProvider::new()),
+            registry: Arc::new(RwLock::new(ProviderRegistry::with_local())),
             tasks: Arc::new(TaskManager::with_defaults()),
             persist,
         }
     }
+}
+
+/// A single write to a remote backend.
+enum RemoteWrite {
+    CreateDir(VfsUri),
+    CreateFile(VfsUri),
+    Rename { from: VfsUri, to: VfsUri },
 }
 
 /// Events a pane emits so the workspace can react.
@@ -138,7 +162,6 @@ pub enum PaneEvent {
     Notice(String),
     /// The pane moved to a folder (not emitted for Back/Forward replays of a
     /// reload, only for real changes of folder).
-    Navigated(VfsUri),
     /// Tabs were opened, closed, switched or pointed elsewhere.
     TabsChanged,
     /// The cursor moved (by key or click), so the preview must follow.
@@ -170,8 +193,12 @@ pub struct Pane {
     /// Side-column folder contents (columns view), loaded lazily.
     pub columns: HashMap<PathBuf, Arc<Vec<FileEntry>>>,
     /// Thumbnails for the icon view, generated lazily for visible files.
-    pub thumbs: HashMap<PathBuf, ThumbEntry>,
+    pub thumbs: HashMap<VfsUri, ThumbEntry>,
     thumbs_in_flight: usize,
+    /// Rendered icons of `.app` entries; `None` while generating or when it failed.
+    app_icons: HashMap<PathBuf, Option<PathBuf>>,
+    app_icon_queue: Vec<PathBuf>,
+    app_icons_busy: bool,
     columns_loading: HashSet<PathBuf>,
     column_scrolls: HashMap<PathBuf, UniformListScrollHandle>,
     columns_scrolled: HashSet<PathBuf>,
@@ -205,7 +232,7 @@ impl Focusable for Pane {
 
 impl Pane {
     pub fn new(side: PaneSide, uri: VfsUri, services: Services, cx: &mut Context<Self>) -> Self {
-        let filter_input = cx.new(|cx| TextInput::new("Filter this folder…", cx));
+        let filter_input = cx.new(|cx| TextInput::new(tr("Filter this folder…"), cx));
 
         let subscriptions = vec![cx.subscribe(
             &filter_input,
@@ -239,6 +266,9 @@ impl Pane {
             columns: HashMap::new(),
             thumbs: HashMap::new(),
             thumbs_in_flight: 0,
+            app_icons: HashMap::new(),
+            app_icon_queue: Vec::new(),
+            app_icons_busy: false,
             columns_loading: HashSet::new(),
             column_scrolls: HashMap::new(),
             columns_scrolled: HashSet::new(),
@@ -290,9 +320,13 @@ impl Pane {
         // otherwise keep showing them, since no chunk ever arrives to clear them.
         self.listing.clear();
 
-        let provider = self.services.provider.clone();
+        let provider = self.services.provider_for(&uri);
         cx.spawn(async move |this, cx| {
-            let stream = match provider.list_stream(&uri).await {
+            let listed = match provider {
+                Ok(provider) => provider.list_stream(&uri).await,
+                Err(error) => Err(error),
+            };
+            let stream = match listed {
                 Ok(stream) => stream,
                 Err(error) => {
                     let message = error.to_string();
@@ -431,12 +465,9 @@ impl Pane {
     }
 
     /// The view and sort saved for this folder (or Finder's default for one never
-    /// customised). Only local folders are remembered.
+    /// customised).
     fn apply_folder_prefs(&mut self, uri: &VfsUri) {
-        let Some(path) = uri.as_local_path() else {
-            return;
-        };
-        let (view, sort) = self.services.persist.folder_view(&path.to_string_lossy());
+        let (view, sort) = self.services.persist.folder_view(&folder_key(uri));
         self.view = view;
         self.sort = sort;
         self.recompute_visible();
@@ -445,14 +476,10 @@ impl Pane {
 
     /// Save the current view and sort as this folder's.
     fn remember_folder_prefs(&mut self, cx: &mut Context<Self>) {
-        if let Some(path) = self.current_uri().as_local_path() {
-            self.services.persist.remember_folder(
-                cx,
-                &path.to_string_lossy(),
-                self.view,
-                self.sort,
-            );
-        }
+        let key = folder_key(&self.current_uri());
+        self.services
+            .persist
+            .remember_folder(cx, &key, self.view, self.sort);
     }
 
     /// Local paths of the open tabs and the active index, for the saved session.
@@ -503,7 +530,6 @@ impl Pane {
         self.filter_input.update(cx, |input, cx| input.clear(cx));
         self.scroll = UniformListScrollHandle::new();
         self.reload(cx);
-        cx.emit(PaneEvent::Navigated(uri));
         cx.emit(PaneEvent::TabsChanged);
     }
 
@@ -656,6 +682,14 @@ impl Pane {
         cx.notify();
     }
 
+    /// Click on blank space: select nothing.
+    pub fn deselect_all(&mut self, cx: &mut Context<Self>) {
+        self.listing.deselect_all();
+        self.refresh_status();
+        cx.emit(PaneEvent::SelectionChanged);
+        cx.notify();
+    }
+
     pub fn clear_selection(&mut self, cx: &mut Context<Self>) {
         if self.filter_active {
             self.stop_filter(cx);
@@ -671,10 +705,20 @@ impl Pane {
         let Some(entry) = self.cursor_entry().cloned() else {
             return;
         };
-        if entry.is_dir() {
+        // Finder launches a bundle instead of entering it.
+        if entry.is_dir() && !is_app(&entry) {
             self.navigate_to(entry.uri.clone(), cx);
         } else {
             cx.emit(PaneEvent::OpenExternally(entry.uri));
+        }
+    }
+
+    /// Finder's "Show Package Contents": enter an application bundle as a folder.
+    pub fn show_package_contents(&mut self, cx: &mut Context<Self>) {
+        if let Some(entry) = self.cursor_entry().cloned()
+            && entry.is_dir()
+        {
+            self.navigate_to(entry.uri, cx);
         }
     }
 
@@ -739,29 +783,46 @@ impl Pane {
 
     // ---- file operations --------------------------------------------------
 
-    pub fn copy_selection_to(&mut self, target_dir: &std::path::Path, cx: &mut Context<Self>) {
-        let policy = cx.global::<AppSettings>().on_conflict.policy();
-        for entry in self.selection_or_cursor() {
-            let Some(from) = entry.uri.as_local_path() else {
-                continue;
-            };
-            let to = target_dir.join(&entry.name);
-            self.services.tasks.copy(from, to, policy);
-        }
-        self.reload_when_idle(cx);
+    pub fn copy_selection_to(&mut self, target_dir: &VfsUri, cx: &mut Context<Self>) {
+        self.transfer_selection(target_dir, false, cx);
         cx.notify();
     }
 
-    pub fn move_selection_to(&mut self, target_dir: &std::path::Path, cx: &mut Context<Self>) {
+    pub fn move_selection_to(&mut self, target_dir: &VfsUri, cx: &mut Context<Self>) {
+        self.transfer_selection(target_dir, true, cx);
+        self.listing.clear_selection();
+    }
+
+    /// Copy or move the selection into `target_dir`. Two local ends use the native
+    /// file tasks (which keep modification times); anything involving a remote
+    /// connection goes through the cross-protocol transfer.
+    fn transfer_selection(
+        &mut self,
+        target_dir: &VfsUri,
+        remove_source: bool,
+        cx: &mut Context<Self>,
+    ) {
         let policy = cx.global::<AppSettings>().on_conflict.policy();
         for entry in self.selection_or_cursor() {
-            let Some(from) = entry.uri.as_local_path() else {
-                continue;
-            };
             let to = target_dir.join(&entry.name);
-            self.services.tasks.move_path(from, to, policy);
+            match (entry.uri.as_local_path(), to.as_local_path()) {
+                (Some(from), Some(to)) if remove_source => {
+                    self.services.tasks.move_path(from, to, policy);
+                }
+                (Some(from), Some(to)) => {
+                    self.services.tasks.copy(from, to, policy);
+                }
+                _ => {
+                    self.services.tasks.transfer(
+                        entry.uri.clone(),
+                        to,
+                        self.services.registry.clone(),
+                        policy,
+                        remove_source,
+                    );
+                }
+            }
         }
-        self.listing.clear_selection();
         self.reload_when_idle(cx);
     }
 
@@ -770,16 +831,29 @@ impl Pane {
     /// Rows disappear immediately (optimistic UI) and the listing is re-read once
     /// the trash task actually completes, so the two never disagree.
     pub fn trash_selection(&mut self, cx: &mut Context<Self>) {
+        let mut remote_skipped = false;
+        for entry in self.selection_or_cursor() {
+            match entry.uri.as_local_path() {
+                Some(path) => {
+                    self.services.tasks.trash(path);
+                }
+                None => remote_skipped = true,
+            }
+        }
+        if remote_skipped {
+            // A server has no Trash. Remote items are only ever deleted through
+            // `delete_remote`, after the workspace has asked for confirmation.
+            cx.emit(PaneEvent::Notice(
+                tr("Remote items cannot be moved to the Trash, so they were not deleted")
+                    .to_string(),
+            ));
+        }
         let targets: Vec<String> = self
             .selection_or_cursor()
             .into_iter()
+            .filter(|entry| entry.uri.scheme.is_local())
             .map(|entry| entry.id())
             .collect();
-        for entry in self.selection_or_cursor() {
-            if let Some(path) = entry.uri.as_local_path() {
-                self.services.tasks.trash(path);
-            }
-        }
         let remaining: Vec<FileEntry> = self
             .listing
             .entries
@@ -792,6 +866,46 @@ impl Pane {
             .set_entries(remaining, &self.sort, &mut self.filter);
         self.refresh_status();
         self.reload_when_idle(cx);
+        cx.notify();
+    }
+
+    /// Permanently delete remote items. The one hard-delete path in the app: there
+    /// is no Trash on a server, so the caller must have confirmed already.
+    pub fn delete_remote(&mut self, uris: Vec<VfsUri>, cx: &mut Context<Self>) {
+        let targets: Vec<String> = uris.iter().map(ToString::to_string).collect();
+        let remaining: Vec<FileEntry> = self
+            .listing
+            .entries
+            .iter()
+            .filter(|entry| !targets.contains(&entry.uri.to_string()))
+            .cloned()
+            .collect();
+        self.listing.clear_selection();
+        self.listing
+            .set_entries(remaining, &self.sort, &mut self.filter);
+        self.refresh_status();
+        let services = self.services.clone();
+        cx.spawn(async move |this, cx| {
+            let mut failures = Vec::new();
+            for uri in uris {
+                let result = match services.provider_for(&uri) {
+                    Ok(provider) => provider.delete(&uri, true).await,
+                    Err(error) => Err(error),
+                };
+                if let Err(error) = result {
+                    failures.push(error.to_string());
+                }
+            }
+            this.update(cx, |pane, cx| {
+                if !failures.is_empty() {
+                    cx.emit(PaneEvent::Notice(failures.join("; ")));
+                }
+                // Re-read either way, so a failed delete brings the row back.
+                pane.reload(cx);
+            })
+            .ok();
+        })
+        .detach();
         cx.notify();
     }
 
@@ -817,10 +931,22 @@ impl Pane {
     }
 
     pub fn create_dir(&mut self, name: &str, cx: &mut Context<Self>) {
-        let Some(dir) = self.current_uri().as_local_path() else {
+        let dir = self.current_uri();
+        let Some(path) = dir.as_local_path() else {
+            self.remote_write(RemoteWrite::CreateDir(dir.join(name)), cx);
             return;
         };
-        self.services.tasks.create_dir(dir.join(name));
+        self.services.tasks.create_dir(path.join(name));
+        self.reload_when_idle(cx);
+    }
+
+    pub fn create_file(&mut self, name: &str, cx: &mut Context<Self>) {
+        let dir = self.current_uri();
+        let Some(path) = dir.as_local_path() else {
+            self.remote_write(RemoteWrite::CreateFile(dir.join(name)), cx);
+            return;
+        };
+        self.services.tasks.create_file(path.join(name));
         self.reload_when_idle(cx);
     }
 
@@ -829,6 +955,16 @@ impl Pane {
             return;
         };
         let Some(path) = entry.uri.as_local_path() else {
+            if let Some(parent) = entry.uri.parent() {
+                let to = parent.join(new_name);
+                self.remote_write(
+                    RemoteWrite::Rename {
+                        from: entry.uri,
+                        to,
+                    },
+                    cx,
+                );
+            }
             return;
         };
         let Some(parent) = path.parent().map(|parent| parent.to_path_buf()) else {
@@ -836,6 +972,47 @@ impl Pane {
         };
         self.services.tasks.rename(path, parent.join(new_name));
         self.reload_when_idle(cx);
+    }
+
+    /// Run one small write against a remote backend, then re-read the listing.
+    /// These are single requests, so they run inline on the async executor instead
+    /// of going through the transfer queue.
+    fn remote_write(&mut self, write: RemoteWrite, cx: &mut Context<Self>) {
+        let uri = match &write {
+            RemoteWrite::CreateDir(uri) | RemoteWrite::CreateFile(uri) => uri.clone(),
+            RemoteWrite::Rename { from, .. } => from.clone(),
+        };
+        let provider = match self.services.provider_for(&uri) {
+            Ok(provider) => provider,
+            Err(error) => {
+                cx.emit(PaneEvent::Notice(error.to_string()));
+                return;
+            }
+        };
+        cx.spawn(async move |this, cx| {
+            let result = match write {
+                RemoteWrite::CreateDir(uri) => provider.create_dir(&uri).await,
+                RemoteWrite::CreateFile(uri) => {
+                    provider
+                        .write_stream(
+                            &uri,
+                            futures::StreamExt::boxed(futures::stream::empty()),
+                            Some(0),
+                            None,
+                        )
+                        .await
+                }
+                RemoteWrite::Rename { from, to } => provider.rename(&from, &to).await,
+            };
+            this.update(cx, |pane, cx| {
+                if let Err(error) = result {
+                    cx.emit(PaneEvent::Notice(error.to_string()));
+                }
+                pane.reload(cx);
+            })
+            .ok();
+        })
+        .detach();
     }
 
     // ---- context-menu operations -------------------------------------------
@@ -857,6 +1034,7 @@ impl Pane {
                     .is_some_and(|index| self.listing.selected.contains(index));
                 if inside {
                     self.listing.cursor = row;
+                    self.listing.cursor_hidden = false;
                 } else {
                     self.listing.set_cursor(row, false);
                 }
@@ -887,7 +1065,10 @@ impl Pane {
             self.activate_cursor(cx);
             return;
         }
-        for entry in entries.into_iter().filter(|entry| !entry.is_dir()) {
+        for entry in entries
+            .into_iter()
+            .filter(|entry| !entry.is_dir() || is_app(entry))
+        {
             cx.emit(PaneEvent::OpenExternally(entry.uri));
         }
     }
@@ -939,7 +1120,10 @@ impl Pane {
                 .spawn(async move {
                     for (from, to) in pairs {
                         std::os::unix::fs::symlink(&from, &to).map_err(|error| {
-                            format!("Cannot create a shortcut to {}: {error}", from.display())
+                            trf(
+                                "Cannot create a shortcut to {}: {}",
+                                &[&from.display().to_string(), &error.to_string()],
+                            )
                         })?;
                     }
                     Ok::<(), String>(())
@@ -971,7 +1155,7 @@ impl Pane {
         self.run_archive_job(
             spec,
             None,
-            format!("Compress to {} failed", format.label()),
+            trf("Compress to {} failed", &[&format.label()]),
             cx,
         );
     }
@@ -988,7 +1172,9 @@ impl Pane {
             .file_name()
             .and_then(|name| ArchiveKind::detect(&name.to_string_lossy()))
         else {
-            cx.emit(PaneEvent::Notice("This is not a supported archive".into()));
+            cx.emit(PaneEvent::Notice(
+                tr("This is not a supported archive").into(),
+            ));
             return;
         };
         let dest = if here {
@@ -1000,7 +1186,7 @@ impl Pane {
             return;
         };
         let spec = extract_command(kind, &archive, &dest);
-        self.run_archive_job(spec, Some(dest), "Extract failed".to_string(), cx);
+        self.run_archive_job(spec, Some(dest), tr("Extract failed").to_string(), cx);
     }
 
     /// Run an archive tool off the UI thread; failures surface as a banner and the
@@ -1017,8 +1203,12 @@ impl Pane {
                 .background_executor()
                 .spawn(async move {
                     if let Some(dir) = create_dir {
-                        std::fs::create_dir_all(&dir)
-                            .map_err(|error| format!("Cannot create {}: {error}", dir.display()))?;
+                        std::fs::create_dir_all(&dir).map_err(|error| {
+                            trf(
+                                "Cannot create {}: {}",
+                                &[&dir.display().to_string(), &error.to_string()],
+                            )
+                        })?;
                     }
                     archive::run(&spec)
                 })
@@ -1101,11 +1291,16 @@ impl Pane {
         let body = self.render_body(focused, cx);
         let status = self.render_status(self.show_folder_name);
         let entity = cx.entity();
+        let blank_entity = entity.clone();
         let body_area = div()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
+            // Rows stop propagation of left presses, so only blank space gets here.
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                blank_entity.update(cx, |pane, cx| pane.deselect_all(cx));
+            })
             .on_mouse_down(MouseButton::Right, move |event, _, cx| {
                 let at = event.position;
                 entity.update(cx, |pane, cx| pane.context_click(None, at, cx));
@@ -1157,13 +1352,6 @@ impl Pane {
             .min_w_0()
             .h_full()
             .bg(theme::bg_pane())
-            // Always reserve the 2px so focus changes never shift the layout.
-            .border_t_2()
-            .border_color(if focused {
-                theme::accent_dim()
-            } else {
-                Hsla::transparent_black()
-            })
             .children(tabs)
             .children(filter_bar)
             .child(content)
@@ -1177,12 +1365,11 @@ impl Pane {
             .flex()
             .flex_row()
             .items_center()
-            .h(px(30.0))
+            .h(px(38.0))
             .flex_shrink_0()
-            .bg(theme::bg())
-            .border_b_1()
-            .border_color(theme::border_soft())
-            .pl_1();
+            .gap_1()
+            .px_2()
+            .bg(theme::bg_pane());
 
         for (index, tab) in self.tabs.iter().enumerate() {
             let active = index == self.active_tab;
@@ -1196,19 +1383,23 @@ impl Pane {
                 .flex_row()
                 .items_center()
                 .gap_1()
-                .h(px(23.0))
-                .px_2()
+                .h(px(26.0))
+                .pl_2p5()
+                .pr_1p5()
                 .max_w(px(180.0))
-                .rounded_md()
+                .rounded_full()
+                .border_1()
+                // 和工具栏的胶囊同一套：选中项是带细边的浅底，其余透明。
                 .when(active, |this| {
-                    this.bg(theme::bg_pane())
+                    this.bg(theme::bg_raised())
+                        .border_color(theme::border_soft())
                         .text_color(theme::text())
-                        .when(focused, |this| {
-                            this.border_b_1().border_color(theme::accent())
-                        })
                 })
-                .when(!active, |this| this.text_color(theme::text_muted()))
-                .hover(|this| this.bg(theme::bg_hover()))
+                .when(!active, |this| {
+                    this.border_color(gpui::transparent_black())
+                        .text_color(theme::text_muted())
+                        .hover(|this| this.bg(theme::bg_hover()).text_color(theme::text()))
+                })
                 .on_click(move |_, _, cx| {
                     entity.update(cx, |pane, cx| pane.select_tab(index, cx));
                 })
@@ -1218,8 +1409,8 @@ impl Pane {
                         .w(px(12.))
                         .h(px(12.))
                         .flex_shrink_0()
-                        .text_color(if active {
-                            theme::blue()
+                        .text_color(if active && focused {
+                            theme::accent()
                         } else {
                             theme::text_faint()
                         }),
@@ -1236,9 +1427,9 @@ impl Pane {
                         .flex()
                         .items_center()
                         .justify_center()
-                        .w(px(14.))
-                        .h(px(14.))
-                        .rounded_sm()
+                        .w(px(16.))
+                        .h(px(16.))
+                        .rounded_full()
                         .text_color(theme::text_faint())
                         .hover(|this| this.bg(theme::bg_raised()).text_color(theme::text()))
                         .on_click(move |_, _, cx| {
@@ -1266,9 +1457,9 @@ impl Pane {
                 .flex()
                 .items_center()
                 .justify_center()
-                .w(px(22.))
-                .h(px(20.))
-                .rounded_sm()
+                .w(px(26.))
+                .h(px(26.))
+                .rounded_full()
                 .text_color(theme::text_faint())
                 .hover(|this| this.bg(theme::bg_hover()).text_color(theme::text()))
                 .on_click(move |_, _, cx| {
@@ -1290,8 +1481,12 @@ impl Pane {
         let matched = self.listing.len();
         let total = self.listing.shown_total();
         let input = self.filter_input.clone();
-        let _ = cx;
+        let entity = cx.entity();
         div()
+            // 点到搜索条之外就收起，和 Esc 一样。
+            .on_mouse_down_out(move |_, _, cx| {
+                entity.update(cx, |pane, cx| pane.stop_filter(cx));
+            })
             .flex()
             .flex_row()
             .items_center()
@@ -1336,10 +1531,10 @@ impl Pane {
             .child(div().w(px(ICON_WIDTH + 4.0)).flex_shrink_0());
 
         for (key, label, width) in [
-            (SortKey::Name, "Name", None),
-            (SortKey::Modified, "Date Modified", Some(TIME_WIDTH)),
-            (SortKey::Size, "Size", Some(SIZE_WIDTH)),
-            (SortKey::Kind, "Kind", Some(KIND_WIDTH)),
+            (SortKey::Name, tr("Name"), None),
+            (SortKey::Modified, tr("Date Modified"), Some(TIME_WIDTH)),
+            (SortKey::Size, tr("Size"), Some(SIZE_WIDTH)),
+            (SortKey::Kind, tr("Kind"), Some(KIND_WIDTH)),
         ] {
             let active = sort.key == key;
             let arrow = if active {
@@ -1391,7 +1586,7 @@ impl Pane {
         if let Some(error) = self.error.clone() {
             return Some(render_message(
                 icons::CLOSE,
-                "Cannot open this folder",
+                tr("Cannot open this folder"),
                 &error,
                 theme::red(),
             ));
@@ -1399,7 +1594,7 @@ impl Pane {
         if self.loading && self.listing.entries.is_empty() {
             return Some(render_message(
                 icons::FOLDER,
-                "Loading…",
+                tr("Loading…"),
                 "",
                 theme::text_muted(),
             ));
@@ -1407,11 +1602,11 @@ impl Pane {
         if self.listing.is_empty() {
             let (title, detail) = if self.filter.is_active() {
                 (
-                    "No matches".to_string(),
-                    format!("Nothing here matches “{}”", self.filter.query()),
+                    tr("No matches").to_string(),
+                    trf("Nothing here matches “{}”", &[self.filter.query()]),
                 )
             } else {
-                ("This folder is empty".to_string(), String::new())
+                (tr("This folder is empty").to_string(), String::new())
             };
             return Some(render_message(
                 icons::FOLDER,
@@ -1431,7 +1626,7 @@ impl Pane {
         let count = self.listing.len();
         let entity = cx.entity();
         let selected = self.listing.selected.clone();
-        let cursor = self.listing.cursor;
+        let cursor = self.listing.visible_cursor();
         div()
             .flex_1()
             .min_h_0()
@@ -1442,7 +1637,7 @@ impl Pane {
                 uniform_list(
                     gpui::ElementId::Name(format!("pane{}-list", self.side.index()).into()),
                     count,
-                    cx.processor(move |pane, range: std::ops::Range<usize>, _window, _cx| {
+                    cx.processor(move |pane, range: std::ops::Range<usize>, _window, cx| {
                         let mut rows: Vec<AnyElement> = Vec::with_capacity(range.len());
                         for position in range {
                             let Some(entry) = pane
@@ -1450,15 +1645,17 @@ impl Pane {
                                 .visible
                                 .get(position)
                                 .and_then(|index| pane.listing.entries.get(*index))
+                                .cloned()
                             else {
                                 continue;
                             };
+                            let app_icon = pane.app_icon_for(&entry, cx);
                             let is_selected = pane
                                 .listing
                                 .visible
                                 .get(position)
                                 .is_some_and(|index| selected.contains(index));
-                            let is_cursor = position == cursor;
+                            let is_cursor = Some(position) == cursor;
                             let dimmed = !pane.cut_paths.is_empty()
                                 && entry
                                     .uri
@@ -1467,7 +1664,8 @@ impl Pane {
                             rows.push(render_row(
                                 pane.side.index(),
                                 position,
-                                entry,
+                                &entry,
+                                app_icon,
                                 is_selected || is_cursor,
                                 focused,
                                 dimmed,
@@ -1516,7 +1714,7 @@ impl Pane {
                     div()
                         .flex_shrink_0()
                         .text_color(theme::accent())
-                        .child(format!("filter: {}", self.filter.query())),
+                        .child(trf("filter: {}", &[self.filter.query()])),
                 )
             })
             .into_any_element()
@@ -1529,25 +1727,27 @@ impl gpui::Render for Pane {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn render_row(
     side: u8,
     position: usize,
     entry: &FileEntry,
+    app_icon: Option<PathBuf>,
     highlighted: bool,
     pane_focused: bool,
     dimmed: bool,
     entity: Entity<Pane>,
 ) -> AnyElement {
     let is_dir = entry.is_dir();
-    let name = entry.name.clone();
-    let size = if is_dir {
+    let name = crate::open_with::display_name(&entry.name).to_string();
+    let size = if is_dir && !is_app(entry) {
         "--".to_string()
     } else {
         format_size(entry.size)
     };
     let modified = format_relative(entry.modified);
     let kind = crate::info::kind_label(entry);
-    let icon = entry_icon(entry, 16.0);
+    let icon = bundle_icon(entry, app_icon, 16.0);
 
     // Finder semantics: blue highlight in the active pane, grey in the other.
     let on_accent = highlighted && pane_focused;
@@ -1588,6 +1788,7 @@ fn render_row(
                         this.bg(theme::bg_raised())
                     }
                 })
+                .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                 .on_click(move |event, _, cx| {
                     let shift = event.modifiers().shift;
                     let double = event.click_count() >= 2;
@@ -1656,6 +1857,23 @@ fn render_row(
                 ),
         )
         .into_any_element()
+}
+
+/// Whether `entry` is an application bundle: a directory Finder treats as a file.
+pub(crate) fn is_app(entry: &FileEntry) -> bool {
+    entry.is_dir() && crate::open_with::is_app_bundle(&entry.name)
+}
+
+/// The app's own icon when it has been rendered, the ordinary entry icon until then.
+pub(crate) fn bundle_icon(entry: &FileEntry, app_icon: Option<PathBuf>, size: f32) -> AnyElement {
+    match app_icon {
+        Some(path) => img(path)
+            .w(px(size))
+            .h(px(size))
+            .flex_shrink_0()
+            .into_any_element(),
+        None => entry_icon(entry, size),
+    }
 }
 
 /// Full-colour Material icon for an entry. Symlinks keep the Lucide link glyph so

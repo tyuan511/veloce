@@ -13,13 +13,55 @@ pub enum ViewMode {
 // ---- icon grid -------------------------------------------------------------
 
 pub const ICON_CELL_W: f32 = 104.0;
-pub const ICON_CELL_H: f32 = 120.0;
+pub const ICON_CELL_H: f32 = 112.0;
 pub const GRID_PADDING: f32 = 8.0;
 
 /// How many icon cells fit across `width` (always at least one).
 pub fn grid_columns(width: f32) -> usize {
     let usable = (width - GRID_PADDING * 2.0).max(0.0);
     ((usable / ICON_CELL_W).floor() as usize).max(1)
+}
+
+/// 估算图标名字的显示宽度（px，12px 字号）：宽字符按一个字宽，其余按半个。
+fn name_width(c: char) -> f32 {
+    if c.is_ascii() { 6.5 } else { 12.0 }
+}
+
+/// 两行放不下的名字做中间省略，保留开头和结尾（含扩展名），像访达那样。
+/// 手动换行宽度未知，所以按估算宽度裁剪，宁可少显示一点也不让第二行被切掉。
+pub fn middle_ellipsis(name: &str, budget: f32) -> String {
+    let chars: Vec<char> = name.chars().collect();
+    let total: f32 = chars.iter().map(|c| name_width(*c)).sum();
+    if total <= budget {
+        return name.to_string();
+    }
+    let ellipsis = 12.0;
+    let avail = (budget - ellipsis).max(0.0);
+    // 第一行满，第二行留给结尾。
+    let head_budget = avail * 0.5;
+    let tail_budget = avail - head_budget;
+    let mut head = String::new();
+    let mut used = 0.0;
+    for c in &chars {
+        let w = name_width(*c);
+        if used + w > head_budget {
+            break;
+        }
+        used += w;
+        head.push(*c);
+    }
+    let mut tail: Vec<char> = Vec::new();
+    let mut used = 0.0;
+    for c in chars.iter().rev() {
+        let w = name_width(*c);
+        if used + w > tail_budget {
+            break;
+        }
+        used += w;
+        tail.push(*c);
+    }
+    tail.reverse();
+    format!("{head}…{}", tail.into_iter().collect::<String>())
 }
 
 /// Rows needed to lay `len` items out in `cols` columns.
@@ -243,6 +285,25 @@ pub fn column_dirs(current: &Path, max: usize) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn short_names_are_left_alone() {
+        assert_eq!(middle_ellipsis("a.txt", 150.0), "a.txt");
+    }
+
+    #[test]
+    fn long_names_keep_both_ends_and_the_extension() {
+        let out = middle_ellipsis("AutoResearch_可行性分析与实施建议报告.md", 150.0);
+        assert!(out.starts_with("AutoRes"));
+        assert!(out.ends_with(".md"));
+        assert!(out.contains('…'));
+    }
+
+    #[test]
+    fn zero_budget_does_not_panic() {
+        assert_eq!(middle_ellipsis("abc", 0.0), "…");
+        assert_eq!(middle_ellipsis("", 0.0), "");
+    }
+
     use super::*;
 
     #[test]

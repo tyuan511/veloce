@@ -79,6 +79,11 @@ pub struct TextInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
+    /// Show bullets instead of the text (passwords, secret keys), and refuse to put
+    /// the content on the clipboard.
+    masked: bool,
+    /// How far the text is scrolled left so the cursor stays inside a narrow field.
+    scroll_x: Pixels,
 }
 
 impl EventEmitter<TextInputEvent> for TextInput {}
@@ -95,7 +100,13 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
+            masked: false,
+            scroll_x: px(0.),
         }
+    }
+
+    pub fn set_masked(&mut self, masked: bool) {
+        self.masked = masked;
     }
 
     pub fn set_content(&mut self, content: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -203,7 +214,7 @@ impl TextInput {
         if position.y > bounds.bottom() {
             return self.content.len();
         }
-        line.closest_index_for_x(position.x - bounds.left())
+        line.closest_index_for_x(position.x - bounds.left() + self.scroll_x)
     }
 
     // ---- actions ----------------------------------------------------------
@@ -273,7 +284,7 @@ impl TextInput {
     }
 
     fn copy(&mut self, _: &Copy, _: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        if !self.selected_range.is_empty() && !self.masked {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
@@ -281,7 +292,7 @@ impl TextInput {
     }
 
     fn cut(&mut self, _: &Cut, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.selected_range.is_empty() {
+        if !self.selected_range.is_empty() && !self.masked {
             cx.write_to_clipboard(ClipboardItem::new_string(
                 self.content[self.selected_range.clone()].to_string(),
             ));
@@ -297,7 +308,18 @@ impl TextInput {
         cx.emit(TextInputEvent::Cancel);
     }
 
-    fn on_mouse_down(&mut self, event: &MouseDownEvent, _: &mut Window, cx: &mut Context<Self>) {
+    fn on_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Clicking a field has to give it the keyboard. The main window focuses its
+        // inputs by hand, but a form in another window (Settings) has no one to do that.
+        window.focus(&self.focus_handle);
+        // Stop here: a container that blurs on a click in empty space (the Settings
+        // body does) would otherwise run after this and take the focus straight back.
+        cx.stop_propagation();
         self.is_selecting = true;
         if event.modifiers.shift {
             self.select_to(self.index_for_mouse_position(event.position), cx);
@@ -425,11 +447,11 @@ impl EntityInputHandler for TextInput {
         let range = self.range_from_utf16(&range_utf16);
         Some(Bounds::from_corners(
             point(
-                bounds.left() + last_layout.x_for_index(range.start),
+                bounds.left() + last_layout.x_for_index(range.start) - self.scroll_x,
                 bounds.top(),
             ),
             point(
-                bounds.left() + last_layout.x_for_index(range.end),
+                bounds.left() + last_layout.x_for_index(range.end) - self.scroll_x,
                 bounds.bottom(),
             ),
         ))
@@ -443,7 +465,7 @@ impl EntityInputHandler for TextInput {
     ) -> Option<usize> {
         let line_point = self.last_bounds?.localize(&point)?;
         let last_layout = self.last_layout.as_ref()?;
-        let utf8_index = last_layout.index_for_x(point.x - line_point.x)?;
+        let utf8_index = last_layout.index_for_x(point.x - line_point.x + self.scroll_x)?;
         Some(self.offset_to_utf16(utf8_index))
     }
 }
@@ -504,10 +526,13 @@ impl Element for FieldElement {
         let content = input.content.clone();
         let selected_range = input.selected_range.clone();
         let cursor = input.cursor_offset();
+        let input_scroll = input.scroll_x;
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
             (input.placeholder.clone(), crate::theme::text_faint())
+        } else if input.masked {
+            (mask_text(&content).into(), style.color)
         } else {
             (content, style.color)
         };
@@ -552,13 +577,21 @@ impl Element for FieldElement {
             .text_system()
             .shape_line(display_text, font_size, &runs, None);
 
+        let scroll = px(scroll_for(
+            f32::from(line.x_for_index(cursor)),
+            f32::from(line.width),
+            f32::from(bounds.size.width),
+            f32::from(input_scroll),
+        ));
+        self.input.update(cx, |input, _| input.scroll_x = scroll);
+        let origin_x = bounds.left() - scroll;
         let cursor_pos = line.x_for_index(cursor);
         let (selection, cursor) = if selected_range.is_empty() {
             (
                 None,
                 Some(fill(
                     Bounds::new(
-                        point(bounds.left() + cursor_pos, bounds.top() + px(2.)),
+                        point(origin_x + cursor_pos, bounds.top() + px(2.)),
                         size(px(1.5), bounds.bottom() - bounds.top() - px(4.)),
                     ),
                     crate::theme::accent(),
@@ -569,11 +602,11 @@ impl Element for FieldElement {
                 Some(fill(
                     Bounds::from_corners(
                         point(
-                            bounds.left() + line.x_for_index(selected_range.start),
+                            origin_x + line.x_for_index(selected_range.start),
                             bounds.top(),
                         ),
                         point(
-                            bounds.left() + line.x_for_index(selected_range.end),
+                            origin_x + line.x_for_index(selected_range.end),
                             bounds.bottom(),
                         ),
                     ),
@@ -610,14 +643,23 @@ impl Element for FieldElement {
         }
         let line = prepaint.line.take().unwrap();
         let line_height = window.line_height();
-        line.paint(bounds.origin, line_height, window, cx)
+        let scroll = self.input.read(cx).scroll_x;
+        // Clip to the field: text past the edge must not spill into the form.
+        window.with_content_mask(Some(gpui::ContentMask { bounds }), |window| {
+            line.paint(
+                point(bounds.origin.x - scroll, bounds.origin.y),
+                line_height,
+                window,
+                cx,
+            )
             .expect("paint line");
 
-        if focus_handle.is_focused(window)
-            && let Some(cursor) = prepaint.cursor.take()
-        {
-            window.paint_quad(cursor);
-        }
+            if focus_handle.is_focused(window)
+                && let Some(cursor) = prepaint.cursor.take()
+            {
+                window.paint_quad(cursor);
+            }
+        });
 
         self.input.update(cx, |input, _| {
             input.last_layout = Some(line);
@@ -656,5 +698,76 @@ impl Render for TextInput {
             .line_height(px(18.))
             .text_size(px(12.5))
             .child(FieldElement { input: cx.entity() })
+    }
+}
+
+/// Horizontal scroll that keeps the cursor visible in a field `view` wide showing a
+/// line `line` wide, moving as little as possible from `current`. Text that fits
+/// never scrolls.
+fn scroll_for(cursor_x: f32, line: f32, view: f32, current: f32) -> f32 {
+    // A little room after the cursor so it is not flush against the edge.
+    const MARGIN: f32 = 2.0;
+    let max = (line + MARGIN - view).max(0.0);
+    let mut scroll = current;
+    if cursor_x < scroll {
+        scroll = cursor_x;
+    } else if cursor_x + MARGIN > scroll + view {
+        scroll = cursor_x + MARGIN - view;
+    }
+    scroll.clamp(0.0, max)
+}
+
+/// One `*` per byte, so every byte offset into the real text is also a valid offset
+/// into the masked line and the cursor and selection need no translation.
+fn mask_text(text: &str) -> String {
+    "*".repeat(text.len())
+}
+
+#[cfg(test)]
+mod mask_tests {
+    use super::{mask_text, scroll_for};
+
+    #[test]
+    fn text_that_fits_never_scrolls() {
+        assert_eq!(scroll_for(10.0, 50.0, 100.0, 0.0), 0.0);
+        assert_eq!(
+            scroll_for(10.0, 50.0, 100.0, 30.0),
+            0.0,
+            "stale scroll resets"
+        );
+    }
+
+    #[test]
+    fn typing_past_the_right_edge_scrolls_just_enough() {
+        // 300px of text in a 100px field, cursor at the end.
+        let scroll = scroll_for(300.0, 300.0, 100.0, 0.0);
+        assert_eq!(scroll, 202.0);
+        assert!(300.0 - scroll <= 100.0, "cursor stays inside");
+    }
+
+    #[test]
+    fn moving_the_cursor_back_left_scrolls_back() {
+        assert_eq!(scroll_for(40.0, 300.0, 100.0, 202.0), 40.0);
+    }
+
+    #[test]
+    fn a_cursor_already_in_view_does_not_move_the_text() {
+        assert_eq!(scroll_for(150.0, 300.0, 100.0, 100.0), 100.0);
+    }
+
+    #[test]
+    fn masking_keeps_byte_offsets_aligned_for_multibyte_text() {
+        let secret = "pä€";
+        let masked = mask_text(secret);
+        assert_eq!(masked.len(), secret.len());
+        assert!(masked.chars().all(|c| c == '*'));
+        for (offset, _) in secret.char_indices() {
+            assert!(masked.is_char_boundary(offset));
+        }
+    }
+
+    #[test]
+    fn masking_nothing_gives_nothing() {
+        assert_eq!(mask_text(""), "");
     }
 }

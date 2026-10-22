@@ -4,6 +4,7 @@
 //! Only data and string handling live here, so every rule is unit-tested. Turning
 //! the result into live GPUI bindings is `actions::install_keymap`.
 
+use crate::i18n::{tr, trf};
 use std::collections::BTreeMap;
 
 use gpui::Keystroke;
@@ -277,11 +278,12 @@ pub enum Refusal {
 impl Refusal {
     pub fn message(&self, shown: &str) -> String {
         match self {
-            Refusal::Invalid => "That is not a usable shortcut".to_string(),
-            Refusal::Reserved(what) => format!("{shown} is reserved for “{what}”"),
-            Refusal::Taken(label) => {
-                format!("{shown} is already used by “{label}”. Remove it there first.")
-            }
+            Refusal::Invalid => tr("That is not a usable shortcut").to_string(),
+            Refusal::Reserved(what) => trf("{} is reserved for “{}”", &[shown, tr(what)]),
+            Refusal::Taken(label) => trf(
+                "{} is already used by “{}”. Remove it there first.",
+                &[shown, tr(label)],
+            ),
         }
     }
 }

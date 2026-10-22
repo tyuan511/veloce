@@ -98,19 +98,26 @@ fn code_line(line: &Line) -> AnyElement {
         .into_any_element()
 }
 
-pub(super) fn code_state(lines: &[Line], truncated: bool) -> AnyElement {
+pub(super) fn code_state(
+    lines: &[Line],
+    truncated: bool,
+    handle: &gpui::ScrollHandle,
+) -> AnyElement {
     let gutter = px(38.0);
     div()
         .id("preview-code")
+        .track_scroll(handle)
+        .flex()
         .flex_1()
         .min_h_0()
-        .overflow_y_scroll()
+        .overflow_scroll()
         .px_2()
         .py_2()
         .child(
             div()
                 .flex()
                 .flex_col()
+                .flex_shrink_0()
                 .font_family(theme::MONO_FAMILY)
                 .text_size(px(11.5))
                 .line_height(px(16.0))
@@ -129,7 +136,8 @@ pub(super) fn code_state(lines: &[Line], truncated: bool) -> AnyElement {
                                 .text_color(theme::text_faint())
                                 .child((index + 1).to_string()),
                         )
-                        .child(div().flex_1().min_w_0().child(code_line(line)))
+                        // 不能 min_w_0：长行要撑开内容宽度，外层才有东西可横向滚动
+                        .child(div().flex_shrink_0().child(code_line(line)))
                 }))
                 .when(truncated, |this| {
                     this.child(

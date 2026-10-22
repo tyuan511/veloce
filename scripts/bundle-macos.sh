@@ -22,7 +22,7 @@ fi
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
-cp "$BIN" "$APP/Contents/MacOS/veloce"
+cp "$BIN" "$APP/Contents/MacOS/Veloce"
 cp "$ROOT/packaging/macos/Info.plist" "$APP/Contents/Info.plist"
 
 # Ad-hoc signature: enough for local runs and Gatekeeper-free launches on this

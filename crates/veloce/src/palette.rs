@@ -5,6 +5,7 @@
 //! (`ignore` + `nucleo`); results stream back in batches so the list fills while
 //! the walk is still going. A new keystroke cancels the previous walk.
 
+use crate::i18n::tr;
 use std::{
     path::PathBuf,
     sync::{
@@ -148,7 +149,7 @@ impl gpui::Focusable for Palette {
 
 impl Palette {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| TextInput::new("Search files, or type a path (~/code)…", cx));
+        let input = cx.new(|cx| TextInput::new(tr("Search files, or type a path (~/code)…"), cx));
         let subscription = cx.subscribe(
             &input,
             |palette, _, event: &TextInputEvent, cx| match event {
@@ -218,7 +219,9 @@ impl Palette {
                 self.commands = COMMANDS
                     .iter()
                     .filter(|command| {
-                        needle.is_empty() || command.label.to_lowercase().contains(&needle)
+                        needle.is_empty()
+                            || command.label.to_lowercase().contains(&needle)
+                            || tr(command.label).to_lowercase().contains(&needle)
                     })
                     .collect();
                 cx.notify();
@@ -268,7 +271,7 @@ impl Palette {
                     Ok(hits) => palette.hits = hits,
                     Err(_) => {
                         palette.hits.clear();
-                        palette.path_error = Some("No such folder".to_string());
+                        palette.path_error = Some(tr("No such folder").to_string());
                     }
                 }
                 palette.cursor = 0;
@@ -440,9 +443,9 @@ impl Render for Palette {
 fn render_palette(palette: &mut Palette, cx: &mut Context<Palette>) -> AnyElement {
     let entity = cx.entity();
     let title = match palette.mode {
-        PaletteMode::Files if palette.path_mode => "Go to folder",
-        PaletteMode::Files => "Jump to file",
-        PaletteMode::Commands => "Run command",
+        PaletteMode::Files if palette.path_mode => tr("Go to folder"),
+        PaletteMode::Files => tr("Jump to file"),
+        PaletteMode::Commands => tr("Run command"),
     };
     let rows: AnyElement = match palette.mode {
         PaletteMode::Files => {
@@ -452,15 +455,15 @@ fn render_palette(palette: &mut Palette, cx: &mut Context<Palette>) -> AnyElemen
                     .text_xs()
                     .text_color(theme::text_faint())
                     .child(if palette.searching {
-                        "Searching…".to_string()
+                        tr("Searching…").to_string()
                     } else if let Some(error) = &palette.path_error {
                         error.clone()
                     } else if palette.path_mode {
-                        "Nothing here matches".to_string()
+                        tr("Nothing here matches").to_string()
                     } else if palette.query.is_empty() {
-                        "Type to search this folder, or a path like ~/Downloads".to_string()
+                        tr("Type to search this folder, or a path like ~/Downloads").to_string()
                     } else {
-                        "No matches".to_string()
+                        tr("No matches").to_string()
                     })
                     .into_any_element()
             } else {
@@ -553,7 +556,7 @@ fn render_palette(palette: &mut Palette, cx: &mut Context<Palette>) -> AnyElemen
                             palette.activate(cx);
                         });
                     })
-                    .child(div().text_xs().child(command.label))
+                    .child(div().text_xs().child(tr(command.label)))
                     .child(
                         div()
                             .text_xs()

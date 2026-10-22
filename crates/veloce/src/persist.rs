@@ -13,9 +13,10 @@ use std::{
 
 use gpui::App;
 use veloce_store::{FolderPrefs, Store, TabState};
-use vfs_core::SortSpec;
+use vfs_core::{SortSpec, VfsUri};
 
 use crate::{
+    listing::{FAVORITES_KEY, Favorite, favorites_from_json, favorites_to_json},
     prefs::{
         LayoutPrefs, default_folder_view, folder_prefs_for, tabs_from_state, tabs_to_state,
         view_and_sort,
@@ -24,9 +25,6 @@ use crate::{
     view::ViewMode,
 };
 
-/// Folders shown under "Recent" in the sidebar.
-pub const RECENT_SHOWN: usize = 6;
-
 /// Everything restored at start-up.
 #[derive(Debug, Default)]
 pub struct Startup {
@@ -34,7 +32,8 @@ pub struct Startup {
     pub settings: AppSettings,
     /// Saved tabs and the active index, per pane (left, right).
     pub tabs: [(Vec<String>, usize); 2],
-    pub recents: Vec<String>,
+    /// Files and folders starred in the sidebar.
+    pub favorites: Vec<Favorite>,
 }
 
 #[derive(Clone)]
@@ -60,16 +59,32 @@ pub fn load_startup(
         .unwrap_or_default()
         .into_iter()
         .collect();
-    let recents = store.recent_paths(64).unwrap_or_default();
+    let favorites = store
+        .get_setting(FAVORITES_KEY)
+        .ok()
+        .flatten()
+        .map(|text| favorites_from_json(&text))
+        .unwrap_or_default();
     (
         Startup {
             layout,
             settings,
             tabs: [tabs_for(0), tabs_for(1)],
-            recents,
+            favorites,
         },
         folders,
     )
+}
+
+/// Key a folder's remembered view is stored under. Local folders keep the bare
+/// path so records written before remote folders were remembered still match;
+/// remote ones use the full uri, since the same path means different folders on
+/// different connections. The two can't collide: a local path starts with `/`.
+pub fn folder_key(uri: &VfsUri) -> String {
+    match uri.as_local_path() {
+        Some(path) => path.to_string_lossy().into_owned(),
+        None => uri.to_string(),
+    }
 }
 
 impl gpui::Global for Persist {}
@@ -187,9 +202,9 @@ impl Persist {
         self.write(cx, move |store| store.save_tabs(pane, &tabs));
     }
 
-    pub fn record_visit(&self, cx: &App, path: &str) {
-        let path = path.to_string();
-        self.write(cx, move |store| store.record_visit(&path));
+    pub fn save_favorites(&self, cx: &App, favorites: &[Favorite]) {
+        let json = favorites_to_json(favorites);
+        self.write(cx, move |store| store.set_setting(FAVORITES_KEY, &json));
     }
 
     /// Queue a write on the background executor; failures only reach stderr
@@ -215,6 +230,7 @@ impl Persist {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vfs_core::ProtocolScheme;
 
     fn store_with_data() -> Store {
         let store = Store::in_memory().unwrap();
@@ -250,7 +266,7 @@ mod tests {
     }
 
     #[test]
-    fn startup_collects_layout_tabs_folders_and_recents() {
+    fn startup_collects_layout_tabs_and_folders() {
         let store = store_with_data();
         let (startup, folders) = load_startup(&store, |path| path != "/gone");
         assert_eq!(startup.layout.sidebar_width, 222.0);
@@ -259,7 +275,6 @@ mod tests {
             (vec!["/a".to_string(), "/b".to_string()], 1)
         );
         assert!(startup.tabs[1].0.is_empty(), "right pane saved nothing");
-        assert_eq!(startup.recents, ["/b", "/a"]);
         assert!(folders.contains_key("/photos"));
     }
 
@@ -269,7 +284,7 @@ mod tests {
         let (startup, folders) = load_startup(&store, |_| true);
         assert_eq!(startup.layout, LayoutPrefs::default());
         assert!(startup.tabs[0].0.is_empty());
-        assert!(startup.recents.is_empty());
+        assert!(startup.favorites.is_empty());
         assert!(folders.is_empty());
     }
 
@@ -284,6 +299,45 @@ mod tests {
         };
         assert_eq!(persist.folder_view("/photos").0, ViewMode::Icons);
         assert_eq!(persist.folder_view("/elsewhere"), default_folder_view());
+    }
+
+    #[test]
+    fn local_folders_keep_their_bare_path_as_key() {
+        assert_eq!(folder_key(&VfsUri::local("/photos")), "/photos");
+        assert_eq!(folder_key(&VfsUri::local_root()), "/");
+    }
+
+    #[test]
+    fn remote_folders_are_keyed_by_connection_and_path() {
+        let a = VfsUri::remote(ProtocolScheme::Sftp, "prod", "/var/log");
+        let b = VfsUri::remote(ProtocolScheme::Sftp, "staging", "/var/log");
+        assert_eq!(folder_key(&a), "sftp://prod/var/log");
+        assert_ne!(folder_key(&a), folder_key(&b));
+        assert_ne!(folder_key(&a), folder_key(&VfsUri::local("/var/log")));
+    }
+
+    #[test]
+    fn a_remembered_remote_folder_is_found_again() {
+        let store = Store::in_memory().unwrap();
+        let uri = VfsUri::remote(ProtocolScheme::Sftp, "prod", "/pics");
+        store
+            .set_folder_prefs(
+                &folder_key(&uri),
+                &folder_prefs_for(ViewMode::Icons, SortSpec::default()),
+            )
+            .unwrap();
+        let (_, folders) = load_startup(&store, |_| true);
+        let persist = Persist {
+            store: None,
+            defaults: Arc::new(RwLock::new(default_folder_view())),
+            folders: Arc::new(RwLock::new(folders)),
+        };
+        assert_eq!(persist.folder_view(&folder_key(&uri)).0, ViewMode::Icons);
+        let other = VfsUri::remote(ProtocolScheme::Sftp, "staging", "/pics");
+        assert_eq!(
+            persist.folder_view(&folder_key(&other)),
+            default_folder_view()
+        );
     }
 
     #[test]

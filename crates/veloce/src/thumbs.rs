@@ -13,6 +13,7 @@ use std::{
 };
 
 use veloce_store::Store;
+use vfs_core::{FileEntry, VfsProvider, VfsUri};
 
 /// Edge length, in pixels, of icon-view thumbnails.
 pub const THUMB_PIXELS: u32 = 256;
@@ -69,6 +70,18 @@ impl Stamp {
         let metadata = std::fs::metadata(path).ok()?;
         Some(Self::new(metadata.len(), metadata.modified().ok()))
     }
+}
+
+/// Cache key for a picture rendered from a remote file (`kind` says which size).
+/// Follows the file version like [`cache_key`], so a
+/// changed remote file is fetched again.
+pub fn remote_key(uri: &vfs_core::VfsUri, stamp: Stamp, kind: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    uri.hash(&mut hasher);
+    stamp.size.hash(&mut hasher);
+    stamp.modified_secs.hash(&mut hasher);
+    format!("remote:{:016x}@{kind}", hasher.finish())
 }
 
 /// Cache key for one rendering of one file version: changes when the file does,
@@ -179,26 +192,86 @@ fn quicklook_render(path: &Path, work: &Path, pixels: u32) -> Option<Vec<u8>> {
     std::fs::read(out).ok().filter(|bytes| !bytes.is_empty())
 }
 
-/// Thumbnail PNG bytes for a file: from the store if cached, else generated and
-/// cached. `None` means "show the ordinary icon".
-pub fn thumbnail_bytes(
+/// Largest remote file downloaded to be rendered. Only the small PNG is kept, but the
+/// whole file has to cross the network once to make it.
+pub const REMOTE_RENDER_BYTES: u64 = 32 * 1024 * 1024;
+
+/// The cache key for `entry` at `pixels`. Local files keep their original keys, so
+/// thumbnails made before remote support are still found.
+pub fn thumb_key(uri: &VfsUri, stamp: Stamp, pixels: u32) -> String {
+    match uri.as_local_path() {
+        Some(path) => cache_key(&path, stamp, pixels),
+        None => remote_key(uri, stamp, &format!("px{pixels}")),
+    }
+}
+
+/// Thumbnail PNG bytes for any entry, local or remote: from the store if cached,
+/// else rendered and cached. `None` means "show the ordinary icon".
+///
+/// The one path for both: a remote file is first fetched through its provider into
+/// a scratch file, then rendered by the same tools as a local one. Failure is
+/// remembered only where retrying is expensive, i.e. for a download.
+pub async fn thumbnail_bytes(
     store: Option<&Store>,
-    path: &Path,
-    ext: &str,
-    stamp: Stamp,
+    provider: &dyn VfsProvider,
+    entry: &FileEntry,
     pixels: u32,
 ) -> Option<Vec<u8>> {
-    let key = cache_key(path, stamp, pixels);
+    use futures::StreamExt as _;
+    let ext = entry.extension()?;
+    let local = entry.uri.as_local_path();
+    if local.is_none() && entry.size > REMOTE_RENDER_BYTES {
+        return None;
+    }
+    let key = thumb_key(&entry.uri, Stamp::new(entry.size, entry.modified), pixels);
     if let Some(store) = store
         && let Ok(Some(png)) = store.get_thumbnail(&key)
     {
-        return Some(png);
+        // An empty entry is a remembered "this cannot be rendered".
+        return (!png.is_empty()).then_some(png);
     }
-    let png = generate(path, ext, &key, pixels)?;
+    let png = match local {
+        Some(path) => generate(&path, &ext, &key, pixels),
+        None => {
+            let work = std::env::temp_dir()
+                .join("veloce-remote-thumb")
+                .join(key.replace([':', '@'], "-"));
+            let file = work.join(&entry.name);
+            let fetched: Result<(), ()> = async {
+                let mut stream = provider
+                    .read_stream(&entry.uri, 0, Some(entry.size))
+                    .await
+                    .map_err(|_| ())?;
+                std::fs::create_dir_all(&work).map_err(|_| ())?;
+                let mut out = std::fs::File::create(&file).map_err(|_| ())?;
+                while let Some(chunk) = stream.next().await {
+                    std::io::Write::write_all(&mut out, &chunk.map_err(|_| ())?).map_err(|_| ())?;
+                }
+                Ok(())
+            }
+            .await;
+            if fetched.is_err() {
+                // The network failed, not the file: do not remember it.
+                let _ = std::fs::remove_dir_all(&work);
+                return None;
+            }
+            let png = generate(&file, &ext, &key, pixels);
+            let _ = std::fs::remove_dir_all(&work);
+            png
+        }
+    };
     if let Some(store) = store {
-        let _ = store.put_thumbnail(&key, &png);
+        match &png {
+            Some(png) => {
+                let _ = store.put_thumbnail(&key, png);
+            }
+            None if !entry.uri.scheme.is_local() => {
+                let _ = store.put_thumbnail(&key, &[]);
+            }
+            None => {}
+        }
     }
-    Some(png)
+    png
 }
 
 #[cfg(test)]
@@ -211,6 +284,42 @@ mod tests {
         0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 218, 99, 252, 207, 192, 80,
         15, 0, 4, 133, 1, 128, 132, 169, 140, 33, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66, 96, 130,
     ];
+
+    #[test]
+    fn remote_keys_follow_the_connection_path_and_version() {
+        use vfs_core::{ProtocolScheme, VfsUri};
+        let uri = |id: &str, path: &str| VfsUri::remote(ProtocolScheme::S3, id, path);
+        let stamp = Stamp {
+            size: 10,
+            modified_secs: 5,
+        };
+        let base = remote_key(&uri("1", "/a.png"), stamp, "head");
+        assert_eq!(base, remote_key(&uri("1", "/a.png"), stamp, "head"));
+        assert_ne!(
+            base,
+            remote_key(&uri("2", "/a.png"), stamp, "head"),
+            "connection"
+        );
+        assert_ne!(base, remote_key(&uri("1", "/b.png"), stamp, "head"), "path");
+        assert_ne!(
+            base,
+            remote_key(&uri("1", "/a.png"), stamp, "image"),
+            "kind"
+        );
+        let newer = Stamp {
+            modified_secs: 6,
+            ..stamp
+        };
+        assert_ne!(
+            base,
+            remote_key(&uri("1", "/a.png"), newer, "head"),
+            "version"
+        );
+        assert!(
+            base.starts_with("remote:"),
+            "cannot collide with local keys"
+        );
+    }
 
     #[test]
     fn pictures_and_documents_are_thumbnailable_and_plain_files_are_not() {
@@ -261,6 +370,81 @@ mod tests {
         assert!(small.ends_with("@256") && large.ends_with("@1024"));
     }
 
+    fn entry_for(path: &Path, stamp: Stamp) -> FileEntry {
+        let mut entry = FileEntry::new(
+            VfsUri::local(path),
+            path.file_name().unwrap().to_string_lossy(),
+            vfs_core::FileKind::File,
+        );
+        entry.size = stamp.size;
+        entry.modified = Some(UNIX_EPOCH + Duration::from_secs(stamp.modified_secs));
+        entry
+    }
+
+    fn thumbs_now(store: &Store, entry: &FileEntry, pixels: u32) -> Option<Vec<u8>> {
+        futures::executor::block_on(thumbnail_bytes(
+            Some(store),
+            &vfs_core::LocalProvider::new(),
+            entry,
+            pixels,
+        ))
+    }
+
+    #[test]
+    fn remote_files_over_the_cap_are_never_downloaded() {
+        let store = Store::in_memory().unwrap();
+        let mut entry = FileEntry::new(
+            VfsUri::remote(vfs_core::ProtocolScheme::S3, "1", "/huge.png"),
+            "huge.png",
+            vfs_core::FileKind::File,
+        );
+        entry.size = REMOTE_RENDER_BYTES + 1;
+        // The local provider would fail on this uri; reaching it would show up as an
+        // error entry in the store. Nothing is read and nothing is remembered.
+        assert!(thumbs_now(&store, &entry, THUMB_PIXELS).is_none());
+        assert_eq!(store.thumbnail_bytes().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_remembered_remote_failure_answers_without_fetching() {
+        let store = Store::in_memory().unwrap();
+        let mut entry = FileEntry::new(
+            VfsUri::remote(vfs_core::ProtocolScheme::S3, "1", "/odd.png"),
+            "odd.png",
+            vfs_core::FileKind::File,
+        );
+        entry.size = 10;
+        let key = thumb_key(
+            &entry.uri,
+            Stamp::new(entry.size, entry.modified),
+            THUMB_PIXELS,
+        );
+        store.put_thumbnail(&key, &[]).unwrap();
+        assert!(thumbs_now(&store, &entry, THUMB_PIXELS).is_none());
+    }
+
+    #[test]
+    fn local_and_remote_keys_never_collide_and_local_keys_are_unchanged() {
+        let stamp = Stamp {
+            size: 1,
+            modified_secs: 1,
+        };
+        let local = VfsUri::local("/a/b.png");
+        let remote = VfsUri::remote(vfs_core::ProtocolScheme::S3, "1", "/a/b.png");
+        assert_eq!(
+            thumb_key(&local, stamp, THUMB_PIXELS),
+            cache_key(Path::new("/a/b.png"), stamp, THUMB_PIXELS)
+        );
+        assert_ne!(
+            thumb_key(&local, stamp, THUMB_PIXELS),
+            thumb_key(&remote, stamp, THUMB_PIXELS)
+        );
+        assert_ne!(
+            thumb_key(&remote, stamp, THUMB_PIXELS),
+            thumb_key(&remote, stamp, PREVIEW_PIXELS)
+        );
+    }
+
     #[test]
     fn both_sizes_are_cached_side_by_side() {
         let store = Store::in_memory().unwrap();
@@ -276,9 +460,10 @@ mod tests {
             .put_thumbnail(&cache_key(path, stamp, PREVIEW_PIXELS), &[2; 30])
             .unwrap();
         // The preview render is a cache hit even though the file is not on disk.
-        let hit = thumbnail_bytes(Some(&store), path, "pdf", stamp, PREVIEW_PIXELS);
+        let entry = entry_for(path, stamp);
+        let hit = thumbs_now(&store, &entry, PREVIEW_PIXELS);
         assert_eq!(hit, Some(vec![2; 30]));
-        let small = thumbnail_bytes(Some(&store), path, "pdf", stamp, THUMB_PIXELS);
+        let small = thumbs_now(&store, &entry, THUMB_PIXELS);
         assert_eq!(small, Some(vec![1; 10]));
         assert_eq!(store.thumbnail_bytes().unwrap(), 40);
     }
@@ -357,15 +542,14 @@ mod tests {
         let stamp = Stamp::of(&file).unwrap();
         let store = Store::in_memory().unwrap();
 
-        let first = thumbnail_bytes(Some(&store), &file, "png", stamp, THUMB_PIXELS)
-            .expect("sips renders it");
+        let entry = entry_for(&file, stamp);
+        let first = thumbs_now(&store, &entry, THUMB_PIXELS).expect("sips renders it");
         assert_eq!(&first[..8], b"\x89PNG\r\n\x1a\n");
         assert!(store.thumbnail_bytes().unwrap() > 0, "cached");
 
         // With the file gone the cache still answers.
         std::fs::remove_file(&file).unwrap();
-        let again = thumbnail_bytes(Some(&store), &file, "png", stamp, THUMB_PIXELS)
-            .expect("from the store");
+        let again = thumbs_now(&store, &entry, THUMB_PIXELS).expect("from the store");
         assert_eq!(again, first);
     }
 
@@ -377,7 +561,8 @@ mod tests {
         std::fs::write(&file, b"not an image").unwrap();
         let stamp = Stamp::of(&file).unwrap();
         let store = Store::in_memory().unwrap();
-        assert!(thumbnail_bytes(Some(&store), &file, "png", stamp, THUMB_PIXELS).is_none());
+        let entry = entry_for(&file, stamp);
+        assert!(thumbs_now(&store, &entry, THUMB_PIXELS).is_none());
         assert_eq!(store.thumbnail_bytes().unwrap(), 0);
     }
 }

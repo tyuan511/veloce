@@ -1,19 +1,23 @@
 //! Content of the Get Info window: pure formatting of a `FileEntry`.
 
+use crate::i18n::{tr, trf};
 use vfs_core::{
     FileEntry, FileKind,
     entry::{format_size, format_time},
 };
 
-/// Explorer-style type: "File folder", "RS File", "Shortcut".
+/// Explorer-style type: tr("File folder"), "RS File", tr("Shortcut").
 pub fn kind_label(entry: &FileEntry) -> String {
     match entry.kind {
-        FileKind::Directory => "File folder".to_string(),
-        FileKind::Symlink => "Shortcut".to_string(),
-        FileKind::Special => "Special file".to_string(),
+        FileKind::Directory if crate::open_with::is_app_bundle(&entry.name) => {
+            tr("Application").to_string()
+        }
+        FileKind::Directory => tr("File folder").to_string(),
+        FileKind::Symlink => tr("Shortcut").to_string(),
+        FileKind::Special => tr("Special file").to_string(),
         FileKind::File => match entry.extension() {
-            Some(ext) => format!("{} File", ext.to_uppercase()),
-            None => "File".to_string(),
+            Some(ext) => trf("{} File", &[&ext.to_uppercase()]),
+            None => tr("File").to_string(),
         },
     }
 }
@@ -25,12 +29,12 @@ pub fn permissions_label(mode: Option<u32>) -> Option<String> {
 
 /// Label/value rows in display order. `folder_bytes` is the recursively measured
 /// size of a folder, which arrives later than the rest, so `None` shows
-/// "Calculating…" for folders.
+/// tr("Calculating…") for folders.
 pub fn info_rows(entry: &FileEntry, folder_bytes: Option<u64>) -> Vec<(&'static str, String)> {
     let size = if entry.is_dir() {
         match folder_bytes {
             Some(bytes) => format_size(bytes),
-            None => "Calculating…".to_string(),
+            None => tr("Calculating…").to_string(),
         }
     } else {
         let exact = entry.size;
@@ -43,14 +47,14 @@ pub fn info_rows(entry: &FileEntry, folder_bytes: Option<u64>) -> Vec<(&'static 
         .unwrap_or_else(|| entry.uri.to_string());
 
     let mut rows = vec![
-        ("Type", kind_label(entry)),
-        ("Size", size),
-        ("Location", location),
-        ("Created", format_time(entry.created)),
-        ("Modified", format_time(entry.modified)),
+        (tr("Type"), kind_label(entry)),
+        (tr("Size"), size),
+        (tr("Location"), location),
+        (tr("Created"), format_time(entry.created)),
+        (tr("Modified"), format_time(entry.modified)),
     ];
     if let Some(mode) = permissions_label(entry.permissions) {
-        rows.push(("Permissions", mode));
+        rows.push((tr("Permissions"), mode));
     }
     rows
 }

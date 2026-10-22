@@ -19,7 +19,12 @@ use std::{
     time::Instant,
 };
 
-use crate::error::{Error, Result};
+use crate::{
+    error::{Error, Result},
+    provider::ProviderRegistry,
+    transfer::{self, TransferSink},
+    uri::VfsUri,
+};
 
 /// Buffer used for copy loops (1 MiB: big enough to keep syscalls rare, small
 /// enough to keep memory flat when many tasks run at once).
@@ -33,6 +38,7 @@ pub enum TaskKind {
     Delete,
     Trash,
     CreateDir,
+    CreateFile,
     Rename,
 }
 
@@ -44,6 +50,7 @@ impl TaskKind {
             TaskKind::Delete => "Delete",
             TaskKind::Trash => "Trash",
             TaskKind::CreateDir => "New folder",
+            TaskKind::CreateFile => "New file",
             TaskKind::Rename => "Rename",
         }
     }
@@ -217,7 +224,26 @@ impl TaskRecord {
     }
 }
 
-type Job = Arc<dyn Fn(&TaskRecord) -> Result<()> + Send + Sync>;
+type Job = Arc<dyn Fn(&Arc<TaskRecord>) -> Result<()> + Send + Sync>;
+
+/// Lets the transfer code publish progress straight into the task's counters.
+struct RecordSink(Arc<TaskRecord>);
+
+impl TransferSink for RecordSink {
+    fn cancelled(&self) -> bool {
+        self.0.cancel.load(Ordering::Relaxed)
+    }
+    fn add_total(&self, bytes: u64, files: u64) {
+        self.0.total_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.0.files_total.fetch_add(files, Ordering::Relaxed);
+    }
+    fn add_done(&self, bytes: u64) {
+        self.0.done_bytes.fetch_add(bytes, Ordering::Relaxed);
+    }
+    fn file_done(&self) {
+        self.0.files_done.fetch_add(1, Ordering::Relaxed);
+    }
+}
 
 struct Shared {
     tasks: Mutex<Vec<Arc<TaskRecord>>>,
@@ -314,6 +340,48 @@ impl TaskManager {
         TaskRecord::new(id, kind, source, target)
     }
 
+    /// Copy or move between any two backends (local, SFTP, S3, WebDAV ...). Returns
+    /// the task id.
+    ///
+    /// The task carries no local paths, since either end may be remote; the label
+    /// names the item instead.
+    pub fn transfer(
+        &self,
+        source: VfsUri,
+        target: VfsUri,
+        registry: Arc<std::sync::RwLock<ProviderRegistry>>,
+        policy: ConflictPolicy,
+        remove_source: bool,
+    ) -> u64 {
+        let kind = if remove_source {
+            TaskKind::Move
+        } else {
+            TaskKind::Copy
+        };
+        let mut record = self.next_record(kind, None, None);
+        record.label = format!("{} → {}", source.file_name(), target.file_name());
+        self.enqueue(
+            record,
+            Arc::new(move |task| {
+                let providers = registry
+                    .read()
+                    .map_err(|_| Error::Other("provider registry is poisoned".into()))
+                    .and_then(|registry| {
+                        Ok((registry.for_uri(&source)?, registry.for_uri(&target)?))
+                    })?;
+                futures::executor::block_on(transfer::transfer(
+                    providers.0.as_ref(),
+                    providers.1.as_ref(),
+                    &source,
+                    &target,
+                    policy,
+                    remove_source,
+                    Arc::new(RecordSink(task.clone())),
+                ))
+            }),
+        )
+    }
+
     /// Copy a file or directory tree. Returns the task id.
     pub fn copy(&self, source: PathBuf, target: PathBuf, policy: ConflictPolicy) -> u64 {
         let record = self.next_record(TaskKind::Copy, Some(source.clone()), Some(target.clone()));
@@ -370,6 +438,25 @@ impl TaskManager {
             Arc::new(move |task| {
                 task.total_bytes.store(1, Ordering::Relaxed);
                 fs::create_dir_all(&target)
+                    .map_err(|e| Error::io(format!("create {}", target.display()), e))?;
+                task.done_bytes.store(1, Ordering::Relaxed);
+                Ok(())
+            }),
+        )
+    }
+
+    /// Create an empty file. Never touches an existing one: `create_new` makes the
+    /// task fail instead of truncating somebody's data.
+    pub fn create_file(&self, target: PathBuf) -> u64 {
+        let record = self.next_record(TaskKind::CreateFile, None, Some(target.clone()));
+        self.enqueue(
+            record,
+            Arc::new(move |task| {
+                task.total_bytes.store(1, Ordering::Relaxed);
+                fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&target)
                     .map_err(|e| Error::io(format!("create {}", target.display()), e))?;
                 task.done_bytes.store(1, Ordering::Relaxed);
                 Ok(())
@@ -799,6 +886,29 @@ mod tests {
     }
 
     #[test]
+    fn create_file_makes_an_empty_file() {
+        let dir = tempdir();
+        let file = dir.path().join("note.txt");
+        let manager = TaskManager::new(1);
+        manager.create_file(file.clone());
+        manager.wait_idle();
+        assert_eq!(fs::read(&file).unwrap(), b"");
+    }
+
+    #[test]
+    fn create_file_fails_instead_of_overwriting() {
+        let dir = tempdir();
+        let file = dir.path().join("keep.txt");
+        fs::write(&file, b"precious").unwrap();
+        let manager = TaskManager::new(1);
+        manager.create_file(file.clone());
+        manager.wait_idle();
+        assert_eq!(fs::read(&file).unwrap(), b"precious");
+        let snapshot = manager.snapshots().pop().unwrap();
+        assert!(matches!(snapshot.state, TaskState::Failed(_)));
+    }
+
+    #[test]
     fn unique_path_appends_counter() {
         let dir = tempdir();
         let file = dir.path().join("report.txt");
@@ -864,6 +974,7 @@ mod edge_tests {
             TaskKind::Delete,
             TaskKind::Trash,
             TaskKind::CreateDir,
+            TaskKind::CreateFile,
             TaskKind::Rename,
         ] {
             assert!(!kind.verb().is_empty());

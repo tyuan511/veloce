@@ -8,6 +8,7 @@
 use vfs_core::{SortSpec, ops::ConflictPolicy};
 
 use crate::{
+    i18n::{LanguagePref, tr},
     keymap::{self, Overrides},
     prefs::{parse_sort_key, parse_view, sort_key_name, view_key},
     view::ViewMode,
@@ -27,9 +28,9 @@ impl ThemePref {
 
     pub fn label(self) -> &'static str {
         match self {
-            ThemePref::System => "System",
-            ThemePref::Light => "Light",
-            ThemePref::Dark => "Dark",
+            ThemePref::System => tr("System"),
+            ThemePref::Light => tr("Light"),
+            ThemePref::Dark => tr("Dark"),
         }
     }
 
@@ -59,9 +60,9 @@ impl Density {
 
     pub fn label(self) -> &'static str {
         match self {
-            Density::Compact => "Compact",
-            Density::Regular => "Regular",
-            Density::Comfortable => "Comfortable",
+            Density::Compact => tr("Compact"),
+            Density::Regular => tr("Regular"),
+            Density::Comfortable => tr("Comfortable"),
         }
     }
 
@@ -101,9 +102,9 @@ impl OnConflict {
 
     pub fn label(self) -> &'static str {
         match self {
-            OnConflict::KeepBoth => "Keep both",
-            OnConflict::Skip => "Skip",
-            OnConflict::Replace => "Replace",
+            OnConflict::KeepBoth => tr("Keep both"),
+            OnConflict::Skip => tr("Skip"),
+            OnConflict::Replace => tr("Replace"),
         }
     }
 
@@ -142,8 +143,8 @@ impl Startup {
 
     pub fn label(self) -> &'static str {
         match self {
-            Startup::RestoreSession => "Restore last session",
-            Startup::HomeFolder => "Open the home folder",
+            Startup::RestoreSession => tr("Restore last session"),
+            Startup::HomeFolder => tr("Open the home folder"),
         }
     }
 
@@ -164,6 +165,7 @@ pub const CACHE_CHOICES_MB: [u32; 4] = [64, 256, 1024, 4096];
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct AppSettings {
+    pub language: LanguagePref,
     pub theme: ThemePref,
     pub density: Density,
     pub startup: Startup,
@@ -188,6 +190,7 @@ impl gpui::Global for AppSettings {}
 impl Default for AppSettings {
     fn default() -> Self {
         Self {
+            language: LanguagePref::System,
             theme: ThemePref::System,
             density: Density::Regular,
             startup: Startup::RestoreSession,
@@ -205,6 +208,7 @@ impl Default for AppSettings {
     }
 }
 
+const K_LANGUAGE: &str = "app.language";
 const K_THEME: &str = "app.theme";
 const K_DENSITY: &str = "app.density";
 const K_STARTUP: &str = "app.startup";
@@ -257,6 +261,9 @@ impl AppSettings {
             .filter(|mb| CACHE_CHOICES_MB.contains(mb))
             .unwrap_or(defaults.thumbnail_cache_mb);
         Self {
+            language: text(K_LANGUAGE)
+                .and_then(|v| LanguagePref::parse(&v))
+                .unwrap_or(defaults.language),
             theme: text(K_THEME)
                 .and_then(|v| ThemePref::parse(&v))
                 .unwrap_or(defaults.theme),
@@ -292,6 +299,7 @@ impl AppSettings {
     /// Key/value pairs to write, all in one transaction.
     pub fn entries(&self) -> Vec<(&'static str, String)> {
         vec![
+            (K_LANGUAGE, self.language.key().to_string()),
             (K_THEME, self.theme.key().to_string()),
             (K_DENSITY, self.density.key().to_string()),
             (K_STARTUP, self.startup.key().to_string()),
@@ -355,6 +363,7 @@ mod tests {
     #[test]
     fn every_setting_survives_a_save_and_load() {
         let settings = AppSettings {
+            language: LanguagePref::Chinese,
             theme: ThemePref::Dark,
             density: Density::Comfortable,
             startup: Startup::HomeFolder,
@@ -386,12 +395,14 @@ mod tests {
     #[test]
     fn unreadable_values_fall_back_one_at_a_time() {
         let settings = AppSettings::from_lookup(lookup(&[
+            (K_LANGUAGE, "klingon"),
             (K_THEME, "neon"),
             (K_DENSITY, "comfortable"),
             (K_VIEW, "gallery"),
             (K_CACHE, "300"),
             (K_THUMBS, "maybe"),
         ]));
+        assert_eq!(settings.language, LanguagePref::System);
         assert_eq!(settings.theme, ThemePref::System, "bad value → default");
         assert_eq!(settings.density, Density::Comfortable, "good value kept");
         assert_eq!(settings.default_view, ViewMode::List);
@@ -407,7 +418,7 @@ mod tests {
         keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), before, "duplicate key");
-        assert_eq!(before, 15);
+        assert_eq!(before, 16);
     }
 
     #[test]

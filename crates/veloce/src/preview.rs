@@ -10,17 +10,19 @@ mod table;
 mod ts;
 mod views;
 
+use crate::i18n::{tr, trf};
 use std::{
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, RwLock},
 };
 
 use gpui::{
-    AnyElement, Context, Hsla, ObjectFit, StatefulInteractiveElement, div, img, prelude::*, px, svg,
+    AnyElement, Bounds, Context, Corners, Hsla, ObjectFit, ScrollHandle,
+    StatefulInteractiveElement, canvas, div, fill, img, prelude::*, px, svg,
 };
 use veloce_store::Store;
 use vfs_core::{
-    FileEntry, LocalProvider, VfsProvider,
+    FileEntry, ProviderRegistry, VfsProvider,
     archive::{ArchiveKind, list_entries},
     entry::{format_size, format_time},
 };
@@ -102,12 +104,15 @@ pub struct Preview {
     token: Arc<std::sync::atomic::AtomicBool>,
     /// Where rendered thumbnails are cached (shared with the icon view).
     store: Option<Arc<Store>>,
+    /// Where remote entries find the provider that can read them.
+    registry: Arc<RwLock<ProviderRegistry>>,
 }
 
 impl Preview {
-    pub fn new(store: Option<Arc<Store>>) -> Self {
+    pub fn new(store: Option<Arc<Store>>, registry: Arc<RwLock<ProviderRegistry>>) -> Self {
         Self {
             store,
+            registry,
             content: PreviewContent::Empty,
             loaded: None,
             token: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -142,11 +147,27 @@ impl Preview {
         self.token = token.clone();
 
         let store = self.store.clone();
+        let provider = self
+            .registry
+            .read()
+            .map_err(|_| tr("The connection list is unavailable").to_string())
+            .and_then(|registry| {
+                registry
+                    .for_uri(&entry.uri)
+                    .map_err(|error| error.to_string())
+            });
         cx.spawn(async move |this, cx| {
             // Reading files and running `tar` / `qlmanage` must not block the UI.
             let content = cx
                 .background_executor()
-                .spawn(async move { build_preview(&entry, store.as_deref()).await })
+                .spawn(async move {
+                    match provider {
+                        Ok(provider) => {
+                            build_preview(&entry, store.as_deref(), provider.as_ref()).await
+                        }
+                        Err(message) => PreviewContent::Error { message },
+                    }
+                })
                 .await;
             this.update(cx, |preview, cx| {
                 if token.load(std::sync::atomic::Ordering::Relaxed) {
@@ -353,39 +374,45 @@ pub fn hex_dump(bytes: &[u8], max_bytes: usize) -> Vec<String> {
 /// Whether this platform can render Quick Look thumbnails.
 const THUMBNAILS: bool = cfg!(target_os = "macos");
 
-async fn build_preview(entry: &FileEntry, store: Option<&Store>) -> PreviewContent {
+/// Build the preview for any entry, local or remote: everything goes through the
+/// entry's provider, and the only differences are the ones that are real. A local
+/// file is already on disk, so images are shown straight from it and archives are
+/// listed in place; a remote one has to be fetched, so only a bounded head is read,
+/// or the whole file once to render a small picture (which is what gets cached).
+async fn build_preview(
+    entry: &FileEntry,
+    store: Option<&Store>,
+    provider: &dyn VfsProvider,
+) -> PreviewContent {
     if entry.is_dir() {
-        return directory_preview(entry);
+        return directory_preview(provider, entry).await;
     }
-    let Some(path) = entry.uri.as_local_path() else {
-        return PreviewContent::Error {
-            message: "Remote previews arrive with the SFTP backend".to_string(),
-        };
-    };
     let extension = entry.extension().unwrap_or_default();
-    let provider = LocalProvider::new();
+    let local = entry.uri.as_local_path();
+    let is_text = is_text_extension(&extension);
+    let from_head = |as_text: bool| head_preview(provider, entry, as_text);
 
     match route_for(&entry.name, &extension, THUMBNAILS) {
-        Route::Image => PreviewContent::Image { path },
-        Route::Thumbnail => match thumbs::thumbnail_bytes(
-            store,
-            &path,
-            &extension,
-            thumbs::Stamp::new(entry.size, entry.modified),
-            thumbs::PREVIEW_PIXELS,
-        ) {
-            Some(png) => PreviewContent::Picture {
-                image: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png)),
-            },
-            // No thumbnail (DRM media, odd codec ...): HTML falls back to its source,
-            // everything else to the bytes.
-            None if is_text_extension(&extension) => read_text_preview(&provider, entry).await,
-            None => sniff_preview(&provider, entry).await,
+        Route::Image if local.is_some() => PreviewContent::Image {
+            path: local.unwrap_or_default(),
         },
+        Route::Image | Route::Thumbnail => {
+            match thumbs::thumbnail_bytes(store, provider, entry, thumbs::PREVIEW_PIXELS).await {
+                Some(png) => PreviewContent::Picture {
+                    image: Arc::new(gpui::Image::from_bytes(gpui::ImageFormat::Png, png)),
+                },
+                // No picture (DRM media, odd codec, too big to fetch ...): HTML falls
+                // back to its source, everything else to the bytes.
+                None => from_head(is_text).await,
+            }
+        }
         Route::Archive => {
-            let kind = ArchiveKind::detect(&entry.name);
-            let listed = kind
-                .ok_or_else(|| "Not an archive".to_string())
+            // Listing needs the archive on disk; a remote one shows its bytes.
+            let Some(path) = local else {
+                return from_head(false).await;
+            };
+            let listed = ArchiveKind::detect(&entry.name)
+                .ok_or_else(|| tr("Not an archive").to_string())
                 .and_then(|kind| list_entries(kind, &path, ARCHIVE_PREVIEW_ENTRIES + 1));
             match listed {
                 Ok(mut entries) => {
@@ -394,32 +421,35 @@ async fn build_preview(entry: &FileEntry, store: Option<&Store>) -> PreviewConte
                     PreviewContent::Archive { entries, truncated }
                 }
                 // Single-file compressions and unreadable archives still get bytes.
-                Err(_) => sniff_preview(&provider, entry).await,
+                Err(_) => from_head(false).await,
             }
         }
-        Route::Text => read_text_preview(&provider, entry).await,
-        Route::Sniff => sniff_preview(&provider, entry).await,
+        Route::Text => from_head(true).await,
+        Route::Sniff => from_head(false).await,
     }
 }
 
-fn directory_preview(entry: &FileEntry) -> PreviewContent {
-    let Some(path) = entry.uri.as_local_path() else {
-        return PreviewContent::Directory {
-            children: 0,
-            names: Vec::new(),
-        };
+async fn directory_preview(provider: &dyn VfsProvider, entry: &FileEntry) -> PreviewContent {
+    use futures::StreamExt as _;
+    // A local folder is counted in full; a remote listing is a paid, slow request per
+    // page, so it stops once the panel is full.
+    let limit = if entry.uri.scheme.is_local() {
+        usize::MAX
+    } else {
+        DIRECTORY_PREVIEW_ENTRIES + 1
     };
-    let mut names: Vec<(String, bool)> = std::fs::read_dir(path)
-        .map(|entries| {
-            entries
-                .flatten()
-                .map(|child| {
-                    let is_dir = child.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                    (child.file_name().to_string_lossy().into_owned(), is_dir)
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut names: Vec<(String, bool)> = Vec::new();
+    if let Ok(mut stream) = provider.list_stream(&entry.uri).await {
+        while let Some(Ok(chunk)) = stream.next().await {
+            names.extend(chunk.into_iter().map(|child| {
+                let is_dir = child.is_dir();
+                (child.name, is_dir)
+            }));
+            if names.len() >= limit {
+                break;
+            }
+        }
+    }
     let children = names.len();
     // Folders first, then names, so the cut-off keeps the most useful rows.
     names.sort_by(|a, b| {
@@ -430,18 +460,21 @@ fn directory_preview(entry: &FileEntry) -> PreviewContent {
     PreviewContent::Directory { children, names }
 }
 
-async fn sniff_preview(provider: &LocalProvider, entry: &FileEntry) -> PreviewContent {
+/// Preview from the first bytes of the file. The bytes themselves are never cached,
+/// local or remote: only the rendered picture is (see `thumbs::thumbnail_bytes`).
+async fn head_preview(
+    provider: &dyn VfsProvider,
+    entry: &FileEntry,
+    as_text: bool,
+) -> PreviewContent {
     match read_head(provider, entry).await {
+        Ok(head) if as_text => text_preview_from_head(entry, &head),
         Ok(head) => classify_head(&head, entry.size),
-        Err(error) => PreviewContent::Error { message: error },
+        Err(message) => PreviewContent::Error { message },
     }
 }
 
-async fn read_text_preview(provider: &LocalProvider, entry: &FileEntry) -> PreviewContent {
-    let head = match read_head(provider, entry).await {
-        Ok(head) => head,
-        Err(message) => return PreviewContent::Error { message },
-    };
+fn text_preview_from_head(entry: &FileEntry, head: &[u8]) -> PreviewContent {
     let extension = entry.extension().unwrap_or_default();
     // Binary property lists are common on macOS; `plutil` turns them into XML.
     if extension == "plist"
@@ -451,9 +484,9 @@ async fn read_text_preview(provider: &LocalProvider, entry: &FileEntry) -> Previ
         return text_content(&entry.name, "xml", &xml, false);
     }
     if head.iter().take(BINARY_SNIFF_BYTES).any(|byte| *byte == 0) {
-        return classify_head(&head, entry.size);
+        return classify_head(head, entry.size);
     }
-    let text = String::from_utf8_lossy(&head);
+    let text = String::from_utf8_lossy(head);
     text_content(&entry.name, &extension, &text, entry.size > PREVIEW_BYTES)
 }
 
@@ -539,7 +572,7 @@ fn text_content(name: &str, extension: &str, text: &str, file_truncated: bool) -
 pub const TABLE_PREVIEW_ROWS: usize = 200;
 pub const TABLE_PREVIEW_COLUMNS: usize = 40;
 
-async fn read_head(provider: &LocalProvider, entry: &FileEntry) -> Result<Vec<u8>, String> {
+async fn read_head(provider: &dyn VfsProvider, entry: &FileEntry) -> Result<Vec<u8>, String> {
     use futures::StreamExt as _;
     let stream = provider
         .read_stream(&entry.uri, 0, Some(PREVIEW_BYTES))
@@ -612,6 +645,8 @@ pub struct PreviewView {
     pub entry: Option<FileEntry>,
     /// Panel width: the inspector is narrow. Ignored when `embedded`.
     pub width: f32,
+    /// Shared by the text/code/hex bodies: only one is on screen at a time.
+    h_scroll: ScrollHandle,
 }
 
 /// What the inspector asks of the workspace.
@@ -632,12 +667,17 @@ impl gpui::Focusable for PreviewView {
 }
 
 impl PreviewView {
-    pub fn new(store: Option<Arc<Store>>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        store: Option<Arc<Store>>,
+        registry: Arc<RwLock<ProviderRegistry>>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         Self {
-            preview: Preview::new(store),
+            preview: Preview::new(store, registry),
             focus_handle: cx.focus_handle(),
             entry: None,
             width: 340.0,
+            h_scroll: ScrollHandle::new(),
         }
     }
 
@@ -654,7 +694,14 @@ impl gpui::Render for PreviewView {
         _window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) -> impl gpui::IntoElement {
-        render_preview(&self.preview, self.entry.as_ref(), self.width, cx).into_any_element()
+        render_preview(
+            &self.preview,
+            self.entry.as_ref(),
+            self.width,
+            &self.h_scroll,
+            cx,
+        )
+        .into_any_element()
     }
 }
 
@@ -663,19 +710,26 @@ pub fn render_preview(
     preview: &Preview,
     entry: Option<&FileEntry>,
     width: f32,
+    h_scroll: &ScrollHandle,
     cx: &mut Context<PreviewView>,
 ) -> AnyElement {
     let header = render_header(entry, cx);
     let body = match &preview.content {
         PreviewContent::Empty => empty_state(),
         PreviewContent::Loading { name } => loading_state(name),
-        PreviewContent::Text { lines, truncated } => text_state(lines, *truncated),
-        PreviewContent::Code { lines, truncated } => views::code_state(lines, *truncated),
+        PreviewContent::Text { lines, truncated } => {
+            with_hbar(text_state(lines, *truncated, h_scroll), h_scroll)
+        }
+        PreviewContent::Code { lines, truncated } => {
+            with_hbar(views::code_state(lines, *truncated, h_scroll), h_scroll)
+        }
         PreviewContent::Markdown { blocks, truncated } => views::markdown_state(blocks, *truncated),
         PreviewContent::Table { rows, truncated } => views::table_state(rows, *truncated),
         PreviewContent::Image { path } => image_state(path.clone()),
         PreviewContent::Picture { image } => image_state(image.clone()),
-        PreviewContent::Binary { size, dump } => binary_state(*size, dump),
+        PreviewContent::Binary { size, dump } => {
+            with_hbar(binary_state(*size, dump, h_scroll), h_scroll)
+        }
         PreviewContent::Archive { entries, truncated } => archive_state(entries, *truncated),
         PreviewContent::Directory { children, names } => directory_state(*children, names),
         PreviewContent::Error { message } => error_state(message),
@@ -806,7 +860,7 @@ fn open_button(cx: &mut Context<PreviewView>) -> AnyElement {
                 .cursor_pointer()
                 .hover(|this| this.bg(theme::border()))
                 .on_click(cx.listener(|_, _, _, cx| cx.emit(PreviewEvent::Open)))
-                .child("Open"),
+                .child(tr("Open")),
         )
         .child(div().w(px(1.)).h(px(12.)).bg(theme::border()))
         .child(
@@ -839,13 +893,13 @@ fn open_button(cx: &mut Context<PreviewView>) -> AnyElement {
 pub(crate) fn header_facts(entry: &FileEntry) -> Vec<(&'static str, String)> {
     let mut facts = Vec::new();
     if entry.modified.is_some() {
-        facts.push(("Modified", format_time(entry.modified)));
+        facts.push((tr("Modified"), format_time(entry.modified)));
     }
     if entry.created.is_some() {
-        facts.push(("Created", format_time(entry.created)));
+        facts.push((tr("Created"), format_time(entry.created)));
     }
     if let Some(mode) = crate::info::permissions_label(entry.permissions) {
-        facts.push(("Permissions", mode));
+        facts.push((tr("Permissions"), mode));
     }
     facts
 }
@@ -871,14 +925,14 @@ fn empty_state() -> AnyElement {
             div()
                 .text_xs()
                 .text_color(theme::text_faint())
-                .child("Select a file and press Space"),
+                .child(tr("Select a file and press Space")),
         )
         .child(
             div().flex().flex_col().gap_1().mt_3().children(
                 crate::actions::SHORTCUTS
                     .iter()
                     .take(6)
-                    .map(|(key, label)| shortcut_row(key, label)),
+                    .map(|(key, label)| shortcut_row(key, tr(label))),
             ),
         )
         .into_any_element()
@@ -916,28 +970,38 @@ fn loading_state(name: &str) -> AnyElement {
         .flex()
         .items_center()
         .justify_center()
+        .px_4()
+        .min_w_0()
         .child(
+            // A long file name must be cut with an ellipsis, not run past the panel.
             div()
+                .max_w_full()
+                .min_w_0()
+                .truncate()
                 .text_xs()
                 .text_color(theme::text_faint())
-                .child(format!("Loading {name}…")),
+                .child(trf("Loading {}…", &[name])),
         )
         .into_any_element()
 }
 
-fn text_state(lines: &[String], truncated: bool) -> AnyElement {
+fn text_state(lines: &[String], truncated: bool, handle: &ScrollHandle) -> AnyElement {
     let gutter_width = px(38.0);
     div()
         .id("preview-body")
+        .track_scroll(handle)
+        // 横向 flex：子列按内容宽度排布而不是被拉伸到容器宽，滚动范围才取得到
+        .flex()
         .flex_1()
         .min_h_0()
-        .overflow_y_scroll()
+        .overflow_scroll()
         .px_2()
         .py_2()
         .child(
             div()
                 .flex()
                 .flex_col()
+                .flex_shrink_0()
                 .font_family(theme::MONO_FAMILY)
                 .text_size(px(11.5))
                 .line_height(px(16.0))
@@ -958,8 +1022,7 @@ fn text_state(lines: &[String], truncated: bool) -> AnyElement {
                         )
                         .child(
                             div()
-                                .flex_1()
-                                .min_w_0()
+                                .flex_shrink_0()
                                 .whitespace_nowrap()
                                 .text_color(theme::text())
                                 .child(line.clone()),
@@ -995,44 +1058,52 @@ fn image_state(source: impl Into<gpui::ImageSource>) -> AnyElement {
         .into_any_element()
 }
 
-fn binary_state(size: u64, dump: &[String]) -> AnyElement {
+fn binary_state(size: u64, dump: &[String], handle: &ScrollHandle) -> AnyElement {
     if dump.is_empty() {
         return centered_hint(
             icons::FILE,
-            "Binary file",
-            &format!("{} · no preview", format_size(size)),
+            tr("Binary file"),
+            &trf("{} · no preview", &[&format_size(size)]),
             theme::text_faint(),
         );
     }
     div()
         .id("preview-hex")
+        .track_scroll(handle)
+        .flex()
         .flex_1()
         .min_h_0()
-        .overflow_y_scroll()
+        .overflow_scroll()
         .px_3()
         .py_2()
         .child(
             div()
-                .mb_2()
-                .text_xs()
-                .text_color(theme::text_faint())
-                .child(format!(
-                    "Binary · {} · first {} bytes",
-                    format_size(size),
-                    HEX_PREVIEW_BYTES
-                )),
-        )
-        .child(
-            div()
                 .flex()
                 .flex_col()
-                .font_family(theme::MONO_FAMILY)
-                .text_size(px(11.))
-                .line_height(px(15.))
-                .text_color(theme::text_muted())
-                .children(
-                    dump.iter()
-                        .map(|row| div().whitespace_nowrap().child(row.clone())),
+                .flex_shrink_0()
+                .child(
+                    div()
+                        .mb_2()
+                        .text_xs()
+                        .text_color(theme::text_faint())
+                        .child(trf(
+                            "Binary · {} · first {} bytes",
+                            &[&format_size(size), &HEX_PREVIEW_BYTES.to_string()],
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_shrink_0()
+                        .font_family(theme::MONO_FAMILY)
+                        .text_size(px(11.))
+                        .line_height(px(15.))
+                        .text_color(theme::text_muted())
+                        .children(
+                            dump.iter()
+                                .map(|row| div().whitespace_nowrap().child(row.clone())),
+                        ),
                 ),
         )
         .into_any_element()
@@ -1099,9 +1170,9 @@ fn archive_state(entries: &[String], truncated: bool) -> AnyElement {
                 .text_xs()
                 .text_color(theme::text_faint())
                 .child(if truncated {
-                    format!("Archive · first {} entries", entries.len())
+                    trf("Archive · first {} entries", &[&entries.len().to_string()])
                 } else {
-                    format!("Archive · {} entries", entries.len())
+                    trf("Archive · {} entries", &[&entries.len().to_string()])
                 }),
         )
         .children(
@@ -1115,8 +1186,8 @@ fn directory_state(children: usize, names: &[(String, bool)]) -> AnyElement {
     if names.is_empty() {
         return centered_hint(
             icons::FOLDER,
-            "Folder",
-            &format!("{children} items inside"),
+            tr("Folder"),
+            &trf("{} items inside", &[&children.to_string()]),
             theme::blue(),
         );
     }
@@ -1147,7 +1218,7 @@ fn directory_state(children: usize, names: &[(String, bool)]) -> AnyElement {
 }
 
 fn error_state(message: &str) -> AnyElement {
-    centered_hint(icons::CLOSE, "Cannot preview", message, theme::red())
+    centered_hint(icons::CLOSE, tr("Cannot preview"), message, theme::red())
 }
 
 fn centered_hint(icon: &'static str, title: &str, detail: &str, tint: Hsla) -> AnyElement {
@@ -1179,6 +1250,7 @@ fn centered_hint(icon: &'static str, title: &str, detail: &str, tint: Hsla) -> A
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use std::fs;
     use vfs_core::VfsUri;
@@ -1206,7 +1278,11 @@ mod tests {
         fs::write(&path, line.repeat(5000)).unwrap();
 
         let entry = entry_for(&path);
-        let content = futures::executor::block_on(build_preview(&entry, None));
+        let content = futures::executor::block_on(build_preview(
+            &entry,
+            None,
+            &vfs_core::LocalProvider::new(),
+        ));
         match content {
             PreviewContent::Text {
                 lines, truncated, ..
@@ -1224,7 +1300,11 @@ mod tests {
         let path = dir.path().join("blob.dat");
         fs::write(&path, [0u8, 1, 2, 3, 0, 9]).unwrap();
         let entry = entry_for(&path);
-        let content = futures::executor::block_on(build_preview(&entry, None));
+        let content = futures::executor::block_on(build_preview(
+            &entry,
+            None,
+            &vfs_core::LocalProvider::new(),
+        ));
         assert!(matches!(content, PreviewContent::Binary { .. }));
     }
 
@@ -1237,7 +1317,11 @@ mod tests {
             fs::write(folder.join(name), b"x").unwrap();
         }
         let entry = entry_for(&folder);
-        let content = futures::executor::block_on(build_preview(&entry, None));
+        let content = futures::executor::block_on(build_preview(
+            &entry,
+            None,
+            &vfs_core::LocalProvider::new(),
+        ));
         match content {
             PreviewContent::Directory { children, names } => {
                 assert_eq!(children, 3);
@@ -1253,7 +1337,11 @@ mod tests {
         let path = dir.path().join("shot.png");
         fs::write(&path, b"not really a png").unwrap();
         let entry = entry_for(&path);
-        let content = futures::executor::block_on(build_preview(&entry, None));
+        let content = futures::executor::block_on(build_preview(
+            &entry,
+            None,
+            &vfs_core::LocalProvider::new(),
+        ));
         assert!(matches!(content, PreviewContent::Image { .. }));
     }
 
@@ -1382,7 +1470,11 @@ mod tests {
         let path = dir.path().join("notes.md");
         fs::write(&path, "# Title\n\n- a\n- b\n").unwrap();
         let entry = entry_for(&path);
-        let content = futures::executor::block_on(build_preview(&entry, None));
+        let content = futures::executor::block_on(build_preview(
+            &entry,
+            None,
+            &vfs_core::LocalProvider::new(),
+        ));
         assert!(
             matches!(content, PreviewContent::Markdown { .. }),
             "{content:?}"
@@ -1395,7 +1487,11 @@ mod tests {
         let path = dir.path().join("weird.json");
         fs::write(&path, [0u8, 159, 146, 150]).unwrap();
         let entry = entry_for(&path);
-        let content = futures::executor::block_on(build_preview(&entry, None));
+        let content = futures::executor::block_on(build_preview(
+            &entry,
+            None,
+            &vfs_core::LocalProvider::new(),
+        ));
         assert!(
             matches!(content, PreviewContent::Binary { .. }),
             "{content:?}"
@@ -1427,7 +1523,11 @@ mod tests {
         fs::create_dir_all(folder.join("zeta")).unwrap();
         fs::write(folder.join("alpha.txt"), b"x").unwrap();
         let entry = entry_for(&folder);
-        match futures::executor::block_on(build_preview(&entry, None)) {
+        match futures::executor::block_on(build_preview(
+            &entry,
+            None,
+            &vfs_core::LocalProvider::new(),
+        )) {
             PreviewContent::Directory { names, .. } => {
                 assert_eq!(names[0], ("zeta".to_string(), true));
                 assert_eq!(names[1], ("alpha.txt".to_string(), false));
@@ -1450,7 +1550,11 @@ mod tests {
         ))
         .unwrap();
         let entry = entry_for(&archive);
-        match futures::executor::block_on(build_preview(&entry, None)) {
+        match futures::executor::block_on(build_preview(
+            &entry,
+            None,
+            &vfs_core::LocalProvider::new(),
+        )) {
             PreviewContent::Archive { entries, truncated } => {
                 assert!(!truncated);
                 assert!(entries.iter().any(|e| e.ends_with("readme.md")));
@@ -1465,7 +1569,11 @@ mod tests {
         let path = dir.path().join("broken.zip");
         fs::write(&path, [0u8, 1, 2, 3]).unwrap();
         let entry = entry_for(&path);
-        let content = futures::executor::block_on(build_preview(&entry, None));
+        let content = futures::executor::block_on(build_preview(
+            &entry,
+            None,
+            &vfs_core::LocalProvider::new(),
+        ));
         assert!(
             matches!(content, PreviewContent::Binary { .. }),
             "{content:?}"
@@ -1478,7 +1586,11 @@ mod tests {
         let path = dir.path().join("blob.dat");
         fs::write(&path, [0u8, 1, 2, 0x41]).unwrap();
         let entry = entry_for(&path);
-        match futures::executor::block_on(build_preview(&entry, None)) {
+        match futures::executor::block_on(build_preview(
+            &entry,
+            None,
+            &vfs_core::LocalProvider::new(),
+        )) {
             PreviewContent::Binary { dump, .. } => {
                 assert_eq!(dump.len(), 1);
                 assert!(dump[0].contains("00 01 02 41"));
@@ -1646,4 +1758,45 @@ mod edge_tests {
     fn sniff_window_fits_inside_the_head_read() {
         assert!(BINARY_SNIFF_BYTES <= PREVIEW_BYTES as usize);
     }
+}
+
+/// gpui draws no scrollbars, so a scrolling body gets a thin thumb overlay;
+/// without it nothing hints that clipped lines can be scrolled sideways.
+fn with_hbar(scroller: AnyElement, handle: &ScrollHandle) -> AnyElement {
+    let handle = handle.clone();
+    div()
+        .relative()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .child(scroller)
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    let max = f32::from(handle.max_offset().width);
+                    let view = f32::from(bounds.size.width);
+                    if max <= 0.0 || view <= 0.0 {
+                        return;
+                    }
+                    let thumb = (view * view / (view + max)).max(24.0).min(view);
+                    let progress = (-f32::from(handle.offset().x) / max).clamp(0.0, 1.0);
+                    let left = bounds.left() + px(progress * (view - thumb));
+                    let top = bounds.bottom() - px(7.0);
+                    let mut quad = fill(
+                        Bounds::new(gpui::point(left, top), gpui::size(px(thumb), px(4.0))),
+                        theme::text_faint(),
+                    );
+                    quad.corner_radii = Corners::all(px(2.0));
+                    window.paint_quad(quad);
+                },
+            )
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .h(px(8.0)),
+        )
+        .into_any_element()
 }

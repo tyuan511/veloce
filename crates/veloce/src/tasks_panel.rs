@@ -4,6 +4,7 @@
 //! workers publish into atomics, the panel samples them ~10x a second, which keeps
 //! the UI thread free and the cost flat no matter how many tasks run.
 
+use crate::i18n::{tr, trf};
 use std::{
     sync::Arc,
     time::{Duration, Instant},
@@ -151,9 +152,9 @@ fn render_panel(panel: &mut TaskPanel, cx: &mut Context<TaskPanel>) -> AnyElemen
                             .text_xs()
                             .text_color(theme::text_muted())
                             .child(if active > 0 {
-                                format!("Tasks · {active} running")
+                                trf("Tasks · {} running", &[&active.to_string()])
                             } else {
-                                "Tasks".to_string()
+                                tr("Tasks").to_string()
                             }),
                     ),
             )
@@ -172,7 +173,7 @@ fn render_panel(panel: &mut TaskPanel, cx: &mut Context<TaskPanel>) -> AnyElemen
                     .on_click(move |_, _, cx| {
                         entity.update(cx, |panel, cx| panel.clear_finished(cx));
                     })
-                    .child("Clear finished")
+                    .child(tr("Clear finished"))
             });
 
     let body: AnyElement = if panel.snapshots.is_empty() {
@@ -186,7 +187,7 @@ fn render_panel(panel: &mut TaskPanel, cx: &mut Context<TaskPanel>) -> AnyElemen
                 div()
                     .text_xs()
                     .text_color(theme::text_faint())
-                    .child("No transfers yet"),
+                    .child(tr("No transfers yet")),
             )
             .into_any_element()
     } else {
@@ -205,7 +206,7 @@ fn render_panel(panel: &mut TaskPanel, cx: &mut Context<TaskPanel>) -> AnyElemen
     div()
         .flex()
         .flex_col()
-        .w(px(360.0))
+        .w_full()
         .flex_shrink_0()
         .h(px(200.0))
         .bg(theme::bg_pane())
@@ -218,10 +219,10 @@ fn render_panel(panel: &mut TaskPanel, cx: &mut Context<TaskPanel>) -> AnyElemen
 
 fn render_task(task: &TaskSnapshot, entity: gpui::Entity<TaskPanel>) -> AnyElement {
     let (state_color, state_label) = match &task.state {
-        TaskState::Queued => (theme::text_faint(), "queued".to_string()),
-        TaskState::Running => (theme::accent(), "running".to_string()),
-        TaskState::Done => (theme::green(), "done".to_string()),
-        TaskState::Cancelled => (theme::text_faint(), "cancelled".to_string()),
+        TaskState::Queued => (theme::text_faint(), tr("queued").to_string()),
+        TaskState::Running => (theme::accent(), tr("running").to_string()),
+        TaskState::Done => (theme::green(), tr("done").to_string()),
+        TaskState::Cancelled => (theme::text_faint(), tr("cancelled").to_string()),
         TaskState::Failed(message) => (theme::red(), message.clone()),
     };
 

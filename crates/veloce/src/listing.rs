@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use vfs_core::{FileEntry, Filter, SortSpec, VfsUri};
 
-use crate::pane::JumpTarget;
+use crate::{i18n::trf, pane::JumpTarget};
 
 /// A directory listing after sort and filter, plus the selection state that has
 /// to be kept consistent with it.
@@ -25,6 +25,9 @@ pub struct Listing {
     pub selected: Vec<usize>,
     /// Position inside `visible`, not inside `entries`.
     pub cursor: usize,
+    /// Set by a click on blank space: nothing is selected and no row counts as
+    /// the cursor, so actions and the preview have no target. Any move clears it.
+    pub cursor_hidden: bool,
     /// Dot-files are hidden unless this is on (Finder's ⇧⌘.).
     pub show_hidden: bool,
 }
@@ -93,6 +96,7 @@ impl Listing {
         self.visible.clear();
         self.selected.clear();
         self.cursor = 0;
+        self.cursor_hidden = false;
     }
 
     pub fn is_empty(&self) -> bool {
@@ -104,6 +108,9 @@ impl Listing {
     }
 
     pub fn cursor_entry(&self) -> Option<&FileEntry> {
+        if self.cursor_hidden {
+            return None;
+        }
         self.visible
             .get(self.cursor)
             .and_then(|index| self.entries.get(*index))
@@ -132,6 +139,7 @@ impl Listing {
         if position >= self.visible.len() {
             return;
         }
+        self.cursor_hidden = false;
         self.cursor = position;
         let index = self.visible[position];
         if extend {
@@ -163,6 +171,7 @@ impl Listing {
         if self.visible.is_empty() {
             return;
         }
+        self.cursor_hidden = false;
         if self.selected.is_empty() {
             self.selected.push(self.visible[self.cursor]);
         }
@@ -188,11 +197,23 @@ impl Listing {
     }
 
     pub fn select_all(&mut self) {
+        self.cursor_hidden = false;
         self.selected = self.visible.clone();
     }
 
     pub fn clear_selection(&mut self) {
         self.selected.clear();
+    }
+
+    /// Blank-space click: drop the selection and the cursor highlight too.
+    pub fn deselect_all(&mut self) {
+        self.selected.clear();
+        self.cursor_hidden = true;
+    }
+
+    /// The cursor row, unless a blank click has hidden it.
+    pub fn visible_cursor(&self) -> Option<usize> {
+        (!self.cursor_hidden).then_some(self.cursor)
     }
 
     /// The status line: item counts, folder counts and the selection's byte size.
@@ -217,9 +238,15 @@ impl Listing {
             .filter(|entry| entry.is_dir() && (self.show_hidden || !is_hidden(&entry.name)))
             .count();
         let mut status = if visible == total {
-            format!("{total} items · {dirs} folders")
+            trf(
+                "{} items · {} folders",
+                &[&total.to_string(), &dirs.to_string()],
+            )
         } else {
-            format!("{visible}/{total} items · {dirs} folders")
+            trf(
+                "{}/{} items · {} folders",
+                &[&visible.to_string(), &total.to_string(), &dirs.to_string()],
+            )
         };
         if !self.selected.is_empty() {
             let bytes: u64 = self
@@ -229,10 +256,12 @@ impl Listing {
                 .filter(|entry| !entry.is_dir())
                 .map(|entry| entry.size)
                 .sum();
-            status.push_str(&format!(
+            status.push_str(&trf(
                 " · {} selected ({})",
-                self.selected.len(),
-                vfs_core::entry::format_size(bytes)
+                &[
+                    &self.selected.len().to_string(),
+                    &vfs_core::entry::format_size(bytes),
+                ],
             ));
         }
         status
@@ -315,6 +344,10 @@ pub struct Place {
     pub label: String,
     pub path: PathBuf,
     pub icon: &'static str,
+    /// A starred file: clicking reveals it in its folder instead of entering it.
+    pub is_file: bool,
+    /// One the user starred (as opposed to a built-in place): it has its own menu.
+    pub starred: bool,
 }
 
 fn place(label: impl Into<String>, path: impl Into<PathBuf>, icon: &'static str) -> Place {
@@ -322,6 +355,8 @@ fn place(label: impl Into<String>, path: impl Into<PathBuf>, icon: &'static str)
         label: label.into(),
         path: path.into(),
         icon,
+        is_file: false,
+        starred: false,
     }
 }
 
@@ -350,18 +385,105 @@ pub fn location_places() -> Vec<Place> {
     vec![place("Macintosh HD", "/", crate::icons::DISK)]
 }
 
-/// Sidebar "Recent" entries: the newest visited folders that are not already a
-/// favorite and are not the disk root.
-pub fn recent_places(recents: &[PathBuf], favorites: &[Place], limit: usize) -> Vec<Place> {
-    recents
+/// A file or folder the user starred. Whether it is a folder is remembered so the
+/// sidebar can pick an icon and a click action without touching the disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Favorite {
+    pub path: PathBuf,
+    pub is_dir: bool,
+}
+
+/// Settings key the starred list is stored under.
+pub const FAVORITES_KEY: &str = "favorites";
+
+pub fn favorites_to_json(favorites: &[Favorite]) -> String {
+    serde_json::Value::Array(
+        favorites
+            .iter()
+            .map(|favorite| {
+                serde_json::json!({
+                    "path": favorite.path.to_string_lossy(),
+                    "dir": favorite.is_dir,
+                })
+            })
+            .collect(),
+    )
+    .to_string()
+}
+
+/// Read the stored list. Anything unreadable counts as "nothing starred": a damaged
+/// value must not stop the app from starting. Duplicates are dropped.
+pub fn favorites_from_json(text: &str) -> Vec<Favorite> {
+    let Ok(serde_json::Value::Array(items)) = serde_json::from_str::<serde_json::Value>(text)
+    else {
+        return Vec::new();
+    };
+    let mut out: Vec<Favorite> = Vec::new();
+    for item in items {
+        let Some(path) = item
+            .get("path")
+            .and_then(|value| value.as_str())
+            .filter(|path| !path.is_empty())
+        else {
+            continue;
+        };
+        let path = PathBuf::from(path);
+        if out.iter().any(|existing| existing.path == path) {
+            continue;
+        }
+        let is_dir = item
+            .get("dir")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(true);
+        out.push(Favorite { path, is_dir });
+    }
+    out
+}
+
+pub fn is_favorite(favorites: &[Favorite], path: &std::path::Path) -> bool {
+    favorites.iter().any(|favorite| favorite.path == path)
+}
+
+/// Star `favorite`, or unstar it when it already is. Returns whether it is starred
+/// afterwards.
+pub fn toggle_favorite(favorites: &mut Vec<Favorite>, favorite: Favorite) -> bool {
+    match favorites
         .iter()
-        .filter(|path| path.parent().is_some())
-        .filter(|path| !favorites.iter().any(|place| &place.path == *path))
-        .filter_map(|path| {
-            let label = path.file_name()?.to_string_lossy().into_owned();
-            Some(place(label, path.clone(), crate::icons::FOLDER))
+        .position(|existing| existing.path == favorite.path)
+    {
+        Some(index) => {
+            favorites.remove(index);
+            false
+        }
+        None => {
+            favorites.push(favorite);
+            true
+        }
+    }
+}
+
+/// The sidebar rows for starred items, skipping any that duplicate a built-in place.
+pub fn favorite_rows(favorites: &[Favorite], builtin: &[Place]) -> Vec<Place> {
+    favorites
+        .iter()
+        .filter(|favorite| !builtin.iter().any(|place| place.path == favorite.path))
+        .map(|favorite| {
+            let label = favorite
+                .path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| favorite.path.to_string_lossy().into_owned());
+            let icon = if favorite.is_dir {
+                crate::icons::FOLDER
+            } else {
+                crate::icons::FILE
+            };
+            Place {
+                is_file: !favorite.is_dir,
+                starred: true,
+                ..place(label, favorite.path.clone(), icon)
+            }
         })
-        .take(limit)
         .collect()
 }
 
@@ -404,23 +526,61 @@ mod tests {
         assert_eq!(places[0].path, PathBuf::from("/"));
     }
 
+    fn fav(path: &str, is_dir: bool) -> Favorite {
+        Favorite {
+            path: PathBuf::from(path),
+            is_dir,
+        }
+    }
+
     #[test]
-    fn recent_places_skip_favorites_the_root_and_respect_the_limit() {
-        let favorites = favorite_places(std::path::Path::new("/Users/me"));
-        let recents: Vec<PathBuf> = [
-            "/Users/me/Downloads",
-            "/",
-            "/Users/me/code/veloce",
-            "/Users/me/code",
-            "/tmp/a",
-        ]
-        .iter()
-        .map(PathBuf::from)
-        .collect();
-        let places = recent_places(&recents, &favorites, 2);
-        let labels: Vec<&str> = places.iter().map(|p| p.label.as_str()).collect();
-        assert_eq!(labels, ["veloce", "code"]);
-        assert!(recent_places(&[], &favorites, 5).is_empty());
+    fn favorites_survive_a_json_round_trip_with_their_kind() {
+        let list = vec![
+            fav("/Users/me/code", true),
+            fav("/Users/me/notes.md", false),
+        ];
+        assert_eq!(favorites_from_json(&favorites_to_json(&list)), list);
+    }
+
+    #[test]
+    fn damaged_favorites_load_as_empty_or_skip_bad_rows() {
+        assert!(favorites_from_json("not json").is_empty());
+        assert!(favorites_from_json("{}").is_empty());
+        assert!(favorites_from_json("").is_empty());
+        let loaded = favorites_from_json(
+            r#"[{"path":"/a"},{"nope":1},{"path":""},{"path":"/a","dir":false},{"path":"/b","dir":false}]"#,
+        );
+        assert_eq!(loaded, [fav("/a", true), fav("/b", false)]);
+    }
+
+    #[test]
+    fn toggling_stars_then_unstars() {
+        let mut list = Vec::new();
+        assert!(toggle_favorite(&mut list, fav("/a", true)));
+        assert!(toggle_favorite(&mut list, fav("/b", false)));
+        assert!(is_favorite(&list, std::path::Path::new("/a")));
+        assert!(!toggle_favorite(&mut list, fav("/a", true)));
+        assert!(!is_favorite(&list, std::path::Path::new("/a")));
+        assert_eq!(list, [fav("/b", false)]);
+    }
+
+    #[test]
+    fn favorite_rows_label_files_and_folders_and_skip_builtins() {
+        let builtin = favorite_places(std::path::Path::new("/Users/me"));
+        let rows = favorite_rows(
+            &[
+                fav("/Users/me/Downloads", true),
+                fav("/Users/me/code", true),
+                fav("/Users/me/todo.txt", false),
+            ],
+            &builtin,
+        );
+        let labels: Vec<&str> = rows.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, ["code", "todo.txt"]);
+        assert!(!rows[0].is_file);
+        assert!(rows[1].is_file);
+        assert!(rows.iter().all(|row| row.starred));
+        assert!(builtin.iter().all(|place| !place.starred));
     }
 
     #[test]
@@ -609,6 +769,21 @@ mod tests {
 
         assert_eq!(listing.entries.len(), 3);
         assert_eq!(listing.cursor_entry().unwrap().name, "aaa");
+    }
+
+    #[test]
+    fn blank_click_leaves_nothing_selected_until_the_next_move() {
+        let mut listing = listing();
+        listing.set_cursor(1, false);
+        listing.deselect_all();
+        assert!(listing.selected.is_empty());
+        assert!(listing.visible_cursor().is_none());
+        assert!(listing.cursor_entry().is_none());
+        assert!(listing.selection_or_cursor().is_empty());
+
+        listing.move_cursor(1, false);
+        assert_eq!(listing.visible_cursor(), Some(2));
+        assert_eq!(listing.selection_or_cursor().len(), 1);
     }
 
     #[test]

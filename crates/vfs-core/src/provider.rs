@@ -86,12 +86,16 @@ pub enum Capability {
 #[derive(Clone)]
 pub struct ProviderRegistry {
     providers: HashMap<ProtocolScheme, Arc<dyn VfsProvider>>,
+    /// Remote connections, keyed by scheme and saved-connection id: two S3 buckets
+    /// share a scheme but never a provider.
+    connections: HashMap<(ProtocolScheme, String), Arc<dyn VfsProvider>>,
 }
 
 impl ProviderRegistry {
     pub fn new() -> Self {
         Self {
             providers: HashMap::new(),
+            connections: HashMap::new(),
         }
     }
 
@@ -116,7 +120,36 @@ impl ProviderRegistry {
             })
     }
 
+    /// Mount a provider for one saved connection, replacing any earlier one.
+    pub fn register_connection(&mut self, id: impl Into<String>, provider: Arc<dyn VfsProvider>) {
+        self.connections
+            .insert((provider.scheme(), id.into()), provider);
+    }
+
+    /// Drop a connection, e.g. after it was edited or deleted.
+    pub fn remove_connection(&mut self, scheme: ProtocolScheme, id: &str) -> bool {
+        self.connections.remove(&(scheme, id.to_string())).is_some()
+    }
+
+    /// Keep only the connections `keep` approves; the rest are unmounted. Used when
+    /// the saved list changes, so a deleted connection (whose database id may later
+    /// be reused) cannot keep serving its old provider.
+    pub fn retain_connections(&mut self, mut keep: impl FnMut(ProtocolScheme, &str) -> bool) {
+        self.connections.retain(|(scheme, id), _| keep(*scheme, id));
+    }
+
+    pub fn has_connection(&self, scheme: ProtocolScheme, id: &str) -> bool {
+        self.connections.contains_key(&(scheme, id.to_string()))
+    }
+
     pub fn for_uri(&self, uri: &VfsUri) -> Result<Arc<dyn VfsProvider>> {
+        if let Some(id) = &uri.connection_id {
+            return self
+                .connections
+                .get(&(uri.scheme, id.clone()))
+                .cloned()
+                .ok_or_else(|| Error::Other(format!("Not connected: {uri}")));
+        }
         self.get(uri.scheme)
     }
 
@@ -170,6 +203,70 @@ mod tests {
                 registry.get(scheme).is_err(),
                 "{scheme} must not resolve before its provider is registered"
             );
+        }
+    }
+
+    #[test]
+    fn connection_uris_resolve_per_connection_not_per_scheme() {
+        let mut registry = ProviderRegistry::with_local();
+        let first: Arc<dyn VfsProvider> = Arc::new(FakeRemote);
+        registry.register_connection("1", first.clone());
+        let hit = VfsUri::remote(ProtocolScheme::S3, "1", "/a");
+        let miss = VfsUri::remote(ProtocolScheme::S3, "2", "/a");
+        assert!(Arc::ptr_eq(&registry.for_uri(&hit).unwrap(), &first));
+        let error = registry.for_uri(&miss).err().expect("unmounted connection");
+        assert!(error.to_string().contains("Not connected"), "{error}");
+        assert!(registry.has_connection(ProtocolScheme::S3, "1"));
+        assert!(registry.remove_connection(ProtocolScheme::S3, "1"));
+        assert!(!registry.remove_connection(ProtocolScheme::S3, "1"));
+        assert!(registry.for_uri(&hit).is_err());
+    }
+
+    #[test]
+    fn retain_connections_unmounts_the_rest() {
+        let mut registry = ProviderRegistry::new();
+        registry.register_connection("1", Arc::new(FakeRemote));
+        registry.register_connection("2", Arc::new(FakeRemote));
+        registry.retain_connections(|_, id| id == "2");
+        assert!(!registry.has_connection(ProtocolScheme::S3, "1"));
+        assert!(registry.has_connection(ProtocolScheme::S3, "2"));
+    }
+
+    struct FakeRemote;
+
+    #[async_trait]
+    impl VfsProvider for FakeRemote {
+        fn scheme(&self) -> ProtocolScheme {
+            ProtocolScheme::S3
+        }
+        async fn list_stream(&self, _: &VfsUri) -> Result<BoxStream<'static, Result<ListChunk>>> {
+            unimplemented!()
+        }
+        async fn stat(&self, _: &VfsUri) -> Result<FileEntry> {
+            unimplemented!()
+        }
+        async fn read_stream(
+            &self,
+            _: &VfsUri,
+            _: u64,
+            _: Option<u64>,
+        ) -> Result<BoxStream<'static, Result<Bytes>>> {
+            unimplemented!()
+        }
+        async fn write_stream(
+            &self,
+            _: &VfsUri,
+            _: BoxStream<'static, Result<Bytes>>,
+            _: Option<u64>,
+            _: Option<Box<dyn Fn(u64) + Send + Sync>>,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+        async fn rename(&self, _: &VfsUri, _: &VfsUri) -> Result<()> {
+            unimplemented!()
+        }
+        async fn delete(&self, _: &VfsUri, _: bool) -> Result<()> {
+            unimplemented!()
         }
     }
 

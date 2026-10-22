@@ -16,6 +16,7 @@ mod file_icons;
 #[rustfmt::skip]
 mod file_icons_data;
 mod history;
+mod i18n;
 mod icons;
 mod info;
 mod keymap;
@@ -27,6 +28,8 @@ mod path_query;
 mod persist;
 mod prefs;
 mod preview;
+mod remote;
+mod secrets;
 mod settings;
 mod settings_apply;
 mod settings_window;
@@ -79,14 +82,7 @@ fn main() {
         // rather than handled by a workspace.
         cx.on_action(|_: &actions::OpenSettings, cx| settings_window::open(cx));
         cx.on_action(|_: &actions::Quit, cx| cx.quit());
-        cx.set_menus(vec![gpui::Menu {
-            name: "Veloce".into(),
-            items: vec![
-                gpui::MenuItem::action("Settings…", actions::OpenSettings),
-                gpui::MenuItem::separator(),
-                gpui::MenuItem::action("Quit Veloce", actions::Quit),
-            ],
-        }]);
+        settings_apply::install_menus(cx);
         // Closing the main window ends the app even if Settings is still open.
         cx.on_window_closed(|cx| {
             if cx.windows().is_empty() {
