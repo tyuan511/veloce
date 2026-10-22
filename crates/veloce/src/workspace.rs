@@ -867,6 +867,16 @@ impl Workspace {
                     }
                 });
             }
+            PaletteChoice::Goto { path, is_dir } => {
+                let pane = self.focused_pane();
+                pane.update(cx, |pane, cx| {
+                    if is_dir {
+                        pane.navigate_to(VfsUri::local(&path), cx);
+                    } else {
+                        pane.reveal_file(&path, cx);
+                    }
+                });
+            }
             PaletteChoice::Command(id) => {
                 let pane = self.focused_pane();
                 match id {
@@ -1414,6 +1424,10 @@ impl Workspace {
                     .update(cx, |palette, cx| palette.move_cursor(delta, cx));
                 cx.stop_propagation();
             }
+            "tab" if palette_open => {
+                self.palette.update(cx, |palette, cx| palette.complete(cx));
+                cx.stop_propagation();
+            }
             "enter" if palette_open => {
                 let choice = self.palette.read(cx).activated();
                 self.palette.update(cx, |palette, cx| palette.close(cx));
@@ -1450,6 +1464,7 @@ impl Render for Workspace {
         let split = self.split;
         let left_pane = self.left.update(cx, |pane, cx| {
             pane.avail_width = left_width;
+            pane.show_folder_name = split;
             pane.render_pane(left_focused, window, cx)
         });
         // The left pane takes its share as a fixed width; the right one flexes.
@@ -1467,6 +1482,7 @@ impl Render for Workspace {
         let right = split.then(|| {
             self.right.update(cx, |pane, cx| {
                 pane.avail_width = right_width;
+                pane.show_folder_name = true;
                 pane.render_pane(right_focused, window, cx)
             })
         });

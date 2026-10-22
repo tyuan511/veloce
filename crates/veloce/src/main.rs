@@ -21,6 +21,7 @@ mod listing;
 mod open_with;
 mod palette;
 mod pane;
+mod path_query;
 mod persist;
 mod prefs;
 mod preview;

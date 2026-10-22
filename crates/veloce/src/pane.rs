@@ -36,9 +36,7 @@ use crate::{
     file_icons,
     history::History,
     icons,
-    listing::{
-        Listing, breadcrumbs, cycle_index, index_after_close, parse_path_input, visible_crumbs,
-    },
+    listing::{Listing, cycle_index, index_after_close},
     persist::Persist,
     text_input::{TextInput, TextInputEvent},
     theme::{self, ROW_HEIGHT},
@@ -165,6 +163,8 @@ pub struct Pane {
     pub view: ViewMode,
     /// Width the workspace grants this pane; drives the icon grid's column count.
     pub avail_width: f32,
+    /// Name the folder in the status bar (set when two panes are showing).
+    pub show_folder_name: bool,
     pub grid_cols: usize,
     /// Side-column folder contents (columns view), loaded lazily.
     pub columns: HashMap<PathBuf, Arc<Vec<FileEntry>>>,
@@ -182,9 +182,6 @@ pub struct Pane {
     pub focus_handle: FocusHandle,
     pub loading: bool,
     pub error: Option<String>,
-    /// `true` while the path bar shows an editable field.
-    pub editing_path: bool,
-    pub path_input: Entity<TextInput>,
     pub filter_input: Entity<TextInput>,
     pub listed_from: Option<VfsUri>,
     pub status: String,
@@ -207,33 +204,19 @@ impl Focusable for Pane {
 
 impl Pane {
     pub fn new(side: PaneSide, uri: VfsUri, services: Services, cx: &mut Context<Self>) -> Self {
-        let path_input = cx.new(|cx| TextInput::new("Path", cx).monospace());
         let filter_input = cx.new(|cx| TextInput::new("Filter this folder…", cx));
 
-        let subscriptions = vec![
-            cx.subscribe(
-                &path_input,
-                |pane, _, event: &TextInputEvent, cx| match event {
-                    TextInputEvent::Submit(_) => pane.commit_path_edit(cx),
-                    TextInputEvent::Cancel => {
-                        pane.editing_path = false;
-                        cx.notify();
-                    }
-                    TextInputEvent::Change(_) => {}
-                },
-            ),
-            cx.subscribe(
-                &filter_input,
-                |pane, _, event: &TextInputEvent, cx| match event {
-                    TextInputEvent::Change(text) => pane.set_filter_query(text.clone(), cx),
-                    TextInputEvent::Submit(_) => {
-                        // Enter in the filter keeps the filtered list, closes the caret.
-                        cx.notify();
-                    }
-                    TextInputEvent::Cancel => pane.stop_filter(cx),
-                },
-            ),
-        ];
+        let subscriptions = vec![cx.subscribe(
+            &filter_input,
+            |pane, _, event: &TextInputEvent, cx| match event {
+                TextInputEvent::Change(text) => pane.set_filter_query(text.clone(), cx),
+                TextInputEvent::Submit(_) => {
+                    // Enter in the filter keeps the filtered list, closes the caret.
+                    cx.notify();
+                }
+                TextInputEvent::Cancel => pane.stop_filter(cx),
+            },
+        )];
 
         let title = uri.file_name().to_string();
         Self {
@@ -250,6 +233,7 @@ impl Pane {
             filter_active: false,
             view: ViewMode::default(),
             avail_width: 800.0,
+            show_folder_name: false,
             grid_cols: 1,
             columns: HashMap::new(),
             thumbs: HashMap::new(),
@@ -264,8 +248,6 @@ impl Pane {
             focus_handle: cx.focus_handle(),
             loading: false,
             error: None,
-            editing_path: false,
-            path_input,
             filter_input,
             listed_from: None,
             status: String::new(),
@@ -407,6 +389,24 @@ impl Pane {
     pub fn navigate_to(&mut self, uri: VfsUri, cx: &mut Context<Self>) {
         self.tabs[self.active_tab].history.push(uri.clone());
         self.show_uri(uri, cx);
+    }
+
+    /// Go to the folder containing `path` and put the cursor on it.
+    pub fn reveal_file(&mut self, path: &std::path::Path, cx: &mut Context<Self>) {
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        let target = VfsUri::local(path);
+        let parent = VfsUri::local(parent);
+        if self.current_uri() == parent {
+            if let Some(position) = self.listing.position_of(&target) {
+                self.set_cursor_position(position, false, cx);
+            }
+            return;
+        }
+        self.navigate_to(parent, cx);
+        // Applied when the new listing lands.
+        self.pending_focus = Some(target);
     }
 
     pub fn can_go_back(&self) -> bool {
@@ -716,27 +716,6 @@ impl Pane {
             self.recompute_visible();
             self.refresh_status();
             cx.notify();
-        }
-    }
-
-    // ---- path editing -----------------------------------------------------
-
-    pub fn begin_path_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let path = self.current_uri().path.clone();
-        self.editing_path = true;
-        self.path_input
-            .update(cx, |input, cx| input.set_content(path, cx));
-        let handle = self.path_input.read(cx).focus_handle(cx);
-        window.focus(&handle);
-        cx.notify();
-    }
-
-    pub fn commit_path_edit(&mut self, cx: &mut Context<Self>) {
-        self.editing_path = false;
-        let value = self.path_input.read(cx).content().to_string();
-        match parse_path_input(&value, &self.current_uri()) {
-            Some(uri) => self.navigate_to(uri, cx),
-            None => cx.notify(),
         }
     }
 
@@ -1112,16 +1091,15 @@ impl Pane {
     pub fn render_pane(
         &mut self,
         focused: bool,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         // Finder only shows the tab strip once there is more than one tab.
         let tabs = (self.tabs.len() > 1).then(|| self.render_tabs(focused, cx));
-        let path_bar = self.render_path_bar(focused, window, cx);
         let filter_bar = self.filter_active.then(|| self.render_filter_bar(cx));
         let header = (self.view == ViewMode::List).then(|| self.render_header(cx));
         let body = self.render_body(focused, cx);
-        let status = self.render_status();
+        let status = self.render_status(self.show_folder_name);
         let entity = cx.entity();
         let body_area = div()
             .flex()
@@ -1187,7 +1165,6 @@ impl Pane {
                 Hsla::transparent_black()
             })
             .children(tabs)
-            .child(path_bar)
             .children(filter_bar)
             .child(content)
             .child(status)
@@ -1307,200 +1284,6 @@ impl Pane {
         )
         .child(div().flex_1())
         .into_any_element()
-    }
-
-    fn render_path_bar(
-        &mut self,
-        focused: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let can_go_up = !self.current_uri().is_root();
-        let up = {
-            let entity = cx.entity();
-            div()
-                .id(gpui::ElementId::Name(
-                    format!("pane{}-up", self.side.index()).into(),
-                ))
-                .flex()
-                .items_center()
-                .justify_center()
-                .w(px(21.))
-                .h(px(20.))
-                .rounded_sm()
-                .text_color(if can_go_up {
-                    theme::text_muted()
-                } else {
-                    theme::text_faint()
-                })
-                .when(can_go_up, |this| {
-                    this.hover(|this| this.bg(theme::bg_hover()).text_color(theme::text()))
-                        .on_click(move |_, _, cx| {
-                            entity.update(cx, |pane, cx| pane.go_parent(cx));
-                        })
-                })
-                .child(
-                    svg()
-                        .path(icons::ARROW_UP)
-                        .w(px(11.))
-                        .h(px(11.))
-                        .text_color(if can_go_up {
-                            theme::text_muted()
-                        } else {
-                            theme::text_faint()
-                        }),
-                )
-        };
-
-        let path_area: AnyElement = if self.editing_path {
-            div()
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .items_center()
-                .px_2()
-                .h(px(21.))
-                .rounded_sm()
-                .bg(theme::bg())
-                .border_1()
-                .border_color(theme::accent_dim())
-                .text_color(theme::text())
-                .child(self.path_input.clone())
-                .into_any_element()
-        } else {
-            let path_text = self.current_uri().path.clone();
-            let crumbs = breadcrumbs(&path_text);
-            let (shown, cut) = visible_crumbs(&crumbs, 4);
-            let last = shown.len() - 1;
-            let side = self.side.index();
-
-            let mut trail = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_0p5()
-                .min_w_0()
-                .overflow_hidden();
-            if cut {
-                trail = trail.child(div().text_xs().text_color(theme::text_faint()).child("… ›"));
-            }
-            for (index, crumb) in shown.iter().enumerate() {
-                let entity = cx.entity();
-                let target = crumb.path.clone();
-                let is_last = index == last;
-                if index > 0 {
-                    trail = trail.child(
-                        svg()
-                            .path(icons::CHEVRON_RIGHT)
-                            .w(px(9.))
-                            .h(px(9.))
-                            .flex_shrink_0()
-                            .text_color(theme::text_faint()),
-                    );
-                }
-                trail = trail.child(
-                    div()
-                        .id(gpui::ElementId::Name(
-                            format!("pane{side}-crumb{index}").into(),
-                        ))
-                        .px_1()
-                        .h(px(20.))
-                        .flex()
-                        .items_center()
-                        .flex_shrink_0()
-                        .rounded_sm()
-                        .text_sm()
-                        .text_color(if is_last {
-                            theme::text()
-                        } else {
-                            theme::text_muted()
-                        })
-                        .when(is_last, |this| this.font_weight(gpui::FontWeight::MEDIUM))
-                        .hover(|this| this.bg(theme::bg_hover()).text_color(theme::text()))
-                        .on_click(move |_, _, cx| {
-                            entity.update(cx, |pane, cx| {
-                                pane.navigate_to(VfsUri::local(&target), cx)
-                            });
-                        })
-                        .child(crumb.label.clone()),
-                );
-            }
-
-            // The empty space after the trail opens the editable path, like
-            // clicking beside the breadcrumb in Nautilus / Explorer.
-            let entity = cx.entity();
-            div()
-                .id(gpui::ElementId::Name(format!("pane{side}-path").into()))
-                .flex_1()
-                .min_w_0()
-                .flex()
-                .flex_row()
-                .items_center()
-                .h(px(24.))
-                .on_click(move |_, window, cx| {
-                    entity.update(cx, |pane, cx| pane.begin_path_edit(window, cx));
-                })
-                .child(trail)
-                .into_any_element()
-        };
-
-        let filter_button = {
-            let entity = cx.entity();
-            let active = self.filter_active;
-            div()
-                .id(gpui::ElementId::Name(
-                    format!("pane{}-filter", self.side.index()).into(),
-                ))
-                .flex()
-                .items_center()
-                .justify_center()
-                .w(px(21.))
-                .h(px(20.))
-                .rounded_sm()
-                .text_color(if active {
-                    theme::accent()
-                } else {
-                    theme::text_faint()
-                })
-                .hover(|this| this.bg(theme::bg_hover()).text_color(theme::text()))
-                .on_click(move |_, window, cx| {
-                    entity.update(cx, |pane, cx| {
-                        if pane.filter_active {
-                            pane.stop_filter(cx);
-                        } else {
-                            pane.start_filter(window, cx);
-                        }
-                    });
-                })
-                .child(
-                    svg()
-                        .path(icons::SEARCH)
-                        .w(px(11.))
-                        .h(px(11.))
-                        .text_color(if active {
-                            theme::accent()
-                        } else {
-                            theme::text_faint()
-                        }),
-                )
-        };
-
-        let _ = (focused, window);
-        div()
-            .flex()
-            .flex_row()
-            .items_center()
-            .gap_1()
-            .h(px(34.0))
-            .flex_shrink_0()
-            .px_2()
-            .bg(theme::bg_pane())
-            .border_b_1()
-            .border_color(theme::border_soft())
-            .child(up)
-            .child(path_area)
-            .child(filter_button)
-            .into_any_element()
     }
 
     fn render_filter_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -1700,7 +1483,10 @@ impl Pane {
             .into_any_element()
     }
 
-    fn render_status(&self) -> AnyElement {
+    /// `show_folder`: name the folder too, since with two panes there is no other
+    /// hint of which one this is.
+    fn render_status(&self, show_folder: bool) -> AnyElement {
+        let folder = self.current_uri().file_name().to_string();
         div()
             .flex()
             .flex_row()
@@ -1715,6 +1501,15 @@ impl Pane {
             .border_color(theme::border_soft())
             .text_xs()
             .text_color(theme::text_faint())
+            .when(show_folder && !folder.is_empty(), |this| {
+                this.child(
+                    div()
+                        .flex_shrink_0()
+                        .font_weight(gpui::FontWeight::MEDIUM)
+                        .text_color(theme::text_muted())
+                        .child(folder),
+                )
+            })
             .child(div().truncate().min_w_0().child(self.status.clone()))
             .when(self.filter.is_active(), |this| {
                 this.child(

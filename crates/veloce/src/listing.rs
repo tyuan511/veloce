@@ -309,70 +309,6 @@ pub fn expand_home(value: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-/// Turn whatever the user typed into the path bar into a uri.
-///
-/// Accepts `file://` / `s3://...` style uris, absolute paths, `~` paths and
-/// relative names (resolved against the current directory). Returns `None` for
-/// blank input so the caller can just ignore an aborted edit.
-pub fn parse_path_input(value: &str, current: &VfsUri) -> Option<VfsUri> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-    if let Some(uri) = VfsUri::parse(value) {
-        return Some(uri);
-    }
-    let path = PathBuf::from(value);
-    let resolved = if path.is_absolute() || value.starts_with('~') {
-        expand_home(value)
-    } else {
-        current
-            .as_local_path()
-            .unwrap_or_else(|| PathBuf::from("/"))
-            .join(&path)
-    };
-    Some(VfsUri::local(resolved))
-}
-
-/// One clickable segment of the breadcrumb: what to show and where it leads.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Crumb {
-    pub label: String,
-    pub path: String,
-}
-
-/// Split an absolute path into breadcrumb segments, root first.
-///
-/// The root is labelled `/` so the trail never starts empty; `trailing` and
-/// duplicate slashes are ignored because they carry no navigation meaning.
-pub fn breadcrumbs(path: &str) -> Vec<Crumb> {
-    let mut crumbs = vec![Crumb {
-        label: "/".to_string(),
-        path: "/".to_string(),
-    }];
-    let mut accumulated = String::new();
-    for part in path.split('/').filter(|part| !part.is_empty()) {
-        accumulated.push('/');
-        accumulated.push_str(part);
-        crumbs.push(Crumb {
-            label: part.to_string(),
-            path: accumulated.clone(),
-        });
-    }
-    crumbs
-}
-
-/// Keep only the trailing `max` crumbs so a deep path still fits the toolbar.
-/// Returns the visible slice and whether anything was cut off on the left.
-pub fn visible_crumbs(crumbs: &[Crumb], max: usize) -> (&[Crumb], bool) {
-    let max = max.max(1);
-    if crumbs.len() <= max {
-        (crumbs, false)
-    } else {
-        (&crumbs[crumbs.len() - max..], true)
-    }
-}
-
 /// A fixed shortcut in the sidebar.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Place {
@@ -441,48 +377,6 @@ pub fn place_is_current(place: &Place, current: &str) -> bool {
 mod tests {
     use super::*;
     use vfs_core::{FileKind, SortKey, filter::FilterMode};
-
-    #[test]
-    fn breadcrumbs_start_at_root_and_accumulate_paths() {
-        let crumbs = breadcrumbs("/Users/me/code");
-        let labels: Vec<&str> = crumbs.iter().map(|c| c.label.as_str()).collect();
-        assert_eq!(labels, ["/", "Users", "me", "code"]);
-        assert_eq!(crumbs[3].path, "/Users/me/code");
-        assert_eq!(crumbs[1].path, "/Users");
-    }
-
-    #[test]
-    fn breadcrumbs_of_root_is_just_root() {
-        assert_eq!(breadcrumbs("/").len(), 1);
-        assert_eq!(breadcrumbs("").len(), 1);
-    }
-
-    #[test]
-    fn breadcrumbs_ignore_duplicate_and_trailing_slashes() {
-        let crumbs = breadcrumbs("//a///b/");
-        let paths: Vec<&str> = crumbs.iter().map(|c| c.path.as_str()).collect();
-        assert_eq!(paths, ["/", "/a", "/a/b"]);
-    }
-
-    #[test]
-    fn visible_crumbs_keeps_the_tail_and_reports_truncation() {
-        let crumbs = breadcrumbs("/a/b/c/d");
-        let (tail, cut) = visible_crumbs(&crumbs, 2);
-        assert!(cut);
-        assert_eq!(tail.len(), 2);
-        assert_eq!(tail[1].label, "d");
-
-        let (all, cut) = visible_crumbs(&crumbs, 10);
-        assert!(!cut);
-        assert_eq!(all.len(), crumbs.len());
-    }
-
-    #[test]
-    fn visible_crumbs_never_returns_nothing() {
-        let crumbs = breadcrumbs("/a/b");
-        let (tail, _) = visible_crumbs(&crumbs, 0);
-        assert_eq!(tail.len(), 1);
-    }
 
     #[test]
     fn favorites_follow_finder_and_end_with_the_home_folder() {
@@ -882,29 +776,6 @@ mod tests {
     }
 
     // ---- path input -------------------------------------------------------
-
-    #[test]
-    fn parse_path_input_accepts_uris_paths_and_relative_names() {
-        let current = VfsUri::local("/tmp");
-
-        let uri = parse_path_input("s3://bucket/a", &current).unwrap();
-        assert_eq!(uri.to_string(), "s3://bucket/a");
-
-        let absolute = parse_path_input("/usr/local", &current).unwrap();
-        assert_eq!(absolute.path, "/usr/local");
-
-        let relative = parse_path_input("nested/dir", &current).unwrap();
-        assert_eq!(relative.path, "/tmp/nested/dir");
-
-        assert!(parse_path_input("   ", &current).is_none());
-    }
-
-    #[test]
-    fn parse_path_input_resolves_relative_against_the_current_dir() {
-        let current = VfsUri::local("/Users/me/projects");
-        let uri = parse_path_input("../other", &current).unwrap();
-        assert_eq!(uri.path, "/Users/me/other", "dot segments are resolved");
-    }
 
     #[test]
     fn expand_home_resolves_tilde() {

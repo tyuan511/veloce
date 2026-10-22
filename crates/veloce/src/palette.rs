@@ -24,6 +24,7 @@ use vfs_core::{
 
 use crate::{
     icons,
+    path_query::{self, PathQuery},
     text_input::{TextInput, TextInputEvent},
     theme,
 };
@@ -126,6 +127,13 @@ pub struct Palette {
     /// Command rows filtered by the current query.
     pub commands: Vec<&'static Command>,
     query: String,
+    /// The text is a path: rows complete it instead of fuzzy-searching names.
+    pub path_mode: bool,
+    /// What the typed path resolved to (while `path_mode`).
+    path_query: Option<PathQuery>,
+    /// Why the typed folder could not be listed, if it could not.
+    pub path_error: Option<String>,
+    home: PathBuf,
     cancel: Arc<AtomicBool>,
     focus_handle: gpui::FocusHandle,
     _subscription: gpui::Subscription,
@@ -139,7 +147,7 @@ impl gpui::Focusable for Palette {
 
 impl Palette {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let input = cx.new(|cx| TextInput::new("Search files, or type a command…", cx));
+        let input = cx.new(|cx| TextInput::new("Search files, or type a path (~/code)…", cx));
         let subscription = cx.subscribe(
             &input,
             |palette, _, event: &TextInputEvent, cx| match event {
@@ -158,6 +166,12 @@ impl Palette {
             searching: false,
             commands: COMMANDS.iter().collect(),
             query: String::new(),
+            path_mode: false,
+            path_query: None,
+            path_error: None,
+            home: std::env::var_os("HOME")
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("/")),
             cancel: Arc::new(AtomicBool::new(false)),
             focus_handle: cx.focus_handle(),
             _subscription: subscription,
@@ -177,6 +191,9 @@ impl Palette {
         self.hits.clear();
         self.cursor = 0;
         self.query.clear();
+        self.path_mode = false;
+        self.path_query = None;
+        self.path_error = None;
         self.commands = COMMANDS.iter().collect();
         self.input.update(cx, |input, cx| input.clear(cx));
         let handle = self.input.read(cx).focus_handle(cx);
@@ -191,7 +208,7 @@ impl Palette {
         cx.notify();
     }
 
-    fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
+    pub(crate) fn set_query(&mut self, query: String, cx: &mut Context<Self>) {
         self.query = query.clone();
         self.cursor = 0;
         match self.mode {
@@ -205,8 +222,73 @@ impl Palette {
                     .collect();
                 cx.notify();
             }
-            PaletteMode::Files => self.start_search(query, cx),
+            PaletteMode::Files if path_query::is_path_query(&query) => {
+                self.start_path_listing(query, cx)
+            }
+            PaletteMode::Files => {
+                self.path_mode = false;
+                self.path_query = None;
+                self.path_error = None;
+                self.start_search(query, cx)
+            }
         }
+    }
+
+    /// Path mode: list the folder the typed path points into, filtered by what
+    /// has been typed after the last `/`. The directory read runs off the UI
+    /// thread, and a newer keystroke makes an older answer stale.
+    fn start_path_listing(&mut self, query: String, cx: &mut Context<Self>) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.hits.clear();
+        self.path_mode = true;
+        self.path_error = None;
+        let base = self.root.clone().unwrap_or_else(|| self.home.clone());
+        let Some(parsed) = path_query::parse(&query, &base, &self.home) else {
+            self.path_query = None;
+            self.searching = false;
+            cx.notify();
+            return;
+        };
+        self.path_query = Some(parsed.clone());
+        self.searching = true;
+        cx.notify();
+        cx.spawn(async move |this, cx| {
+            let listing = parsed.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { path_query::list_matches(&listing) })
+                .await;
+            this.update(cx, |palette, cx| {
+                if palette.query != query {
+                    return;
+                }
+                palette.searching = false;
+                match result {
+                    Ok(hits) => palette.hits = hits,
+                    Err(_) => {
+                        palette.hits.clear();
+                        palette.path_error = Some("No such folder".to_string());
+                    }
+                }
+                palette.cursor = 0;
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Tab: complete the box to the highlighted entry, ready for the next level.
+    pub fn complete(&mut self, cx: &mut Context<Self>) {
+        if !self.path_mode {
+            return;
+        }
+        let Some(hit) = self.hits.get(self.cursor) else {
+            return;
+        };
+        let text = path_query::completion(hit);
+        self.input
+            .update(cx, |input, cx| input.set_content(text, cx));
     }
 
     fn start_search(&mut self, query: String, cx: &mut Context<Self>) {
@@ -295,6 +377,21 @@ impl Palette {
     /// What the current row means; the workspace turns this into a real action.
     pub fn activated(&self) -> Option<PaletteChoice> {
         match self.mode {
+            PaletteMode::Files if self.path_mode => match self.hits.get(self.cursor) {
+                Some(hit) => Some(PaletteChoice::Goto {
+                    path: hit.path.clone(),
+                    is_dir: hit.is_dir,
+                }),
+                // A complete folder path with nothing left to complete.
+                None => self
+                    .path_query
+                    .as_ref()
+                    .filter(|query| query.partial.is_empty() && self.path_error.is_none())
+                    .map(|query| PaletteChoice::Goto {
+                        path: query.dir.clone(),
+                        is_dir: true,
+                    }),
+            },
             PaletteMode::Files => self
                 .hits
                 .get(self.cursor)
@@ -318,6 +415,11 @@ impl Palette {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PaletteChoice {
     File(PathBuf),
+    /// A typed or completed path: go there (a folder) or show it (a file).
+    Goto {
+        path: PathBuf,
+        is_dir: bool,
+    },
     Command(CommandId),
 }
 
@@ -337,6 +439,7 @@ impl Render for Palette {
 fn render_palette(palette: &mut Palette, cx: &mut Context<Palette>) -> AnyElement {
     let entity = cx.entity();
     let title = match palette.mode {
+        PaletteMode::Files if palette.path_mode => "Go to folder",
         PaletteMode::Files => "Jump to file",
         PaletteMode::Commands => "Run command",
     };
@@ -349,8 +452,12 @@ fn render_palette(palette: &mut Palette, cx: &mut Context<Palette>) -> AnyElemen
                     .text_color(theme::text_faint())
                     .child(if palette.searching {
                         "Searching…".to_string()
+                    } else if let Some(error) = &palette.path_error {
+                        error.clone()
+                    } else if palette.path_mode {
+                        "Nothing here matches".to_string()
                     } else if palette.query.is_empty() {
-                        "Type to search this folder".to_string()
+                        "Type to search this folder, or a path like ~/Downloads".to_string()
                     } else {
                         "No matches".to_string()
                     })

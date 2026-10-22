@@ -79,8 +79,6 @@ pub struct TextInput {
     last_layout: Option<ShapedLine>,
     last_bounds: Option<Bounds<Pixels>>,
     is_selecting: bool,
-    /// Monospace fields (paths) look wrong in the UI font.
-    monospace: bool,
 }
 
 impl EventEmitter<TextInputEvent> for TextInput {}
@@ -97,17 +95,7 @@ impl TextInput {
             last_layout: None,
             last_bounds: None,
             is_selecting: false,
-            monospace: false,
         }
-    }
-
-    pub fn monospace(mut self) -> Self {
-        self.monospace = true;
-        self
-    }
-
-    pub fn content(&self) -> &str {
-        &self.content
     }
 
     pub fn set_content(&mut self, content: impl Into<SharedString>, cx: &mut Context<Self>) {
@@ -663,9 +651,6 @@ impl Render for TextInput {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .line_height(px(18.))
             .text_size(px(12.5))
-            .when(self.monospace, |this| {
-                this.font_family(crate::theme::MONO_FAMILY)
-            })
             .child(FieldElement { input: cx.entity() })
     }
 }

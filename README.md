@@ -85,7 +85,7 @@ compile once at first launch.
 | `⌥⌘I` | toggle the preview panel (same as `space`) |
 | `⌃1` / `⌃2` | focus left / right pane |
 | `/` | filter this folder (fuzzy, live) |
-| `⌘P` | fuzzy jump to any file in the tree |
+| `⌘P` | search box: fuzzy jump to any file in the tree, **or type a path** (`~/code`, `/usr/lo`, `../x`) to go there; `tab` completes, `enter` goes |
 | `⌘⇧P` | command palette |
 | `⌘\` | show / hide the second pane (single pane by default) |
 | `tab` | switch pane (when split) |
@@ -148,7 +148,7 @@ Drag the dividers to resize the sidebar, the preview panel and, when split, the 
 ## Tests
 
 ```sh
-cargo test              # 431 tests, no GPU or window server needed
+cargo test              # 460 tests, no GPU or window server needed
 cargo test -p vfs-core  # 156 core tests
 ```
 
