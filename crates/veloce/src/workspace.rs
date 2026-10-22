@@ -66,8 +66,6 @@ pub(crate) struct InfoState {
     folder_bytes: Option<u64>,
 }
 
-const QUICK_LOOK_WIDTH: f32 = 720.0;
-
 /// The application root view.
 pub struct Workspace {
     pub left: Entity<Pane>,
@@ -130,7 +128,7 @@ impl Workspace {
             cx.new(|cx| Pane::new(PaneSide::Right, VfsUri::local(&start), services.clone(), cx));
 
         let preview = cx.new(PreviewView::new);
-        let quick_look = cx.new(|cx| PreviewView::with_width(QUICK_LOOK_WIDTH, cx));
+        let quick_look = cx.new(PreviewView::quick_look);
         let tasks = cx.new(|cx| TaskPanel::new(services.tasks.clone(), cx));
         let palette = cx.new(Palette::new);
 
@@ -1290,7 +1288,7 @@ impl Render for Workspace {
         let sidebar = self.render_sidebar(cx);
         let menu = self.render_context_menu(window, cx);
         let info = self.render_info(cx);
-        let quick_look = self.render_quick_look(window);
+        let quick_look = self.render_quick_look(window, cx);
 
         div()
             .key_context("Workspace")
@@ -1379,16 +1377,33 @@ impl Render for Workspace {
 }
 
 impl Workspace {
-    /// Quick Look: a large preview of the cursor entry, closed with Space or Esc.
-    fn render_quick_look(&mut self, window: &Window) -> Option<AnyElement> {
+    /// Quick Look: a floating window in Finder's style (title bar with a close
+    /// button, the file's name and kind, an Open button) over the dimmed list.
+    ///
+    /// Every child of the rounded card is transparent. GPUI clips overflow to a
+    /// rectangle, so any opaque child would poke out of the rounded corners.
+    fn render_quick_look(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if !self.quick_look_open {
             return None;
         }
+        let entry = self.focused_pane().read(cx).cursor_entry().cloned()?;
         let viewport = window.viewport_size();
-        let height = (f32::from(viewport.height) * 0.72).max(320.0);
+        let width = (f32::from(viewport.width) * 0.7).clamp(420.0, 980.0);
+        let height = (f32::from(viewport.height) * 0.78).max(320.0);
         let preview = self.quick_look.clone();
-        let entity = self.focus_handle.clone();
-        let _ = entity;
+        let close = cx.entity();
+        let backdrop = cx.entity();
+        let open = cx.entity();
+        let subtitle = {
+            let kind = crate::info::kind_label(&entry);
+            if entry.is_dir() {
+                kind
+            } else {
+                format!("{kind} · {}", vfs_core::entry::format_size(entry.size))
+            }
+        };
+        let icon = crate::pane::entry_icon(&entry, 22.0);
+
         Some(
             div()
                 .absolute()
@@ -1400,18 +1415,125 @@ impl Workspace {
                 .flex()
                 .items_center()
                 .justify_center()
-                .bg(gpui::hsla(0.0, 0.0, 0.0, 0.35))
+                .bg(gpui::hsla(0.0, 0.0, 0.0, 0.32))
+                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                    backdrop.update(cx, |workspace, cx| {
+                        workspace.quick_look_open = false;
+                        cx.notify();
+                    });
+                })
                 .child(
                     div()
-                        .w(px(QUICK_LOOK_WIDTH))
+                        .w(px(width))
                         .h(px(height))
+                        .flex()
+                        .flex_col()
                         .overflow_hidden()
-                        .rounded_lg()
+                        .rounded(px(12.))
                         .border_1()
                         .border_color(theme::border())
                         .shadow_lg()
                         .bg(theme::bg())
-                        .child(preview),
+                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                        .child(
+                            // Title bar: transparent, separated by a hairline.
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .h(px(46.))
+                                .flex_shrink_0()
+                                .px_3()
+                                .gap_3()
+                                .border_b_1()
+                                .border_color(theme::border_soft())
+                                .child(
+                                    div()
+                                        .id("quick-look-close")
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .w(px(22.))
+                                        .h(px(22.))
+                                        .flex_shrink_0()
+                                        .rounded_full()
+                                        .bg(theme::bg_hover())
+                                        .cursor_pointer()
+                                        .hover(|this| this.bg(theme::border()))
+                                        .on_click(move |_, _, cx| {
+                                            close.update(cx, |workspace, cx| {
+                                                workspace.quick_look_open = false;
+                                                cx.notify();
+                                            });
+                                        })
+                                        .child(
+                                            svg()
+                                                .path(icons::CLOSE)
+                                                .w(px(10.))
+                                                .h(px(10.))
+                                                .text_color(theme::text_muted()),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .flex()
+                                        .flex_row()
+                                        .items_center()
+                                        .justify_center()
+                                        .gap_2()
+                                        .child(icon)
+                                        .child(
+                                            div()
+                                                .min_w_0()
+                                                .flex()
+                                                .flex_col()
+                                                .child(
+                                                    div()
+                                                        .text_sm()
+                                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                        .text_color(theme::text())
+                                                        .truncate()
+                                                        .child(entry.name.clone()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(theme::text_faint())
+                                                        .truncate()
+                                                        .child(subtitle),
+                                                ),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("quick-look-open")
+                                        .flex_shrink_0()
+                                        .px_3()
+                                        .h(px(24.))
+                                        .flex()
+                                        .items_center()
+                                        .rounded_md()
+                                        .bg(theme::bg_hover())
+                                        .text_sm()
+                                        .text_color(theme::text())
+                                        .cursor_pointer()
+                                        .hover(|this| this.bg(theme::border()))
+                                        .on_click(move |_, window, cx| {
+                                            open.update(cx, |workspace, cx| {
+                                                workspace.quick_look_open = false;
+                                                workspace.run_menu_action(
+                                                    MenuAction::Open,
+                                                    window,
+                                                    cx,
+                                                );
+                                            });
+                                        })
+                                        .child("Open"),
+                                ),
+                        )
+                        .child(div().flex_1().min_h_0().child(preview)),
                 )
                 .into_any_element(),
         )

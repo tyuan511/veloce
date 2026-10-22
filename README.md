@@ -107,7 +107,7 @@ compile once at first launch.
 - **Fixed row height + `uniform_list`.** Virtualization is arithmetic, so cost per frame
   is independent of directory size.
 - **Bounded preview.** Text previews read 64 KiB and render at most 400 lines: a 10 GB
-  log opens instantly instead of freezing the window. Archives list their first 500
+  log opens instantly instead of freezing the window. Markdown renders natively (headings, lists, tasks, quotes, tables, highlighted code blocks); source files are syntax-highlighted (syntect); JSON is pretty-printed; CSV/TSV become tables; HTML renders through a Quick Look snapshot on macOS. Archives list their first 500
   entries, binaries show a 512-byte hex dump, and on macOS PDFs, video, audio artwork,
   Office/iWork documents, HEIC, RAW, fonts and 3D models render through Quick Look
   thumbnails (cached, with a timeout) — all off the UI thread.
@@ -124,7 +124,7 @@ compile once at first launch.
 ## Tests
 
 ```sh
-cargo test              # 293 tests, no GPU or window server needed
+cargo test              # 358 tests, no GPU or window server needed
 cargo test -p vfs-core  # 156 core tests
 ```
 

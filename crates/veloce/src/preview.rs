@@ -4,6 +4,11 @@
 //! (`PREVIEW_BYTES`, 64 KiB) rather than the whole file: a 10 GB log opens
 //! instantly. Images are handed to GPUI's own loader.
 
+mod code;
+mod markdown;
+mod table;
+mod views;
+
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
@@ -43,6 +48,21 @@ pub enum PreviewContent {
     },
     Text {
         lines: Vec<String>,
+        truncated: bool,
+    },
+    /// Syntax-highlighted source.
+    Code {
+        lines: Vec<code::Line>,
+        truncated: bool,
+        language: String,
+    },
+    Markdown {
+        blocks: Vec<markdown::Block>,
+        truncated: bool,
+    },
+    /// CSV / TSV rows (first row is the header).
+    Table {
+        rows: Vec<Vec<String>>,
         truncated: bool,
     },
     Image {
@@ -209,6 +229,8 @@ fn is_thumbnail_extension(ext: &str) -> bool {
     matches!(
         ext,
         "pdf"
+            | "html"
+            | "htm"
             | "heic"
             | "heif"
             | "psd"
@@ -406,7 +428,9 @@ async fn build_preview(entry: &FileEntry) -> PreviewContent {
         Route::Image => PreviewContent::Image { path },
         Route::Thumbnail => match quicklook_thumbnail(entry, &path) {
             Some(thumbnail) => PreviewContent::Image { path: thumbnail },
-            // No thumbnail (DRM media, odd codec ...): fall back to the bytes.
+            // No thumbnail (DRM media, odd codec ...): HTML falls back to its source,
+            // everything else to the bytes.
+            None if is_text_extension(&extension) => read_text_preview(&provider, entry).await,
             None => sniff_preview(&provider, entry).await,
         },
         Route::Archive => {
@@ -465,11 +489,107 @@ async fn sniff_preview(provider: &LocalProvider, entry: &FileEntry) -> PreviewCo
 }
 
 async fn read_text_preview(provider: &LocalProvider, entry: &FileEntry) -> PreviewContent {
-    match read_head(provider, entry).await {
-        Ok(head) => classify_head(&head, entry.size),
-        Err(message) => PreviewContent::Error { message },
+    let head = match read_head(provider, entry).await {
+        Ok(head) => head,
+        Err(message) => return PreviewContent::Error { message },
+    };
+    let extension = entry.extension().unwrap_or_default();
+    // Binary property lists are common on macOS; `plutil` turns them into XML.
+    if extension == "plist"
+        && let Some(path) = entry.uri.as_local_path()
+        && let Some(xml) = plist_as_xml(&path)
+    {
+        return text_content(&entry.name, "xml", &xml, false);
+    }
+    if head.iter().take(BINARY_SNIFF_BYTES).any(|byte| *byte == 0) {
+        return classify_head(&head, entry.size);
+    }
+    let text = String::from_utf8_lossy(&head);
+    text_content(&entry.name, &extension, &text, entry.size > PREVIEW_BYTES)
+}
+
+#[cfg(target_os = "macos")]
+fn plist_as_xml(path: &Path) -> Option<String> {
+    let output = std::process::Command::new("plutil")
+        .args(["-convert", "xml1", "-o", "-"])
+        .arg(path)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn plist_as_xml(_path: &Path) -> Option<String> {
+    None
+}
+
+/// Choose the richest view of already-decoded text: Markdown, a table, pretty
+/// JSON, highlighted code, or plain lines. `file_truncated` says the text is only
+/// the head of a longer file.
+fn text_content(name: &str, extension: &str, text: &str, file_truncated: bool) -> PreviewContent {
+    match extension {
+        "md" | "markdown" | "mdown" | "mkd" => {
+            return PreviewContent::Markdown {
+                blocks: markdown::parse(text),
+                truncated: file_truncated,
+            };
+        }
+        "csv" | "tsv" => {
+            let (rows, cut) = table::parse_delimited(
+                text,
+                table::delimiter_for(extension),
+                TABLE_PREVIEW_ROWS,
+                TABLE_PREVIEW_COLUMNS,
+            );
+            if !rows.is_empty() {
+                return PreviewContent::Table {
+                    rows,
+                    truncated: cut || file_truncated,
+                };
+            }
+        }
+        _ => {}
+    }
+
+    // Pretty-print JSON only when the whole file is here: a cut-off document is
+    // invalid and would silently show as raw text anyway.
+    let pretty;
+    let source = if extension == "json" && !file_truncated {
+        match serde_json::from_str::<serde_json::Value>(text)
+            .and_then(|value| serde_json::to_string_pretty(&value))
+        {
+            Ok(formatted) => {
+                pretty = formatted;
+                pretty.as_str()
+            }
+            Err(_) => text,
+        }
+    } else {
+        text
+    };
+
+    let capped = source.lines().count() > PREVIEW_LINES;
+    if let Some(lines) = code::highlight(source, name, extension, theme::is_dark(), PREVIEW_LINES) {
+        return PreviewContent::Code {
+            language: code::language_name(name, extension).unwrap_or_default(),
+            lines,
+            truncated: capped || file_truncated,
+        };
+    }
+    let (lines, over) = split_lines(source);
+    PreviewContent::Text {
+        lines,
+        truncated: over || file_truncated,
     }
 }
+
+/// Rows and columns kept for CSV / TSV previews.
+pub const TABLE_PREVIEW_ROWS: usize = 200;
+pub const TABLE_PREVIEW_COLUMNS: usize = 40;
 
 async fn read_head(provider: &LocalProvider, entry: &FileEntry) -> Result<Vec<u8>, String> {
     use futures::StreamExt as _;
@@ -542,8 +662,11 @@ pub struct PreviewView {
     /// Entry metadata shown in the header (kept so the panel can render the
     /// footer without asking the pane again).
     pub entry: Option<FileEntry>,
-    /// Panel width: the inspector is narrow, Quick Look is wide.
+    /// Panel width: the inspector is narrow. Ignored when `embedded`.
     pub width: f32,
+    /// Hosted inside another surface (Quick Look): no border, background or
+    /// header of its own, so nothing opaque can poke out of a rounded parent.
+    pub embedded: bool,
 }
 
 impl gpui::Focusable for PreviewView {
@@ -559,13 +682,14 @@ impl PreviewView {
             focus_handle: cx.focus_handle(),
             entry: None,
             width: 340.0,
+            embedded: false,
         }
     }
 
-    /// A wider panel, for the Quick Look overlay.
-    pub fn with_width(width: f32, cx: &mut Context<Self>) -> Self {
+    /// The content area of the Quick Look window.
+    pub fn quick_look(cx: &mut Context<Self>) -> Self {
         Self {
-            width,
+            embedded: true,
             ..Self::new(cx)
         }
     }
@@ -583,7 +707,14 @@ impl gpui::Render for PreviewView {
         _window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) -> impl gpui::IntoElement {
-        render_preview(&self.preview, self.entry.as_ref(), self.width, cx).into_any_element()
+        render_preview(
+            &self.preview,
+            self.entry.as_ref(),
+            self.width,
+            self.embedded,
+            cx,
+        )
+        .into_any_element()
     }
 }
 
@@ -592,13 +723,21 @@ pub fn render_preview(
     preview: &Preview,
     entry: Option<&FileEntry>,
     width: f32,
+    embedded: bool,
     _cx: &mut Context<PreviewView>,
 ) -> AnyElement {
-    let header = render_header(entry, &preview.content);
+    let header = (!embedded).then(|| render_header(entry, &preview.content));
     let body = match &preview.content {
         PreviewContent::Empty => empty_state(),
         PreviewContent::Loading { name } => loading_state(name),
         PreviewContent::Text { lines, truncated } => text_state(lines, *truncated),
+        PreviewContent::Code {
+            lines,
+            truncated,
+            language,
+        } => views::code_state(lines, *truncated, language),
+        PreviewContent::Markdown { blocks, truncated } => views::markdown_state(blocks, *truncated),
+        PreviewContent::Table { rows, truncated } => views::table_state(rows, *truncated),
         PreviewContent::Image { path } => image_state(path),
         PreviewContent::Binary { size, dump } => binary_state(*size, dump),
         PreviewContent::Archive { entries, truncated } => archive_state(entries, *truncated),
@@ -606,6 +745,17 @@ pub fn render_preview(
         PreviewContent::Error { message } => error_state(message),
     };
 
+    if embedded {
+        // Transparent and unbordered: the Quick Look card draws its own rounded
+        // background and this must not paint over its corners.
+        return div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .min_h_0()
+            .child(body)
+            .into_any_element();
+    }
     div()
         .flex()
         .flex_col()
@@ -615,7 +765,7 @@ pub fn render_preview(
         .bg(theme::bg())
         .border_l_1()
         .border_color(theme::border())
-        .child(header)
+        .children(header)
         .child(body)
         .into_any_element()
 }
@@ -1100,6 +1250,141 @@ mod tests {
         assert!(truncated);
         assert_eq!(lines.len(), PREVIEW_LINES);
         assert_eq!(lines[0], "a    b");
+    }
+
+    #[test]
+    fn markdown_files_become_markdown_content() {
+        match text_content("README.md", "md", "# Hi\n\ntext", false) {
+            PreviewContent::Markdown { blocks, truncated } => {
+                assert!(!truncated);
+                assert!(blocks.len() >= 2);
+            }
+            other => panic!("expected markdown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_cut_off_file_marks_markdown_as_truncated() {
+        match text_content("a.md", "md", "# Hi", true) {
+            PreviewContent::Markdown { truncated, .. } => assert!(truncated),
+            other => panic!("expected markdown, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn csv_files_become_tables_and_tsv_uses_tabs() {
+        match text_content("d.csv", "csv", "a,b\n1,2\n", false) {
+            PreviewContent::Table { rows, .. } => assert_eq!(rows, [["a", "b"], ["1", "2"]]),
+            other => panic!("expected table, got {other:?}"),
+        }
+        match text_content("d.tsv", "tsv", "a\tb\n", false) {
+            PreviewContent::Table { rows, .. } => assert_eq!(rows[0], ["a", "b"]),
+            other => panic!("expected table, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_csv_falls_back_to_text() {
+        assert!(matches!(
+            text_content("d.csv", "csv", "", false),
+            PreviewContent::Text { .. }
+        ));
+    }
+
+    #[test]
+    fn complete_json_is_pretty_printed_before_highlighting() {
+        match text_content("a.json", "json", "{\"a\":[1,2]}", false) {
+            PreviewContent::Code {
+                lines, language, ..
+            } => {
+                assert_eq!(language, "JSON");
+                assert!(lines.len() > 1, "expanded onto several lines");
+            }
+            other => panic!("expected code, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn truncated_json_is_shown_as_is_not_reformatted() {
+        match text_content("a.json", "json", "{\"a\":[1,", true) {
+            PreviewContent::Code {
+                lines, truncated, ..
+            } => {
+                assert_eq!(lines.len(), 1);
+                assert!(truncated);
+            }
+            other => panic!("expected code, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn invalid_json_stays_raw() {
+        match text_content("a.json", "json", "{oops", false) {
+            PreviewContent::Code { lines, .. } => assert_eq!(lines.len(), 1),
+            other => panic!("expected code, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn source_files_are_highlighted_and_unknown_text_stays_plain() {
+        assert!(matches!(
+            text_content("m.rs", "rs", "fn main() {}", false),
+            PreviewContent::Code { .. }
+        ));
+        assert!(matches!(
+            text_content("x.log", "log", "line", false),
+            PreviewContent::Text { .. }
+        ));
+    }
+
+    #[test]
+    fn long_source_is_capped_and_flagged() {
+        let text = "let a = 1;\n".repeat(PREVIEW_LINES + 50);
+        match text_content("a.js", "js", &text, false) {
+            PreviewContent::Code {
+                lines, truncated, ..
+            } => {
+                assert_eq!(lines.len(), PREVIEW_LINES);
+                assert!(truncated);
+            }
+            other => panic!("expected code, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn html_is_rendered_by_quick_look_when_available_and_read_as_source_otherwise() {
+        assert_eq!(route_for("a.html", "html", true), Route::Thumbnail);
+        assert_eq!(route_for("a.html", "html", false), Route::Text);
+        assert!(matches!(
+            text_content("a.html", "html", "<p>hi</p>", false),
+            PreviewContent::Code { .. }
+        ));
+    }
+
+    #[test]
+    fn markdown_file_on_disk_previews_as_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.md");
+        fs::write(&path, "# Title\n\n- a\n- b\n").unwrap();
+        let entry = entry_for(&path);
+        let content = futures::executor::block_on(build_preview(&entry));
+        assert!(
+            matches!(content, PreviewContent::Markdown { .. }),
+            "{content:?}"
+        );
+    }
+
+    #[test]
+    fn binary_data_with_a_text_extension_still_shows_hex() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("weird.json");
+        fs::write(&path, [0u8, 159, 146, 150]).unwrap();
+        let entry = entry_for(&path);
+        let content = futures::executor::block_on(build_preview(&entry));
+        assert!(
+            matches!(content, PreviewContent::Binary { .. }),
+            "{content:?}"
+        );
     }
 
     #[test]

@@ -260,6 +260,11 @@ pub fn set_appearance(appearance: WindowAppearance) -> bool {
     IS_DARK.swap(dark, Ordering::Relaxed) != dark
 }
 
+/// Whether the dark palette is active.
+pub fn is_dark() -> bool {
+    IS_DARK.load(Ordering::Relaxed)
+}
+
 /// Pure mapping from the OS appearance to "use the dark palette".
 pub fn is_dark_appearance(appearance: WindowAppearance) -> bool {
     matches!(
