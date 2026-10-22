@@ -1435,7 +1435,7 @@ impl Workspace {
         let apps = cx.entity();
         // Folders have no meaningful size here, so only files show one.
         let size_label = (!entry.is_dir()).then(|| vfs_core::entry::format_size(entry.size));
-        let icon = crate::pane::entry_icon(&entry, 22.0);
+        let icon = crate::pane::entry_icon(&entry, 16.0);
 
         Some(
             div()
@@ -1496,18 +1496,20 @@ impl Workspace {
                                             div()
                                                 .min_w_0()
                                                 .text_sm()
-                                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                .font_weight(gpui::FontWeight::MEDIUM)
                                                 .text_color(theme::text())
                                                 .truncate()
                                                 .child(entry.name.clone()),
                                         )
+                                        // The size is a footnote to the name, not a
+                                        // second title: smaller, fainter, after a dot.
                                         .when_some(size_label, |this, size| {
                                             this.child(
                                                 div()
                                                     .flex_shrink_0()
-                                                    .text_sm()
+                                                    .text_xs()
                                                     .text_color(theme::text_faint())
-                                                    .child(size),
+                                                    .child(format!("·  {size}")),
                                             )
                                         }),
                                 )

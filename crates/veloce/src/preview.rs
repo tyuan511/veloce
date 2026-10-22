@@ -796,7 +796,7 @@ fn render_header(entry: Option<&FileEntry>) -> AnyElement {
                 .flex_row()
                 .items_center()
                 .gap_3()
-                .child(crate::pane::entry_icon(entry, 44.0))
+                .child(crate::pane::entry_icon(entry, 32.0))
                 .child(
                     div()
                         .flex_1()
