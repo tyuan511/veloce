@@ -9,6 +9,7 @@
 //! - [`Filter`] / [`search`]: `nucleo`-backed fuzzy filtering and recursive search.
 //! - [`TaskManager`]: background transfer queue with progress, cancellation and byte accounting.
 
+pub mod archive;
 pub mod entry;
 pub mod error;
 pub mod filter;

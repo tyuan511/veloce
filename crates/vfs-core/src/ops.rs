@@ -1084,29 +1084,9 @@ pub fn shortcut_path(path: &Path) -> PathBuf {
     suffixed_path(path, "Shortcut")
 }
 
-/// Where "Compress to ZIP file" writes: `<first item's stem>.zip` next to the
-/// first source, numbered (`notes (2).zip`) if that name is taken.
-pub fn archive_path(sources: &[PathBuf]) -> Option<PathBuf> {
-    let first = sources.first()?;
-    let parent = first.parent()?;
-    let stem = if first.is_dir() {
-        first.file_name()?.to_string_lossy().into_owned()
-    } else {
-        first
-            .file_stem()
-            .or_else(|| first.file_name())?
-            .to_string_lossy()
-            .into_owned()
-    };
-    Some(first_free(parent, |label| match label {
-        None => format!("{stem}.zip"),
-        Some(index) => format!("{stem} ({index}).zip"),
-    }))
-}
-
 /// First candidate name (`None` = the plain name, then `Some(2)`, `Some(3)` ...)
 /// that does not exist in `parent`.
-fn first_free(parent: &Path, name: impl Fn(Option<u32>) -> String) -> PathBuf {
+pub(crate) fn first_free(parent: &Path, name: impl Fn(Option<u32>) -> String) -> PathBuf {
     let plain = parent.join(name(None));
     if !plain.exists() {
         return plain;
@@ -1184,37 +1164,5 @@ mod naming_tests {
             shortcut_path(&dir.path().join("photo.png")),
             dir.path().join("photo - Shortcut.png")
         );
-    }
-
-    #[test]
-    fn archive_is_named_after_the_first_item_without_its_extension() {
-        let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("notes.md");
-        fs::write(&file, b"x").unwrap();
-        assert_eq!(archive_path(&[file]), Some(dir.path().join("notes.zip")));
-    }
-
-    #[test]
-    fn archive_of_a_folder_keeps_the_whole_name() {
-        let dir = tempfile::tempdir().unwrap();
-        let folder = dir.path().join("my.project");
-        fs::create_dir(&folder).unwrap();
-        assert_eq!(
-            archive_path(&[folder]),
-            Some(dir.path().join("my.project.zip"))
-        );
-    }
-
-    #[test]
-    fn archive_never_overwrites_an_existing_zip() {
-        let dir = tempfile::tempdir().unwrap();
-        let sources = vec![dir.path().join("a.txt"), dir.path().join("b.txt")];
-        fs::write(dir.path().join("a.zip"), b"x").unwrap();
-        assert_eq!(archive_path(&sources), Some(dir.path().join("a (2).zip")));
-    }
-
-    #[test]
-    fn archive_of_nothing_is_none() {
-        assert_eq!(archive_path(&[]), None);
     }
 }
