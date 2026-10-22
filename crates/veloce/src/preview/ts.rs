@@ -144,6 +144,9 @@ fn style_of(group: Group, dark: bool) -> (u32, bool, bool) {
 
 /// One supported language: how to recognise it and how to build its grammar.
 struct Lang {
+    /// Display name; only the tests ask for it now that the preview shows no
+    /// language label.
+    #[cfg_attr(not(test), allow(dead_code))]
     name: &'static str,
     extensions: &'static [&'static str],
     file_names: &'static [&'static str],
@@ -439,6 +442,7 @@ fn find_lang(file_name: &str, ext: &str) -> Option<usize> {
 }
 
 /// Display name of the grammar that would highlight this file.
+#[cfg(test)]
 pub fn language_name(file_name: &str, ext: &str) -> Option<&'static str> {
     find_lang(file_name, ext).map(|index| LANGS[index].name)
 }

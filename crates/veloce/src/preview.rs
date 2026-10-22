@@ -55,7 +55,6 @@ pub enum PreviewContent {
     Code {
         lines: Vec<code::Line>,
         truncated: bool,
-        language: String,
     },
     Markdown {
         blocks: Vec<markdown::Block>,
@@ -576,7 +575,6 @@ fn text_content(name: &str, extension: &str, text: &str, file_truncated: bool) -
     let capped = source.lines().count() > PREVIEW_LINES;
     if let Some(lines) = code::highlight(source, name, extension, theme::is_dark(), PREVIEW_LINES) {
         return PreviewContent::Code {
-            language: code::language_name(name, extension).unwrap_or_default(),
             lines,
             truncated: capped || file_truncated,
         };
@@ -732,11 +730,7 @@ pub fn render_preview(
         PreviewContent::Empty => empty_state(),
         PreviewContent::Loading { name } => loading_state(name),
         PreviewContent::Text { lines, truncated } => text_state(lines, *truncated),
-        PreviewContent::Code {
-            lines,
-            truncated,
-            language,
-        } => views::code_state(lines, *truncated, language),
+        PreviewContent::Code { lines, truncated } => views::code_state(lines, *truncated),
         PreviewContent::Markdown { blocks, truncated } => views::markdown_state(blocks, *truncated),
         PreviewContent::Table { rows, truncated } => views::table_state(rows, *truncated),
         PreviewContent::Image { path } => image_state(path),
@@ -1333,10 +1327,11 @@ mod tests {
     #[test]
     fn complete_json_is_pretty_printed_before_highlighting() {
         match text_content("a.json", "json", "{\"a\":[1,2]}", false) {
-            PreviewContent::Code {
-                lines, language, ..
-            } => {
-                assert_eq!(language, "JSON");
+            PreviewContent::Code { lines, .. } => {
+                assert_eq!(
+                    code::language_name("a.json", "json").as_deref(),
+                    Some("JSON")
+                );
                 assert!(lines.len() > 1, "expanded onto several lines");
             }
             other => panic!("expected code, got {other:?}"),

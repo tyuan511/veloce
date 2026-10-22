@@ -1433,14 +1433,8 @@ impl Workspace {
         let backdrop = cx.entity();
         let open = cx.entity();
         let apps = cx.entity();
-        let subtitle = {
-            let kind = crate::info::kind_label(&entry);
-            if entry.is_dir() {
-                kind
-            } else {
-                format!("{kind} · {}", vfs_core::entry::format_size(entry.size))
-            }
-        };
+        // Folders have no meaningful size here, so only files show one.
+        let size_label = (!entry.is_dir()).then(|| vfs_core::entry::format_size(entry.size));
         let icon = crate::pane::entry_icon(&entry, 22.0);
 
         Some(
@@ -1489,6 +1483,7 @@ impl Workspace {
                                 .border_color(theme::border_soft())
                                 .child(div().flex_1())
                                 .child(
+                                    // One line: icon, name, size.
                                     div()
                                         .min_w_0()
                                         .flex()
@@ -1500,24 +1495,21 @@ impl Workspace {
                                         .child(
                                             div()
                                                 .min_w_0()
-                                                .flex()
-                                                .flex_col()
-                                                .child(
-                                                    div()
-                                                        .text_sm()
-                                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                                        .text_color(theme::text())
-                                                        .truncate()
-                                                        .child(entry.name.clone()),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(theme::text_faint())
-                                                        .truncate()
-                                                        .child(subtitle),
-                                                ),
-                                        ),
+                                                .text_sm()
+                                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                                .text_color(theme::text())
+                                                .truncate()
+                                                .child(entry.name.clone()),
+                                        )
+                                        .when_some(size_label, |this, size| {
+                                            this.child(
+                                                div()
+                                                    .flex_shrink_0()
+                                                    .text_sm()
+                                                    .text_color(theme::text_faint())
+                                                    .child(size),
+                                            )
+                                        }),
                                 )
                                 .child(
                                     div()

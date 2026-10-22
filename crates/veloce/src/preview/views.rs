@@ -98,7 +98,7 @@ fn code_line(line: &Line) -> AnyElement {
         .into_any_element()
 }
 
-pub(super) fn code_state(lines: &[Line], truncated: bool, language: &str) -> AnyElement {
+pub(super) fn code_state(lines: &[Line], truncated: bool) -> AnyElement {
     let gutter = px(38.0);
     div()
         .id("preview-code")
@@ -115,14 +115,6 @@ pub(super) fn code_state(lines: &[Line], truncated: bool, language: &str) -> Any
                 .text_size(px(11.5))
                 .line_height(px(16.0))
                 .text_color(theme::text())
-                .child(
-                    div()
-                        .mb_1()
-                        .pl(gutter)
-                        .text_xs()
-                        .text_color(theme::text_faint())
-                        .child(language.to_string()),
-                )
                 .children(lines.iter().enumerate().map(|(index, line)| {
                     div()
                         .flex()

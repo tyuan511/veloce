@@ -63,12 +63,14 @@ fn find_syntax(file_name: &str, ext: &str) -> Option<&'static SyntaxReference> {
 }
 
 /// Display name of the language a file would be highlighted as.
+#[cfg(test)]
 fn syntect_language_name(file_name: &str, ext: &str) -> Option<String> {
     find_syntax(file_name, ext).map(|syntax| syntax.name.clone())
 }
 
 /// Display name of the language a file is highlighted as: tree-sitter's grammar
 /// when there is one, otherwise syntect's.
+#[cfg(test)]
 pub fn language_name(file_name: &str, ext: &str) -> Option<String> {
     super::ts::language_name(file_name, ext)
         .map(str::to_string)
