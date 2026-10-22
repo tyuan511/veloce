@@ -25,6 +25,8 @@ pub const VIEW_ICONS: &str = "icons/layout-grid.svg";
 pub const VIEW_COLUMNS: &str = "icons/columns-3.svg";
 pub const SORT: &str = "icons/arrow-up-down.svg";
 pub const CHECK: &str = "icons/check.svg";
+pub const ELLIPSIS: &str = "icons/ellipsis.svg";
+pub const CHEVRON_LEFT: &str = "icons/chevron-left.svg";
 pub const SPLIT: &str = "icons/columns-2.svg";
 pub const EYE: &str = "icons/eye.svg";
 pub const HOME: &str = "icons/house.svg";
@@ -56,6 +58,11 @@ const ICONS: &[(&str, &str)] = &[
     (VIEW_COLUMNS, include_str!("../assets/icons/columns-3.svg")),
     (SORT, include_str!("../assets/icons/arrow-up-down.svg")),
     (CHECK, include_str!("../assets/icons/check.svg")),
+    (ELLIPSIS, include_str!("../assets/icons/ellipsis.svg")),
+    (
+        CHEVRON_LEFT,
+        include_str!("../assets/icons/chevron-left.svg"),
+    ),
     (SPLIT, include_str!("../assets/icons/columns-2.svg")),
     (EYE, include_str!("../assets/icons/eye.svg")),
     (HOME, include_str!("../assets/icons/house.svg")),

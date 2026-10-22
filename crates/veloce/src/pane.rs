@@ -33,7 +33,9 @@ use vfs_core::{
 
 use crate::{
     clipboard::PasteOp,
-    file_icons, icons,
+    file_icons,
+    history::History,
+    icons,
     listing::{
         Listing, breadcrumbs, cycle_index, index_after_close, parse_path_input, visible_crumbs,
     },
@@ -79,6 +81,7 @@ impl PaneSide {
 pub struct Tab {
     pub uri: VfsUri,
     pub title: String,
+    pub history: History<VfsUri>,
 }
 
 /// Shared services the panes borrow.
@@ -212,6 +215,7 @@ impl Pane {
         Self {
             side,
             tabs: vec![Tab {
+                history: History::new(uri.clone()),
                 uri: uri.clone(),
                 title,
             }],
@@ -373,7 +377,35 @@ impl Pane {
 
     // ---- navigation -------------------------------------------------------
 
+    /// Go to `uri`, recording the visit so Back can return here.
     pub fn navigate_to(&mut self, uri: VfsUri, cx: &mut Context<Self>) {
+        self.tabs[self.active_tab].history.push(uri.clone());
+        self.show_uri(uri, cx);
+    }
+
+    pub fn can_go_back(&self) -> bool {
+        self.tabs[self.active_tab].history.can_go_back()
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        self.tabs[self.active_tab].history.can_go_forward()
+    }
+
+    pub fn go_back(&mut self, cx: &mut Context<Self>) {
+        if let Some(uri) = self.tabs[self.active_tab].history.back() {
+            self.show_uri(uri, cx);
+        }
+    }
+
+    pub fn go_forward(&mut self, cx: &mut Context<Self>) {
+        if let Some(uri) = self.tabs[self.active_tab].history.forward() {
+            self.show_uri(uri, cx);
+        }
+    }
+
+    /// Show a folder without touching the history (Back/Forward and `navigate_to`
+    /// both end here).
+    fn show_uri(&mut self, uri: VfsUri, cx: &mut Context<Self>) {
         self.tabs[self.active_tab].uri = uri.clone();
         self.tabs[self.active_tab].title = uri.file_name().to_string();
         self.listing.clear_selection();
@@ -931,7 +963,11 @@ impl Pane {
     pub fn new_tab(&mut self, cx: &mut Context<Self>) {
         let uri = self.current_uri();
         let title = uri.file_name().to_string();
-        self.tabs.push(Tab { uri, title });
+        self.tabs.push(Tab {
+            history: History::new(uri.clone()),
+            uri,
+            title,
+        });
         self.active_tab = self.tabs.len() - 1;
         self.reload(cx);
         cx.notify();

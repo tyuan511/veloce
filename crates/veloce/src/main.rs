@@ -14,6 +14,7 @@ mod context_menu;
 mod file_icons;
 #[rustfmt::skip]
 mod file_icons_data;
+mod history;
 mod icons;
 mod info;
 mod listing;

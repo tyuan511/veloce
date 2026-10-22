@@ -43,6 +43,10 @@ pub enum MenuAction {
     SortFoldersFirst,
     SetView(ViewMode),
     ToggleHidden,
+    ToggleSplit,
+    TogglePreviewPanel,
+    ToggleTasks,
+    CommandPalette,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -192,7 +196,8 @@ pub fn sort_menu(spec: SortSpec) -> Vec<MenuItem> {
     items
 }
 
-fn view_menu(view: ViewMode) -> Vec<MenuItem> {
+/// The toolbar's view switcher: Finder's "as Icons / as List / as Columns".
+pub fn view_menu(view: ViewMode) -> Vec<MenuItem> {
     use MenuAction::SetView;
     vec![
         checked(
@@ -246,6 +251,45 @@ pub fn open_with_menu(open_with: &OpenWith) -> Vec<MenuItem> {
     items.push(MenuItem::Separator);
     items.push(action(MenuAction::OpenWithOther, "Other…", None, true));
     items
+}
+
+/// Which of the toolbar's toggles are on, for the "more" menu's check marks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MoreState {
+    pub show_hidden: bool,
+    pub split: bool,
+    pub preview_open: bool,
+    pub tasks_open: bool,
+}
+
+/// The toolbar's "…" menu: the switches and commands that are not worth a button
+/// of their own.
+pub fn more_menu(state: MoreState) -> Vec<MenuItem> {
+    use MenuAction::*;
+    vec![
+        action(NewFolder, "New folder", Some("⇧⌘N"), true),
+        MenuItem::Separator,
+        checked(
+            action(ToggleHidden, "Show hidden files", Some("⇧⌘."), true),
+            state.show_hidden,
+        ),
+        checked(
+            action(ToggleSplit, "Split view", Some("⌘\\"), true),
+            state.split,
+        ),
+        checked(
+            action(TogglePreviewPanel, "Preview panel", Some("Space"), true),
+            state.preview_open,
+        ),
+        checked(
+            action(ToggleTasks, "Task panel", Some("⌘J"), true),
+            state.tasks_open,
+        ),
+        MenuItem::Separator,
+        action(Refresh, "Refresh", Some("⌘R"), true),
+        action(OpenInTerminal, "Open in Terminal", None, true),
+        action(CommandPalette, "Command palette…", Some("⇧⌘P"), true),
+    ]
 }
 
 /// Build the menu for `target`.
@@ -770,6 +814,51 @@ mod tests {
     fn sort_labels_follow_finder() {
         assert_eq!(sort_key_label(SortKey::Modified), "Date Modified");
         assert_eq!(sort_key_label(SortKey::Created), "Date Created");
+    }
+
+    #[test]
+    fn more_menu_reflects_every_toggle() {
+        let off = more_menu(MoreState::default());
+        assert!(checked_actions(&off).is_empty());
+        let on = more_menu(MoreState {
+            show_hidden: true,
+            split: true,
+            preview_open: true,
+            tasks_open: true,
+        });
+        let checked = checked_actions(&on);
+        for action in [
+            MenuAction::ToggleHidden,
+            MenuAction::ToggleSplit,
+            MenuAction::TogglePreviewPanel,
+            MenuAction::ToggleTasks,
+        ] {
+            assert!(checked.contains(&action), "{action:?}");
+        }
+    }
+
+    #[test]
+    fn more_menu_keeps_the_everyday_commands() {
+        let items = more_menu(MoreState::default());
+        for action in [
+            MenuAction::NewFolder,
+            MenuAction::Refresh,
+            MenuAction::OpenInTerminal,
+            MenuAction::CommandPalette,
+        ] {
+            assert!(has(&items, action), "{action:?}");
+        }
+        assert_ne!(items.first(), Some(&MenuItem::Separator));
+        assert_ne!(items.last(), Some(&MenuItem::Separator));
+    }
+
+    #[test]
+    fn view_menu_checks_the_current_view_and_offers_all_three() {
+        for mode in [ViewMode::Icons, ViewMode::List, ViewMode::Columns] {
+            let items = view_menu(mode);
+            assert_eq!(items.len(), 3);
+            assert_eq!(checked_actions(&items), [MenuAction::SetView(mode)]);
+        }
     }
 
     #[test]

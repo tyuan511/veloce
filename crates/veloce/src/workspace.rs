@@ -25,7 +25,8 @@ use crate::{
     clipboard::FileClipboard,
     context_menu::{
         ActionItem, MENU_PADDING, MENU_WIDTH, MenuAction, MenuContext, MenuItem, MenuTarget,
-        OpenWith, build_menu, clamp_origin, menu_height, open_with_menu, sort_menu,
+        MoreState, OpenWith, build_menu, clamp_origin, menu_height, more_menu, open_with_menu,
+        sort_menu, view_menu,
     },
     icons,
     info::info_rows,
@@ -343,23 +344,6 @@ impl Workspace {
         .detach();
     }
 
-    /// The toolbar's "Sort By" menu, dropped just below the click.
-    fn open_sort_menu(&mut self, at: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
-        let spec = self.focused_pane().read(cx).sort;
-        self.menu_counter += 1;
-        self.menu = Some(OpenMenu {
-            id: self.menu_counter,
-            origin: (f32::from(at.x), f32::from(at.y) + 14.0),
-            items: sort_menu(spec),
-            open_sub: None,
-            target: MenuTarget::Background,
-            ctx: MenuContext::default(),
-            apps: Vec::new(),
-            open_with_only: false,
-        });
-        cx.notify();
-    }
-
     /// The inspector's Open button: the same application list as the context menu's
     /// "Open With", dropped under the button.
     fn open_apps_menu(&mut self, at: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
@@ -630,6 +614,10 @@ impl Workspace {
                 pane.update(cx, |pane, cx| pane.set_sort(spec, cx));
             }
             MenuAction::SetView(view) => self.set_view(view, cx),
+            MenuAction::ToggleSplit => self.toggle_split(window, cx),
+            MenuAction::TogglePreviewPanel => self.on_toggle_preview(&TogglePreview, window, cx),
+            MenuAction::ToggleTasks => self.on_toggle_tasks(&ToggleTasks, window, cx),
+            MenuAction::CommandPalette => self.open_palette(PaletteMode::Commands, window, cx),
             MenuAction::ToggleHidden => {
                 let show = !pane.read(cx).listing.show_hidden;
                 pane.update(cx, |pane, cx| pane.set_show_hidden(show, cx));
@@ -1043,6 +1031,18 @@ impl Workspace {
         self.sync_preview(cx);
     }
 
+    fn on_go_back(&mut self, _: &GoBack, _: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.focused_pane();
+        pane.update(cx, |pane, cx| pane.go_back(cx));
+        self.sync_preview(cx);
+    }
+
+    fn on_go_forward(&mut self, _: &GoForward, _: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.focused_pane();
+        pane.update(cx, |pane, cx| pane.go_forward(cx));
+        self.sync_preview(cx);
+    }
+
     fn on_go_parent(&mut self, _: &GoParent, _: &mut Window, cx: &mut Context<Self>) {
         let pane = self.focused_pane();
         pane.update(cx, |pane, cx| pane.go_parent(cx));
@@ -1415,6 +1415,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_page_up))
             .on_action(cx.listener(Self::on_jump_top))
             .on_action(cx.listener(Self::on_jump_bottom))
+            .on_action(cx.listener(Self::on_go_back))
+            .on_action(cx.listener(Self::on_go_forward))
             .on_action(cx.listener(Self::on_go_parent))
             .on_action(cx.listener(Self::on_open_entry))
             .on_action(cx.listener(Self::on_focus_left))
@@ -1452,32 +1454,46 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_quit))
             .on_key_down(cx.listener(Self::on_key_down))
             .flex()
-            .flex_col()
+            .flex_row()
             .size_full()
             .bg(theme::bg())
             .text_color(theme::text())
-            .child(self.render_title_bar(cx))
+            .child(sidebar)
+            .child(resize_handle("handle-sidebar", Divider::Sidebar, cx))
             .child(
+                // Everything right of the sidebar: toolbar, then the panes and the
+                // inspector side by side, then the task panel.
                 div()
                     .flex()
-                    .flex_row()
+                    .flex_col()
                     .flex_1()
-                    .min_h_0()
-                    .child(sidebar)
-                    .child(resize_handle("handle-sidebar", Divider::Sidebar, cx))
-                    .child(left)
-                    .when_some(right, |this, right| {
-                        this.child(resize_handle("handle-panes", Divider::Panes, cx))
-                            .child(right)
-                    })
-                    .when_some(preview, |this, preview| {
-                        this.child(resize_handle("handle-inspector", Divider::Inspector, cx))
-                            .child(preview)
+                    .min_w_0()
+                    .h_full()
+                    .child(self.render_toolbar(cx))
+                    .child(
+                        div()
+                            .flex()
+                            .flex_row()
+                            .flex_1()
+                            .min_h_0()
+                            .child(left)
+                            .when_some(right, |this, right| {
+                                this.child(resize_handle("handle-panes", Divider::Panes, cx))
+                                    .child(right)
+                            })
+                            .when_some(preview, |this, preview| {
+                                this.child(resize_handle(
+                                    "handle-inspector",
+                                    Divider::Inspector,
+                                    cx,
+                                ))
+                                .child(preview)
+                            }),
+                    )
+                    .when(tasks_open, |this| {
+                        this.child(div().h(px(1.)).bg(theme::border())).child(tasks)
                     }),
             )
-            .when(tasks_open, |this| {
-                this.child(div().h(px(1.)).bg(theme::border())).child(tasks)
-            })
             .when_some(prompt, |this, (title, input)| {
                 this.child(render_prompt(title, input, cx))
             })
@@ -1571,180 +1587,223 @@ impl Workspace {
         )
     }
 
-    /// Unified toolbar, as in Finder: window controls on the left, one search
-    /// field in the middle, view toggles on the right. The path lives in the
-    /// panes' breadcrumbs, so it is not repeated here.
-    fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let active_tasks = self.tasks.read(cx).active_count();
-        let tasks_open = self.tasks_open;
+    /// The toolbar over the content area, laid out like Finder's: back/forward and
+    /// the folder name on the left; view, sort, our own panel toggles, a "more"
+    /// menu and search as round icon buttons on the right.
+    fn render_toolbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let (title, view, sort, can_back, can_forward) = {
+            let pane = self.focused_pane().read(cx);
+            let uri = pane.current_uri();
+            let name = uri.file_name().to_string();
+            (
+                if name.is_empty() {
+                    "/".to_string()
+                } else {
+                    name
+                },
+                pane.view,
+                pane.sort,
+                pane.can_go_back(),
+                pane.can_go_forward(),
+            )
+        };
         let preview_open = self.focused_pane().read(cx).preview_open;
+        let active_tasks = self.tasks.read(cx).active_count();
         let entity = cx.entity();
+
+        let view_icon = match view {
+            ViewMode::Icons => icons::VIEW_ICONS,
+            ViewMode::List => icons::VIEW_LIST,
+            ViewMode::Columns => icons::VIEW_COLUMNS,
+        };
+
+        // Back / forward: one pill, two halves.
+        let nav = {
+            let back = entity.clone();
+            let forward = entity.clone();
+            pill()
+                .child(
+                    icon_button("nav-back", icons::CHEVRON_LEFT, can_back, false).on_click(
+                        move |_, window, cx| {
+                            back.update(cx, |workspace, cx| {
+                                workspace.on_go_back(&GoBack, window, cx)
+                            });
+                        },
+                    ),
+                )
+                .child(
+                    icon_button("nav-forward", icons::CHEVRON_RIGHT, can_forward, false).on_click(
+                        move |_, window, cx| {
+                            forward.update(cx, |workspace, cx| {
+                                workspace.on_go_forward(&GoForward, window, cx)
+                            });
+                        },
+                    ),
+                )
+        };
+
+        let view_menu_button = {
+            let entity = entity.clone();
+            dropdown_button("toolbar-view", view_icon).on_click(move |event, _, cx| {
+                let at = event.position();
+                entity.update(cx, |workspace, cx| {
+                    workspace.open_toolbar_menu(ToolbarMenu::View, at, cx)
+                });
+            })
+        };
+        let sort_menu_button = {
+            let entity = entity.clone();
+            dropdown_button("toolbar-sort", icons::SORT).on_click(move |event, _, cx| {
+                let at = event.position();
+                entity.update(cx, |workspace, cx| {
+                    workspace.open_toolbar_menu(ToolbarMenu::Sort, at, cx)
+                });
+            })
+        };
+        let _ = sort;
+
+        // Our own switches: split view, preview panel, task panel.
+        let panels = {
+            let split = entity.clone();
+            let preview = entity.clone();
+            let tasks = entity.clone();
+            pill()
+                .child(
+                    icon_button("toolbar-split", icons::SPLIT, true, self.split).on_click(
+                        move |_, window, cx| {
+                            split.update(cx, |workspace, cx| workspace.toggle_split(window, cx));
+                        },
+                    ),
+                )
+                .child(
+                    icon_button("toolbar-preview", icons::EYE, true, preview_open).on_click(
+                        move |_, window, cx| {
+                            preview.update(cx, |workspace, cx| {
+                                workspace.on_toggle_preview(&TogglePreview, window, cx)
+                            });
+                        },
+                    ),
+                )
+                .child(
+                    icon_button(
+                        "toolbar-tasks",
+                        icons::TASKS,
+                        true,
+                        self.tasks_open || active_tasks > 0,
+                    )
+                    .on_click(move |_, _, cx| {
+                        tasks.update(cx, |workspace, cx| {
+                            workspace.tasks_open = !workspace.tasks_open;
+                            let panel = workspace.tasks.clone();
+                            panel.update(cx, |panel, cx| panel.toggle(cx));
+                            cx.notify();
+                        });
+                    }),
+                )
+        };
+
+        let more = {
+            let entity = entity.clone();
+            pill().child(
+                icon_button("toolbar-more", icons::ELLIPSIS, true, false).on_click(
+                    move |event, _, cx| {
+                        let at = event.position();
+                        entity.update(cx, |workspace, cx| {
+                            workspace.open_toolbar_menu(ToolbarMenu::More, at, cx)
+                        });
+                    },
+                ),
+            )
+        };
 
         let search = {
             let entity = entity.clone();
-            div()
-                .id("titlebar-palette")
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_2()
-                .w(px(300.))
-                .h(px(24.))
-                .px_2()
-                .rounded_md()
-                .bg(theme::bg_raised())
-                .text_color(theme::text_faint())
-                .hover(|this| this.bg(theme::bg_hover()).text_color(theme::text_muted()))
-                .on_click(move |_, window, cx| {
-                    entity.update(cx, |workspace, cx| {
-                        workspace.open_palette(PaletteMode::Files, window, cx);
-                    });
-                })
-                .child(
-                    svg()
-                        .path(icons::SEARCH)
-                        .w(px(12.))
-                        .h(px(12.))
-                        .text_color(theme::text_faint()),
-                )
-                .child(div().flex_1().text_sm().child("Search"))
-                .child(div().text_xs().child("⌘P"))
-        };
-
-        let preview_button = {
-            let entity = entity.clone();
-            toolbar_button(
-                "titlebar-preview",
-                icons::EYE,
-                preview_open,
-                theme::accent(),
+            pill().child(
+                icon_button("toolbar-search", icons::SEARCH, true, false).on_click(
+                    move |_, window, cx| {
+                        entity.update(cx, |workspace, cx| {
+                            workspace.open_palette(PaletteMode::Files, window, cx);
+                        });
+                    },
+                ),
             )
-            .on_click(move |_, _, cx| {
-                entity.update(cx, |workspace, cx| {
-                    let pane = workspace.focused_pane();
-                    pane.update(cx, |pane, cx| pane.toggle_preview(cx));
-                    cx.notify();
-                });
-            })
-        };
-
-        let current_view = self.focused_pane().read(cx).view;
-        let view_buttons = {
-            let mut group = div()
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_0p5()
-                .p_0p5()
-                .rounded_md()
-                .bg(theme::bg_raised());
-            for (mode, icon) in [
-                (ViewMode::Icons, icons::VIEW_ICONS),
-                (ViewMode::List, icons::VIEW_LIST),
-                (ViewMode::Columns, icons::VIEW_COLUMNS),
-            ] {
-                let entity = entity.clone();
-                let active = current_view == mode;
-                group = group.child(
-                    toolbar_button(
-                        match mode {
-                            ViewMode::Icons => "view-icons",
-                            ViewMode::List => "view-list",
-                            ViewMode::Columns => "view-columns",
-                        },
-                        icon,
-                        false,
-                        theme::text(),
-                    )
-                    .when(active, |this| this.bg(theme::bg_hover()))
-                    .on_click(move |_, _, cx| {
-                        entity.update(cx, |workspace, cx| workspace.set_view(mode, cx));
-                    }),
-                );
-            }
-            group
-        };
-
-        let sort_button = {
-            let entity = entity.clone();
-            toolbar_button("titlebar-sort", icons::SORT, false, theme::text()).on_click(
-                move |event, _, cx| {
-                    let at = event.position();
-                    entity.update(cx, |workspace, cx| workspace.open_sort_menu(at, cx));
-                },
-            )
-        };
-
-        let split_button = {
-            let entity = entity.clone();
-            toolbar_button("titlebar-split", icons::SPLIT, self.split, theme::accent()).on_click(
-                move |_, window, cx| {
-                    entity.update(cx, |workspace, cx| workspace.toggle_split(window, cx));
-                },
-            )
-        };
-
-        let tasks_button = {
-            let entity = entity.clone();
-            toolbar_button(
-                "titlebar-tasks",
-                icons::TASKS,
-                tasks_open || active_tasks > 0,
-                theme::accent(),
-            )
-            .on_click(move |_, _, cx| {
-                entity.update(cx, |workspace, cx| {
-                    workspace.tasks_open = !workspace.tasks_open;
-                    let tasks = workspace.tasks.clone();
-                    tasks.update(cx, |panel, cx| panel.toggle(cx));
-                    cx.notify();
-                });
-            })
-            .when(active_tasks > 0, |this| {
-                this.child(
-                    div()
-                        .text_xs()
-                        .text_color(theme::accent())
-                        .child(active_tasks.to_string()),
-                )
-            })
         };
 
         div()
             .flex()
             .flex_row()
             .items_center()
-            .h(px(38.0))
+            .gap_2()
+            .h(px(52.0))
             .flex_shrink_0()
-            .pl(px(84.0))
-            .pr_3()
-            .bg(theme::bg())
+            .px_3()
+            .bg(theme::bg_pane())
             .border_b_1()
             .border_color(theme::border_soft())
+            .child(nav)
+            .child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_base()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme::text())
+                    .child(title),
+            )
+            // Empty space drags the window, as the title bar would.
             .child(
                 div()
                     .flex_1()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_1()
-                    .child(view_buttons)
-                    .child(sort_button),
+                    .h_full()
+                    .window_control_area(gpui::WindowControlArea::Drag),
             )
+            .child(view_menu_button)
+            .child(sort_menu_button)
+            .child(panels)
+            .child(more)
             .child(search)
-            .child(
-                div()
-                    .flex_1()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .justify_end()
-                    .gap_1()
-                    .child(split_button)
-                    .child(preview_button)
-                    .child(tasks_button),
-            )
             .into_any_element()
+    }
+
+    /// Open one of the toolbar's dropdown menus under the click.
+    fn open_toolbar_menu(
+        &mut self,
+        which: ToolbarMenu,
+        at: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let (view, sort, show_hidden, preview_open) = {
+            let pane = self.focused_pane().read(cx);
+            (
+                pane.view,
+                pane.sort,
+                pane.listing.show_hidden,
+                pane.preview_open,
+            )
+        };
+        let items = match which {
+            ToolbarMenu::View => view_menu(view),
+            ToolbarMenu::Sort => sort_menu(sort),
+            ToolbarMenu::More => more_menu(MoreState {
+                show_hidden,
+                split: self.split,
+                preview_open,
+                tasks_open: self.tasks_open,
+            }),
+        };
+        self.menu_counter += 1;
+        self.menu = Some(OpenMenu {
+            id: self.menu_counter,
+            // Hang the menu from the button's left side.
+            origin: (f32::from(at.x) - 24.0, f32::from(at.y) + 18.0),
+            items,
+            open_sub: None,
+            target: MenuTarget::Background,
+            ctx: MenuContext::default(),
+            apps: Vec::new(),
+            open_with_only: false,
+        });
+        cx.notify();
     }
 
     /// Favorites list. Clicking navigates whichever pane has focus, which is
@@ -1756,7 +1815,8 @@ impl Workspace {
             ("Locations", location_places()),
         ];
 
-        let mut column = div().flex().flex_col().gap_0p5().px_2();
+        // Room for the window's traffic lights, which sit in the sidebar.
+        let mut column = div().flex().flex_col().gap_0p5().px_2().pt(px(46.));
         let mut index = 0;
         for (title, places) in sections {
             column = column.child(
@@ -1856,41 +1916,89 @@ fn resize_handle(id: &'static str, divider: Divider, cx: &mut Context<Workspace>
         .into_any_element()
 }
 
-/// A square icon button for the toolbar; the caller attaches `on_click`.
-fn toolbar_button(
+/// Which toolbar dropdown to open.
+#[derive(Clone, Copy)]
+enum ToolbarMenu {
+    View,
+    Sort,
+    More,
+}
+
+/// A rounded capsule that groups toolbar buttons, as in Finder.
+fn pill() -> gpui::Div {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .h(px(32.))
+        .px_0p5()
+        .gap_0p5()
+        .rounded_full()
+        .bg(theme::bg_raised())
+        .border_1()
+        .border_color(theme::border_soft())
+}
+
+/// A round icon button inside a pill. `enabled` greys it out; `active` tints it.
+fn icon_button(
     id: &'static str,
     icon: &'static str,
+    enabled: bool,
     active: bool,
-    active_color: gpui::Hsla,
 ) -> gpui::Stateful<gpui::Div> {
+    let color = if !enabled {
+        theme::text_faint()
+    } else if active {
+        theme::accent()
+    } else {
+        theme::text_muted()
+    };
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .justify_center()
+        .w(px(30.))
+        .h(px(28.))
+        .rounded_full()
+        .when(active, |this| this.bg(theme::bg_hover()))
+        .when(enabled, |this| {
+            this.cursor_pointer()
+                .hover(|this| this.bg(theme::bg_hover()))
+        })
+        .child(svg().path(icon).w(px(16.)).h(px(16.)).text_color(color))
+}
+
+/// A pill with an icon and a chevron: opens a dropdown menu.
+fn dropdown_button(id: &'static str, icon: &'static str) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex()
         .flex_row()
         .items_center()
-        .justify_center()
         .gap_1()
-        .h(px(24.))
-        .min_w(px(28.))
-        .px_1()
-        .rounded_md()
-        .when(active, |this| this.bg(theme::bg_raised()))
-        .text_color(if active {
-            active_color
-        } else {
-            theme::text_muted()
-        })
-        .hover(|this| this.bg(theme::bg_hover()).text_color(theme::text()))
+        .h(px(32.))
+        .pl_3()
+        .pr_2()
+        .rounded_full()
+        .bg(theme::bg_raised())
+        .border_1()
+        .border_color(theme::border_soft())
+        .cursor_pointer()
+        .hover(|this| this.bg(theme::bg_hover()))
         .child(
             svg()
                 .path(icon)
-                .w(px(14.))
-                .h(px(14.))
-                .text_color(if active {
-                    active_color
-                } else {
-                    theme::text_muted()
-                }),
+                .w(px(16.))
+                .h(px(16.))
+                .text_color(theme::text_muted()),
+        )
+        .child(
+            svg()
+                .path(icons::CHEVRON_DOWN)
+                .w(px(10.))
+                .h(px(10.))
+                .text_color(theme::text_faint()),
         )
 }
 
