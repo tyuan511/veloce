@@ -4,7 +4,7 @@
 //! Compress / Duplicate / Make Alias / Quick Look / Copy / Paste Item ...). Only
 //! the model lives here; the workspace draws it and runs the chosen action.
 
-use vfs_core::{SortKey, SortSpec};
+use vfs_core::{SortKey, SortSpec, archive::CompressFormat};
 
 use crate::view::ViewMode;
 
@@ -15,7 +15,9 @@ pub enum MenuAction {
     OpenInNewTab,
     OpenInTerminal,
     Preview,
-    CompressZip,
+    Compress(CompressFormat),
+    ExtractHere,
+    ExtractTo,
     CopyPath,
     Cut,
     Copy,
@@ -61,6 +63,8 @@ pub enum MenuTarget {
         count: usize,
         /// A single folder is selected.
         is_dir: bool,
+        /// A single archive is selected: the folder name "Extract to" would create.
+        archive_stem: Option<String>,
     },
 }
 
@@ -165,7 +169,11 @@ pub fn build_menu(target: &MenuTarget, can_paste: bool, view: ViewMode) -> Vec<M
                 view == ViewMode::Columns,
             ),
         ],
-        MenuTarget::Items { count, is_dir } => {
+        MenuTarget::Items {
+            count,
+            is_dir,
+            archive_stem,
+        } => {
             let single = *count == 1;
             let folder = single && *is_dir;
             let mut items = vec![action(Open, "Open", Some("⌘O"), true)];
@@ -177,7 +185,24 @@ pub fn build_menu(target: &MenuTarget, can_paste: bool, view: ViewMode) -> Vec<M
                 items.push(action(Preview, "Preview", Some("Space"), true));
             }
             items.push(MenuItem::Separator);
-            items.push(action(CompressZip, "Compress to ZIP file", None, true));
+            if let (true, Some(stem)) = (single, archive_stem) {
+                items.push(action(ExtractHere, "Extract Here", None, true));
+                items.push(action(
+                    ExtractTo,
+                    &format!("Extract to “{stem}/”"),
+                    None,
+                    true,
+                ));
+            }
+            for format in CompressFormat::ALL {
+                items.push(action(
+                    Compress(format),
+                    &format!("Compress to {}", format.label()),
+                    None,
+                    true,
+                ));
+            }
+            items.push(MenuItem::Separator);
             items.push(action(CopyPath, "Copy as path", Some("⇧⌘C"), true));
             items.push(MenuItem::Separator);
             items.push(action(Cut, "Cut", Some("⌘X"), true));
@@ -263,6 +288,7 @@ mod tests {
         MenuTarget::Items {
             count,
             is_dir: false,
+            archive_stem: None,
         }
     }
 
@@ -270,6 +296,15 @@ mod tests {
         MenuTarget::Items {
             count: 1,
             is_dir: true,
+            archive_stem: None,
+        }
+    }
+
+    fn archive() -> MenuTarget {
+        MenuTarget::Items {
+            count: 1,
+            is_dir: false,
+            archive_stem: Some("photos".to_string()),
         }
     }
 
@@ -323,6 +358,50 @@ mod tests {
         assert!(!has(
             &build_menu(&files(1), true, ViewMode::List),
             MenuAction::PasteInto
+        ));
+    }
+
+    #[test]
+    fn every_compress_format_is_offered_for_any_selection() {
+        for target in [files(1), files(3), folder(), archive()] {
+            let items = build_menu(&target, false, ViewMode::List);
+            for format in CompressFormat::ALL {
+                assert!(has(&items, MenuAction::Compress(format)), "{format:?}");
+            }
+        }
+        assert!(
+            labels(&build_menu(&files(1), false, ViewMode::List)).contains(&"Compress to ZIP file")
+        );
+        assert!(
+            labels(&build_menu(&files(1), false, ViewMode::List)).contains(&"Compress to TAR.GZ")
+        );
+    }
+
+    #[test]
+    fn archives_offer_extraction_named_after_their_stem() {
+        let items = build_menu(&archive(), false, ViewMode::List);
+        assert!(has(&items, MenuAction::ExtractHere));
+        assert!(labels(&items).contains(&"Extract to “photos/”"));
+    }
+
+    #[test]
+    fn only_a_single_archive_offers_extraction() {
+        assert!(!has(
+            &build_menu(&files(1), false, ViewMode::List),
+            MenuAction::ExtractHere
+        ));
+        assert!(!has(
+            &build_menu(&folder(), false, ViewMode::List),
+            MenuAction::ExtractTo
+        ));
+        let many = MenuTarget::Items {
+            count: 2,
+            is_dir: false,
+            archive_stem: Some("a".into()),
+        };
+        assert!(!has(
+            &build_menu(&many, false, ViewMode::List),
+            MenuAction::ExtractHere
         ));
     }
 

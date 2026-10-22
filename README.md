@@ -106,7 +106,13 @@ compile once at first launch.
 - **Fixed row height + `uniform_list`.** Virtualization is arithmetic, so cost per frame
   is independent of directory size.
 - **Bounded preview.** Text previews read 64 KiB and render at most 400 lines: a 10 GB
-  log opens instantly instead of freezing the window.
+  log opens instantly instead of freezing the window. Archives list their first 500
+  entries, binaries show a 512-byte hex dump, and on macOS PDFs, video, audio artwork,
+  Office/iWork documents, HEIC, RAW, fonts and 3D models render through Quick Look
+  thumbnails (cached, with a timeout) — all off the UI thread.
+- **Archives.** Right-click compresses to ZIP, TAR.GZ, TAR.XZ, TAR.BZ2 and 7Z, and
+  extracts zip / tar.* / 7z / rar / gz / bz2 / xz / zst with the system `tar`, `zip`
+  and `gzip` (here or into a new `name/` folder, never merging into an existing one).
 - **Trash, never `rm`.** Deleting uses the `trash` crate; there is no hard-delete path in
   the UI at all.
 - **Conflicts default to "keep both".** Copies rename to `name 2.ext` rather than
@@ -117,8 +123,8 @@ compile once at first launch.
 ## Tests
 
 ```sh
-cargo test              # 258 tests, no GPU or window server needed
-cargo test -p vfs-core  # 145 core tests
+cargo test              # 286 tests, no GPU or window server needed
+cargo test -p vfs-core  # 156 core tests
 ```
 
 **UI is not covered by automated tests** (see `AGENTS.md`): interaction is verified

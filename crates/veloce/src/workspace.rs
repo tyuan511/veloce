@@ -228,6 +228,10 @@ impl Workspace {
             (true, Some(first)) => MenuTarget::Items {
                 count: selection.len(),
                 is_dir: selection.len() == 1 && first.is_dir(),
+                archive_stem: (selection.len() == 1 && !first.is_dir())
+                    .then(|| vfs_core::archive::ArchiveKind::detect(&first.name))
+                    .flatten()
+                    .map(|_| vfs_core::archive::archive_stem(&first.name)),
             },
             _ => MenuTarget::Background,
         };
@@ -354,7 +358,11 @@ impl Workspace {
                     self.toggle_quick_look(cx);
                 }
             }
-            MenuAction::CompressZip => pane.update(cx, |pane, cx| pane.compress_selection(cx)),
+            MenuAction::Compress(format) => {
+                pane.update(cx, |pane, cx| pane.compress_selection(format, cx))
+            }
+            MenuAction::ExtractHere => pane.update(cx, |pane, cx| pane.extract_selection(true, cx)),
+            MenuAction::ExtractTo => pane.update(cx, |pane, cx| pane.extract_selection(false, cx)),
             MenuAction::CopyPath => {
                 let paths = pane.read(cx).selection_paths();
                 Self::copy_text_to_clipboard(&paths, cx);

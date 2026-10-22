@@ -23,8 +23,12 @@ use gpui::{
 };
 use vfs_core::{
     FileEntry, FileKind, Filter, LocalProvider, SortKey, SortSpec, VfsProvider, VfsUri,
+    archive::{
+        self, ArchiveKind, CommandSpec, CompressFormat, compress_archive_path, compress_command,
+        extract_command, extract_dir_path,
+    },
     entry::{format_relative, format_size},
-    ops::{ConflictPolicy, TaskManager, archive_path, shortcut_path},
+    ops::{ConflictPolicy, TaskManager, shortcut_path},
 };
 
 use crate::{
@@ -831,51 +835,78 @@ impl Pane {
         .detach();
     }
 
-    /// `Compress to ZIP file`: a zip next to the first item, written by the system `zip` so
-    /// symlinks and permissions survive.
-    pub fn compress_selection(&mut self, cx: &mut Context<Self>) {
+    /// `Compress to ...`: an archive next to the first item, written by the
+    /// system tools so symlinks and permissions survive.
+    pub fn compress_selection(&mut self, format: CompressFormat, cx: &mut Context<Self>) {
         let sources = self.selection_paths();
-        let Some(archive) = archive_path(&sources) else {
+        let Some(archive) = compress_archive_path(&sources, format) else {
             return;
         };
-        let Some(dir) = archive.parent().map(|dir| dir.to_path_buf()) else {
+        let names: Vec<std::ffi::OsString> = sources
+            .iter()
+            .filter_map(|source| source.file_name().map(|name| name.to_os_string()))
+            .collect();
+        let spec = compress_command(format, &archive, &names);
+        self.run_archive_job(
+            spec,
+            None,
+            format!("Compress to {} failed", format.label()),
+            cx,
+        );
+    }
+
+    /// `Extract Here` / `Extract to "name/"`: unpack the cursor's archive.
+    pub fn extract_selection(&mut self, here: bool, cx: &mut Context<Self>) {
+        let Some(archive) = self
+            .cursor_entry()
+            .and_then(|entry| entry.uri.as_local_path())
+        else {
             return;
         };
+        let Some(kind) = archive
+            .file_name()
+            .and_then(|name| ArchiveKind::detect(&name.to_string_lossy()))
+        else {
+            cx.emit(PaneEvent::Notice("This is not a supported archive".into()));
+            return;
+        };
+        let dest = if here {
+            archive.parent().map(|parent| parent.to_path_buf())
+        } else {
+            extract_dir_path(&archive)
+        };
+        let Some(dest) = dest else {
+            return;
+        };
+        let spec = extract_command(kind, &archive, &dest);
+        self.run_archive_job(spec, Some(dest), "Extract failed".to_string(), cx);
+    }
+
+    /// Run an archive tool off the UI thread; failures surface as a banner and the
+    /// listing refreshes either way.
+    fn run_archive_job(
+        &mut self,
+        spec: CommandSpec,
+        create_dir: Option<PathBuf>,
+        failure: String,
+        cx: &mut Context<Self>,
+    ) {
         cx.spawn(async move |this, cx| {
-            let target = archive.clone();
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let mut command = std::process::Command::new("zip");
-                    command
-                        .current_dir(&dir)
-                        .arg("-r")
-                        .arg("-q")
-                        .arg("-y")
-                        .arg(&target);
-                    for source in &sources {
-                        if let Some(name) = source.file_name() {
-                            command.arg(name);
-                        }
+                    if let Some(dir) = create_dir {
+                        std::fs::create_dir_all(&dir)
+                            .map_err(|error| format!("Cannot create {}: {error}", dir.display()))?;
                     }
-                    let output = command
-                        .output()
-                        .map_err(|error| format!("Cannot run zip: {error}"))?;
-                    if output.status.success() {
-                        Ok(())
-                    } else {
-                        Err(format!(
-                            "Compress failed: {}",
-                            String::from_utf8_lossy(&output.stderr).trim()
-                        ))
-                    }
+                    archive::run(&spec)
                 })
                 .await;
             this.update(cx, |pane, cx| {
                 if let Err(message) = result {
-                    cx.emit(PaneEvent::Notice(message));
+                    cx.emit(PaneEvent::Notice(format!("{failure}: {message}")));
                 }
-                pane.reload(cx);
+                pane.refresh(cx);
             })
             .ok();
         })
@@ -1662,7 +1693,7 @@ pub(crate) fn entry_icon(entry: &FileEntry, size: f32) -> AnyElement {
     } else {
         file_icons::file_icon_id(&entry.name)
     };
-    img(file_icons::asset_path(id))
+    img(file_icons::asset_path(id, size))
         .w(px(size))
         .h(px(size))
         .flex_shrink_0()

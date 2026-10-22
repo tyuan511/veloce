@@ -70,7 +70,7 @@ pub struct EmbeddedAssets;
 impl AssetSource for EmbeddedAssets {
     fn load(&self, path: &str) -> Result<Option<Cow<'static, [u8]>>> {
         if let Some(bytes) = crate::file_icons::asset_bytes(path) {
-            return Ok(Some(Cow::Borrowed(bytes)));
+            return Ok(Some(Cow::Owned(bytes)));
         }
         Ok(ICONS
             .iter()

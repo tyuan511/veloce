@@ -44,18 +44,49 @@ pub fn folder_icon_id(name: &str, expanded: bool) -> &'static str {
     }
 }
 
-/// Embedded-asset path for an icon id.
-pub fn asset_path(id: &str) -> String {
-    format!("file-icons/{id}.svg")
+/// Embedded-asset path for an icon id rendered at `size` logical pixels.
+///
+/// The size is part of the path because GPUI rasterises an SVG once, at twice its
+/// intrinsic size, and then scales that bitmap: a 32-unit icon drawn at 96px would
+/// be an upscaled 64px bitmap. Baking the target size into the asset makes each
+/// size its own (cached) sharp raster.
+pub fn asset_path(id: &str, size: f32) -> String {
+    format!("file-icons/{id}@{}.svg", size.round().max(1.0) as u32)
 }
 
-/// Bytes of an embedded icon, looked up by the id taken from an asset path.
-pub fn asset_bytes(path: &str) -> Option<&'static [u8]> {
-    let id = path.strip_prefix("file-icons/")?.strip_suffix(".svg")?;
+/// Embedded SVG with its root `width`/`height` set to `px`.
+fn sized_svg(svg: &[u8], px: u32) -> Vec<u8> {
+    const ROOT: &[u8] = b"<svg";
+    let Some(start) = svg.windows(ROOT.len()).position(|w| w == ROOT) else {
+        return svg.to_vec();
+    };
+    let tag_end = svg[start..]
+        .iter()
+        .position(|&b| b == b'>')
+        .map_or(svg.len(), |i| start + i);
+    let root = &svg[start..tag_end];
+    if root.windows(7).any(|w| w == b" width=") {
+        return svg.to_vec();
+    }
+    let at = start + ROOT.len();
+    let mut out = Vec::with_capacity(svg.len() + 32);
+    out.extend_from_slice(&svg[..at]);
+    out.extend_from_slice(format!(" width=\"{px}\" height=\"{px}\"").as_bytes());
+    out.extend_from_slice(&svg[at..]);
+    out
+}
+
+/// Bytes of an embedded icon, looked up by an asset path from [`asset_path`].
+pub fn asset_bytes(path: &str) -> Option<Vec<u8>> {
+    let (id, size) = path
+        .strip_prefix("file-icons/")?
+        .strip_suffix(".svg")?
+        .rsplit_once('@')?;
+    let px: u32 = size.parse().ok()?;
     ASSETS
         .binary_search_by(|(k, _)| (*k).cmp(id))
         .ok()
-        .map(|index| ASSETS[index].1)
+        .map(|index| sized_svg(ASSETS[index].1, px))
 }
 
 #[cfg(test)]
@@ -102,11 +133,39 @@ mod tests {
             folder_icon_id("src", false),
             folder_icon_id("zzz", true),
         ] {
-            let bytes = asset_bytes(&asset_path(id)).expect(id);
-            assert!(std::str::from_utf8(bytes).unwrap().contains("<svg"), "{id}");
+            let bytes = asset_bytes(&asset_path(id, 16.0)).expect(id);
+            assert!(
+                std::str::from_utf8(&bytes).unwrap().contains("<svg"),
+                "{id}"
+            );
         }
-        assert!(asset_bytes("file-icons/nope.svg").is_none());
+        assert!(asset_bytes("file-icons/nope@16.svg").is_none());
+        assert!(asset_bytes("file-icons/default_file.svg").is_none());
         assert!(asset_bytes("icons/folder.svg").is_none());
+    }
+
+    #[test]
+    fn bakes_the_target_size_into_the_root_element() {
+        let svg = br#"<svg xmlns="x" viewBox="0 0 32 32"><path d="M0 0"/></svg>"#;
+        let sized = String::from_utf8(sized_svg(svg, 96)).unwrap();
+        assert!(
+            sized.starts_with(r#"<svg width="96" height="96" xmlns="x""#),
+            "{sized}"
+        );
+        assert!(sized.ends_with("</svg>"));
+    }
+
+    #[test]
+    fn keeps_svgs_that_already_declare_a_size() {
+        let svg = br#"<svg width="24" height="24" viewBox="0 0 32 32"/>"#;
+        assert_eq!(sized_svg(svg, 96), svg);
+        assert_eq!(sized_svg(b"not svg", 96), b"not svg");
+    }
+
+    #[test]
+    fn different_sizes_get_different_asset_paths() {
+        assert_ne!(asset_path("x", 16.0), asset_path("x", 96.0));
+        assert_eq!(asset_path("x", 15.6), "file-icons/x@16.svg");
     }
 
     #[test]

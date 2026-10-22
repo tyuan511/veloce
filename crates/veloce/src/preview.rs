@@ -14,10 +14,11 @@ use gpui::{
 };
 use vfs_core::{
     FileEntry, LocalProvider, VfsProvider,
+    archive::{ArchiveKind, list_entries},
     entry::{format_size, format_time},
 };
 
-use crate::{icons, theme};
+use crate::{file_icons, icons, theme};
 
 /// How much of a text file is read for the preview.
 pub const PREVIEW_BYTES: u64 = 64 * 1024;
@@ -37,12 +38,34 @@ pub const PREVIEW_LINES: usize = 400;
 #[derive(Debug, Clone)]
 pub enum PreviewContent {
     Empty,
-    Loading { name: String },
-    Text { lines: Vec<String>, truncated: bool },
-    Image { path: PathBuf },
-    Binary { size: u64 },
-    Directory { children: usize },
-    Error { message: String },
+    Loading {
+        name: String,
+    },
+    Text {
+        lines: Vec<String>,
+        truncated: bool,
+    },
+    Image {
+        path: PathBuf,
+    },
+    /// Not text: size plus a hex dump of the head so it is still inspectable.
+    Binary {
+        size: u64,
+        dump: Vec<String>,
+    },
+    /// Entry names of an archive, as listed by `tar` (capped).
+    Archive {
+        entries: Vec<String>,
+        truncated: bool,
+    },
+    /// Immediate children (name, is_dir), capped.
+    Directory {
+        children: usize,
+        names: Vec<(String, bool)>,
+    },
+    Error {
+        message: String,
+    },
 }
 
 /// The preview panel's state. Owned by the workspace, not by a pane, so the two
@@ -91,7 +114,11 @@ impl Preview {
         self.token = token.clone();
 
         cx.spawn(async move |this, cx| {
-            let content = build_preview(&entry).await;
+            // Reading files and running `tar` / `qlmanage` must not block the UI.
+            let content = cx
+                .background_executor()
+                .spawn(async move { build_preview(&entry).await })
+                .await;
             this.update(cx, |preview, cx| {
                 if token.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
@@ -172,42 +199,266 @@ fn is_text_extension(ext: &str) -> bool {
 fn is_image_extension(ext: &str) -> bool {
     matches!(
         ext,
-        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "tif" | "ico" | "avif"
+        "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "tiff" | "tif" | "ico" | "avif" | "svg"
     )
 }
 
+/// Formats GPUI cannot decode but macOS Quick Look can render as a thumbnail:
+/// documents, video, audio artwork, camera RAW, HEIC, fonts and 3D models.
+fn is_thumbnail_extension(ext: &str) -> bool {
+    matches!(
+        ext,
+        "pdf"
+            | "heic"
+            | "heif"
+            | "psd"
+            | "ai"
+            | "eps"
+            | "cr2"
+            | "cr3"
+            | "nef"
+            | "arw"
+            | "dng"
+            | "raf"
+            | "orf"
+            | "mp4"
+            | "m4v"
+            | "mov"
+            | "avi"
+            | "mkv"
+            | "webm"
+            | "mp3"
+            | "m4a"
+            | "wav"
+            | "aac"
+            | "flac"
+            | "aiff"
+            | "doc"
+            | "docx"
+            | "xls"
+            | "xlsx"
+            | "ppt"
+            | "pptx"
+            | "pages"
+            | "numbers"
+            | "key"
+            | "rtf"
+            | "rtfd"
+            | "odt"
+            | "ods"
+            | "odp"
+            | "epub"
+            | "ttf"
+            | "otf"
+            | "ttc"
+            | "usdz"
+            | "obj"
+            | "stl"
+            | "dae"
+    )
+}
+
+/// How a file is previewed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+    /// Decoded by GPUI directly.
+    Image,
+    /// Rendered to a PNG by the system's Quick Look.
+    Thumbnail,
+    Archive,
+    Text,
+    /// Unknown: look at the first bytes to decide text vs binary.
+    Sniff,
+}
+
+fn route_for(name: &str, extension: &str, thumbnails: bool) -> Route {
+    if is_image_extension(extension) {
+        Route::Image
+    } else if thumbnails && is_thumbnail_extension(extension) {
+        Route::Thumbnail
+    } else if ArchiveKind::detect(name).is_some() {
+        Route::Archive
+    } else if is_text_extension(extension) {
+        Route::Text
+    } else {
+        Route::Sniff
+    }
+}
+
+/// Archive entries shown before the list is cut off.
+pub const ARCHIVE_PREVIEW_ENTRIES: usize = 500;
+/// Folder entries shown before the list is cut off.
+pub const DIRECTORY_PREVIEW_ENTRIES: usize = 300;
+/// Bytes of a binary file shown as hex.
+pub const HEX_PREVIEW_BYTES: usize = 512;
+
+/// `xxd`-style rows: offset, 16 hex bytes, printable ASCII.
+pub fn hex_dump(bytes: &[u8], max_bytes: usize) -> Vec<String> {
+    bytes
+        .iter()
+        .take(max_bytes)
+        .copied()
+        .collect::<Vec<u8>>()
+        .chunks(16)
+        .enumerate()
+        .map(|(row, chunk)| {
+            let hex: Vec<String> = (0..16)
+                .map(|i| {
+                    chunk
+                        .get(i)
+                        .map(|byte| format!("{byte:02x}"))
+                        .unwrap_or_else(|| "  ".to_string())
+                })
+                .collect();
+            let ascii: String = chunk
+                .iter()
+                .map(|byte| {
+                    if byte.is_ascii_graphic() || *byte == b' ' {
+                        *byte as char
+                    } else {
+                        '.'
+                    }
+                })
+                .collect();
+            format!("{:08x}  {}  {}", row * 16, hex.join(" "), ascii)
+        })
+        .collect()
+}
+
+/// Stable cache directory name for a thumbnail: changes when the file does.
+pub fn thumbnail_cache_key(path: &Path, size: u64, modified_secs: u64) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    size.hash(&mut hasher);
+    modified_secs.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Render a Quick Look thumbnail with `qlmanage` (macOS), cached on disk.
+#[cfg(target_os = "macos")]
+fn quicklook_thumbnail(entry: &FileEntry, path: &Path) -> Option<PathBuf> {
+    use std::{
+        process::{Command, Stdio},
+        time::{Duration, Instant, UNIX_EPOCH},
+    };
+
+    let modified = entry
+        .modified
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0);
+    let key = thumbnail_cache_key(path, entry.size, modified);
+    let dir = std::env::temp_dir().join("veloce-thumbnails").join(key);
+    let output = dir.join(format!("{}.png", path.file_name()?.to_string_lossy()));
+    if output.is_file() {
+        return Some(output);
+    }
+    std::fs::create_dir_all(&dir).ok()?;
+    let mut child = Command::new("qlmanage")
+        .args(["-t", "-s", "1024", "-o"])
+        .arg(&dir)
+        .arg(path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // Some files make Quick Look hang; give up rather than spin forever.
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(40));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break;
+            }
+        }
+    }
+    output.is_file().then_some(output)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn quicklook_thumbnail(_entry: &FileEntry, _path: &Path) -> Option<PathBuf> {
+    None
+}
+
+/// Whether this platform can render Quick Look thumbnails.
+const THUMBNAILS: bool = cfg!(target_os = "macos");
+
 async fn build_preview(entry: &FileEntry) -> PreviewContent {
-    let name = entry.name.clone();
     if entry.is_dir() {
-        // Count the immediate children: cheap, and it tells you if the folder is
-        // worth opening.
-        let children = entry
-            .uri
-            .as_local_path()
-            .and_then(|path| std::fs::read_dir(path).ok())
-            .map(|entries| entries.flatten().count())
-            .unwrap_or(0);
-        let _ = name;
-        return PreviewContent::Directory { children };
+        return directory_preview(entry);
     }
-
-    let extension = entry.extension().unwrap_or_default();
-    if is_image_extension(&extension) {
-        let Some(path) = entry.uri.as_local_path() else {
-            return PreviewContent::Error {
-                message: "Remote previews arrive with the SFTP backend".to_string(),
-            };
+    let Some(path) = entry.uri.as_local_path() else {
+        return PreviewContent::Error {
+            message: "Remote previews arrive with the SFTP backend".to_string(),
         };
-        return PreviewContent::Image { path };
-    }
-
+    };
+    let extension = entry.extension().unwrap_or_default();
     let provider = LocalProvider::new();
-    if is_text_extension(&extension) {
-        return read_text_preview(&provider, entry).await;
-    }
 
-    // Unknown extension: sniff the first block for NUL bytes.
-    match read_head(&provider, entry).await {
+    match route_for(&entry.name, &extension, THUMBNAILS) {
+        Route::Image => PreviewContent::Image { path },
+        Route::Thumbnail => match quicklook_thumbnail(entry, &path) {
+            Some(thumbnail) => PreviewContent::Image { path: thumbnail },
+            // No thumbnail (DRM media, odd codec ...): fall back to the bytes.
+            None => sniff_preview(&provider, entry).await,
+        },
+        Route::Archive => {
+            let kind = ArchiveKind::detect(&entry.name);
+            let listed = kind
+                .ok_or_else(|| "Not an archive".to_string())
+                .and_then(|kind| list_entries(kind, &path, ARCHIVE_PREVIEW_ENTRIES + 1));
+            match listed {
+                Ok(mut entries) => {
+                    let truncated = entries.len() > ARCHIVE_PREVIEW_ENTRIES;
+                    entries.truncate(ARCHIVE_PREVIEW_ENTRIES);
+                    PreviewContent::Archive { entries, truncated }
+                }
+                // Single-file compressions and unreadable archives still get bytes.
+                Err(_) => sniff_preview(&provider, entry).await,
+            }
+        }
+        Route::Text => read_text_preview(&provider, entry).await,
+        Route::Sniff => sniff_preview(&provider, entry).await,
+    }
+}
+
+fn directory_preview(entry: &FileEntry) -> PreviewContent {
+    let Some(path) = entry.uri.as_local_path() else {
+        return PreviewContent::Directory {
+            children: 0,
+            names: Vec::new(),
+        };
+    };
+    let mut names: Vec<(String, bool)> = std::fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|child| {
+                    let is_dir = child.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    (child.file_name().to_string_lossy().into_owned(), is_dir)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let children = names.len();
+    // Folders first, then names, so the cut-off keeps the most useful rows.
+    names.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| a.0.to_lowercase().cmp(&b.0.to_lowercase()))
+    });
+    names.truncate(DIRECTORY_PREVIEW_ENTRIES);
+    PreviewContent::Directory { children, names }
+}
+
+async fn sniff_preview(provider: &LocalProvider, entry: &FileEntry) -> PreviewContent {
+    match read_head(provider, entry).await {
         Ok(head) => classify_head(&head, entry.size),
         Err(error) => PreviewContent::Error { message: error },
     }
@@ -245,7 +496,10 @@ async fn read_head(provider: &LocalProvider, entry: &FileEntry) -> Result<Vec<u8
 /// decoding, because a preview must never fail on a stray invalid byte.
 fn classify_head(head: &[u8], total_size: u64) -> PreviewContent {
     if head.iter().take(BINARY_SNIFF_BYTES).any(|byte| *byte == 0) {
-        return PreviewContent::Binary { size: total_size };
+        return PreviewContent::Binary {
+            size: total_size,
+            dump: hex_dump(head, HEX_PREVIEW_BYTES),
+        };
     }
     let text = String::from_utf8_lossy(head).to_string();
     let (lines, capped) = split_lines(&text);
@@ -346,8 +600,9 @@ pub fn render_preview(
         PreviewContent::Loading { name } => loading_state(name),
         PreviewContent::Text { lines, truncated } => text_state(lines, *truncated),
         PreviewContent::Image { path } => image_state(path),
-        PreviewContent::Binary { size } => binary_state(*size),
-        PreviewContent::Directory { children } => directory_state(*children),
+        PreviewContent::Binary { size, dump } => binary_state(*size, dump),
+        PreviewContent::Archive { entries, truncated } => archive_state(entries, *truncated),
+        PreviewContent::Directory { children, names } => directory_state(*children, names),
         PreviewContent::Error { message } => error_state(message),
     };
 
@@ -369,6 +624,7 @@ fn render_header(entry: Option<&FileEntry>, content: &PreviewContent) -> AnyElem
     let name = entry.map(|entry| entry.name.clone()).unwrap_or_default();
     let (icon, tint) = match content {
         PreviewContent::Directory { .. } => (icons::FOLDER, theme::blue()),
+        PreviewContent::Archive { .. } => (icons::FILE, theme::yellow()),
         PreviewContent::Image { .. } => (icons::FILE, theme::green()),
         _ => (
             icons::FILE,
@@ -575,22 +831,155 @@ fn image_state(path: &Path) -> AnyElement {
         .into_any_element()
 }
 
-fn binary_state(size: u64) -> AnyElement {
-    centered_hint(
-        icons::FILE,
-        "Binary file",
-        &format!("{} · no text preview", format_size(size)),
-        theme::text_faint(),
-    )
+fn binary_state(size: u64, dump: &[String]) -> AnyElement {
+    if dump.is_empty() {
+        return centered_hint(
+            icons::FILE,
+            "Binary file",
+            &format!("{} · no preview", format_size(size)),
+            theme::text_faint(),
+        );
+    }
+    div()
+        .id("preview-hex")
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .px_3()
+        .py_2()
+        .child(
+            div()
+                .mb_2()
+                .text_xs()
+                .text_color(theme::text_faint())
+                .child(format!(
+                    "Binary · {} · first {} bytes",
+                    format_size(size),
+                    HEX_PREVIEW_BYTES
+                )),
+        )
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .font_family(theme::MONO_FAMILY)
+                .text_size(px(11.))
+                .line_height(px(15.))
+                .text_color(theme::text_muted())
+                .children(
+                    dump.iter()
+                        .map(|row| div().whitespace_nowrap().child(row.clone())),
+                ),
+        )
+        .into_any_element()
 }
 
-fn directory_state(children: usize) -> AnyElement {
-    centered_hint(
-        icons::FOLDER,
-        "Folder",
-        &format!("{children} items inside"),
-        theme::blue(),
-    )
+/// One icon + name row, used by the archive and folder listings.
+fn list_row(name: &str, is_dir: bool, depth: usize) -> AnyElement {
+    let id = if is_dir {
+        file_icons::folder_icon_id(name, false)
+    } else {
+        file_icons::file_icon_id(name)
+    };
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .gap_2()
+        .h(px(22.))
+        .pl(px(12.0 * depth as f32))
+        .child(
+            img(file_icons::asset_path(id, 14.0))
+                .w(px(14.))
+                .h(px(14.))
+                .flex_shrink_0(),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_xs()
+                .text_color(theme::text())
+                .child(name.to_string()),
+        )
+        .into_any_element()
+}
+
+/// Archive entry paths become indented names: `src/main.rs` shows as `main.rs`
+/// one level in, which keeps the tree readable without building one.
+fn archive_rows(entries: &[String]) -> Vec<(String, bool, usize)> {
+    entries
+        .iter()
+        .map(|entry| {
+            let is_dir = entry.ends_with('/');
+            let trimmed = entry.trim_end_matches('/');
+            let depth = trimmed.matches('/').count();
+            let name = trimmed.rsplit('/').next().unwrap_or(trimmed).to_string();
+            (name, is_dir, depth)
+        })
+        .collect()
+}
+
+fn archive_state(entries: &[String], truncated: bool) -> AnyElement {
+    let rows = archive_rows(entries);
+    div()
+        .id("preview-archive")
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .px_3()
+        .py_2()
+        .child(
+            div()
+                .mb_2()
+                .text_xs()
+                .text_color(theme::text_faint())
+                .child(if truncated {
+                    format!("Archive · first {} entries", entries.len())
+                } else {
+                    format!("Archive · {} entries", entries.len())
+                }),
+        )
+        .children(
+            rows.iter()
+                .map(|(name, is_dir, depth)| list_row(name, *is_dir, *depth)),
+        )
+        .into_any_element()
+}
+
+fn directory_state(children: usize, names: &[(String, bool)]) -> AnyElement {
+    if names.is_empty() {
+        return centered_hint(
+            icons::FOLDER,
+            "Folder",
+            &format!("{children} items inside"),
+            theme::blue(),
+        );
+    }
+    div()
+        .id("preview-folder")
+        .flex_1()
+        .min_h_0()
+        .overflow_y_scroll()
+        .px_3()
+        .py_2()
+        .child(
+            div()
+                .mb_2()
+                .text_xs()
+                .text_color(theme::text_faint())
+                .child(if children > names.len() {
+                    format!("{children} items · showing {}", names.len())
+                } else {
+                    format!("{children} items")
+                }),
+        )
+        .children(
+            names
+                .iter()
+                .map(|(name, is_dir)| list_row(name, *is_dir, 0)),
+        )
+        .into_any_element()
 }
 
 fn error_state(message: &str) -> AnyElement {
@@ -686,7 +1075,10 @@ mod tests {
         let entry = entry_for(&folder);
         let content = futures::executor::block_on(build_preview(&entry));
         match content {
-            PreviewContent::Directory { children, .. } => assert_eq!(children, 3),
+            PreviewContent::Directory { children, names } => {
+                assert_eq!(children, 3);
+                assert_eq!(names.len(), 3);
+            }
             other => panic!("expected directory preview, got {other:?}"),
         }
     }
@@ -708,6 +1100,141 @@ mod tests {
         assert!(truncated);
         assert_eq!(lines.len(), PREVIEW_LINES);
         assert_eq!(lines[0], "a    b");
+    }
+
+    #[test]
+    fn folder_preview_lists_folders_before_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("root");
+        fs::create_dir_all(folder.join("zeta")).unwrap();
+        fs::write(folder.join("alpha.txt"), b"x").unwrap();
+        let entry = entry_for(&folder);
+        match futures::executor::block_on(build_preview(&entry)) {
+            PreviewContent::Directory { names, .. } => {
+                assert_eq!(names[0], ("zeta".to_string(), true));
+                assert_eq!(names[1], ("alpha.txt".to_string(), false));
+            }
+            other => panic!("expected directory preview, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn archive_preview_lists_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("pkg");
+        fs::create_dir(&src).unwrap();
+        fs::write(src.join("readme.md"), b"hi").unwrap();
+        let archive = dir.path().join("pkg.tar.gz");
+        vfs_core::archive::run(&vfs_core::archive::compress_command(
+            vfs_core::archive::CompressFormat::TarGz,
+            &archive,
+            &[std::ffi::OsString::from("pkg")],
+        ))
+        .unwrap();
+        let entry = entry_for(&archive);
+        match futures::executor::block_on(build_preview(&entry)) {
+            PreviewContent::Archive { entries, truncated } => {
+                assert!(!truncated);
+                assert!(entries.iter().any(|e| e.ends_with("readme.md")));
+            }
+            other => panic!("expected archive preview, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn corrupt_archive_falls_back_to_the_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("broken.zip");
+        fs::write(&path, [0u8, 1, 2, 3]).unwrap();
+        let entry = entry_for(&path);
+        let content = futures::executor::block_on(build_preview(&entry));
+        assert!(
+            matches!(content, PreviewContent::Binary { .. }),
+            "{content:?}"
+        );
+    }
+
+    #[test]
+    fn binary_preview_includes_a_hex_dump() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blob.dat");
+        fs::write(&path, [0u8, 1, 2, 0x41]).unwrap();
+        let entry = entry_for(&path);
+        match futures::executor::block_on(build_preview(&entry)) {
+            PreviewContent::Binary { dump, .. } => {
+                assert_eq!(dump.len(), 1);
+                assert!(dump[0].contains("00 01 02 41"));
+            }
+            other => panic!("expected binary preview, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hex_dump_formats_offset_hex_and_ascii_rows() {
+        let rows = hex_dump(b"Hello, world!!!!XYZ", 64);
+        assert_eq!(rows.len(), 2);
+        assert!(rows[0].starts_with("00000000  48 65 6c 6c 6f"));
+        assert!(rows[0].ends_with("Hello, world!!!!"));
+        assert!(rows[1].starts_with("00000010  58 59 5a"));
+        assert!(rows[1].ends_with("XYZ"));
+    }
+
+    #[test]
+    fn hex_dump_masks_unprintable_bytes_and_respects_the_cap() {
+        let rows = hex_dump(&[0x00, 0x7f, b'a'], 64);
+        assert!(rows[0].ends_with("..a"));
+        assert_eq!(hex_dump(&[0u8; 100], 32).len(), 2);
+        assert!(hex_dump(&[], 32).is_empty());
+    }
+
+    #[test]
+    fn routing_prefers_direct_images_then_thumbnails_then_archives() {
+        assert_eq!(route_for("a.png", "png", true), Route::Image);
+        assert_eq!(route_for("a.svg", "svg", true), Route::Image);
+        assert_eq!(route_for("a.pdf", "pdf", true), Route::Thumbnail);
+        assert_eq!(route_for("a.mp4", "mp4", true), Route::Thumbnail);
+        assert_eq!(route_for("a.zip", "zip", true), Route::Archive);
+        assert_eq!(route_for("a.tar.gz", "gz", true), Route::Archive);
+        assert_eq!(route_for("a.rs", "rs", true), Route::Text);
+        assert_eq!(route_for("a.weird", "weird", true), Route::Sniff);
+    }
+
+    #[test]
+    fn without_thumbnail_support_documents_fall_back_to_sniffing() {
+        assert_eq!(route_for("a.pdf", "pdf", false), Route::Sniff);
+        assert_eq!(route_for("a.docx", "docx", false), Route::Sniff);
+        assert_eq!(route_for("a.png", "png", false), Route::Image);
+    }
+
+    #[test]
+    fn office_documents_are_thumbnailed_not_listed_as_zips() {
+        assert_eq!(route_for("report.docx", "docx", true), Route::Thumbnail);
+    }
+
+    #[test]
+    fn archive_rows_indent_by_path_depth_and_flag_folders() {
+        let rows = archive_rows(&[
+            "pkg/".to_string(),
+            "pkg/src/".to_string(),
+            "pkg/src/main.rs".to_string(),
+        ]);
+        assert_eq!(rows[0], ("pkg".to_string(), true, 0));
+        assert_eq!(rows[1], ("src".to_string(), true, 1));
+        assert_eq!(rows[2], ("main.rs".to_string(), false, 2));
+    }
+
+    #[test]
+    fn thumbnail_cache_key_changes_with_the_file() {
+        let path = Path::new("/a/b.pdf");
+        let base = thumbnail_cache_key(path, 10, 1);
+        assert_eq!(base, thumbnail_cache_key(path, 10, 1), "deterministic");
+        assert_ne!(base, thumbnail_cache_key(path, 11, 1), "size");
+        assert_ne!(base, thumbnail_cache_key(path, 10, 2), "mtime");
+        assert_ne!(
+            base,
+            thumbnail_cache_key(Path::new("/a/c.pdf"), 10, 1),
+            "path"
+        );
     }
 }
 
@@ -733,7 +1260,7 @@ mod edge_tests {
     fn classify_flags_binary_on_the_first_nul() {
         assert!(matches!(
             classify_head(&[b'a', 0, b'b'], 3),
-            PreviewContent::Binary { size: 3 }
+            PreviewContent::Binary { size: 3, .. }
         ));
     }
 
@@ -803,10 +1330,10 @@ mod edge_tests {
 
     #[test]
     fn image_extensions_are_recognized() {
-        for ext in ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff"] {
+        for ext in ["png", "jpg", "jpeg", "gif", "webp", "bmp", "tiff", "svg"] {
             assert!(is_image_extension(ext), "{ext}");
         }
-        for ext in ["svg", "pdf", "mp4", "rs"] {
+        for ext in ["pdf", "mp4", "rs"] {
             assert!(!is_image_extension(ext), "{ext}");
         }
     }
