@@ -83,15 +83,18 @@ pub enum SortKey {
     Name,
     Size,
     Modified,
+    Created,
     Kind,
 }
 
 impl SortKey {
-    pub const ALL: [SortKey; 4] = [
+    /// In the order Finder's "Sort By" menu lists them.
+    pub const ALL: [SortKey; 5] = [
         SortKey::Name,
-        SortKey::Size,
-        SortKey::Modified,
         SortKey::Kind,
+        SortKey::Modified,
+        SortKey::Created,
+        SortKey::Size,
     ];
 
     pub fn label(self) -> &'static str {
@@ -99,6 +102,7 @@ impl SortKey {
             SortKey::Name => "Name",
             SortKey::Size => "Size",
             SortKey::Modified => "Modified",
+            SortKey::Created => "Created",
             SortKey::Kind => "Kind",
         }
     }
@@ -107,7 +111,8 @@ impl SortKey {
         match self {
             SortKey::Name => SortKey::Size,
             SortKey::Size => SortKey::Modified,
-            SortKey::Modified => SortKey::Kind,
+            SortKey::Modified => SortKey::Created,
+            SortKey::Created => SortKey::Kind,
             SortKey::Kind => SortKey::Name,
         }
     }
@@ -160,6 +165,7 @@ impl SortSpec {
                 SortKey::Name => natural_cmp(&a.name, &b.name),
                 SortKey::Size => a.size.cmp(&b.size),
                 SortKey::Modified => a.modified.cmp(&b.modified),
+                SortKey::Created => a.created.cmp(&b.created),
                 SortKey::Kind => a
                     .extension()
                     .unwrap_or_default()
@@ -432,6 +438,25 @@ mod edge_tests {
         SortSpec::new(SortKey::Modified, false).sort(&mut entries);
         let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, ["unknown.txt", "older.txt", "newer.txt"]);
+    }
+
+    #[test]
+    fn sort_by_created_orders_by_creation_time_not_modification() {
+        let now = SystemTime::now();
+        let mut first = file("first.txt", 0);
+        first.created = Some(now - Duration::from_secs(7200));
+        first.modified = Some(now);
+        let mut second = file("second.txt", 0);
+        second.created = Some(now - Duration::from_secs(60));
+        second.modified = Some(now - Duration::from_secs(9000));
+
+        let mut entries = vec![second, first];
+        SortSpec::new(SortKey::Created, false).sort(&mut entries);
+        let names: Vec<_> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, ["first.txt", "second.txt"]);
+
+        SortSpec::new(SortKey::Created, true).sort(&mut entries);
+        assert_eq!(entries[0].name, "second.txt");
     }
 
     #[test]
