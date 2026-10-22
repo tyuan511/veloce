@@ -16,16 +16,16 @@ use std::{
 
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, Hsla, MouseButton,
-    Subscription, UniformListScrollHandle, Window, div, prelude::*, px, svg, uniform_list,
+    Subscription, UniformListScrollHandle, Window, div, img, prelude::*, px, svg, uniform_list,
 };
 use vfs_core::{
-    FileEntry, Filter, LocalProvider, SortKey, SortSpec, VfsProvider, VfsUri,
+    FileEntry, FileKind, Filter, LocalProvider, SortKey, SortSpec, VfsProvider, VfsUri,
     entry::{format_relative, format_size},
     ops::{ConflictPolicy, TaskManager},
 };
 
 use crate::{
-    icons,
+    file_icons, icons,
     listing::{
         Listing, breadcrumbs, cycle_index, index_after_close, parse_path_input, visible_crumbs,
     },
@@ -775,7 +775,13 @@ impl Pane {
                             cx.stop_propagation();
                             entity.update(cx, |pane, cx| pane.close_tab(index, cx));
                         })
-                        .child(svg().path(icons::CLOSE).w(px(8.)).h(px(8.))),
+                        .child(
+                            svg()
+                                .path(icons::CLOSE)
+                                .w(px(8.))
+                                .h(px(8.))
+                                .text_color(theme::text_faint()),
+                        ),
                 );
             }
             row = row.child(chip);
@@ -798,7 +804,13 @@ impl Pane {
                 .on_click(move |_, _, cx| {
                     entity.update(cx, |pane, cx| pane.new_tab(cx));
                 })
-                .child(svg().path(icons::PLUS).w(px(10.)).h(px(10.))),
+                .child(
+                    svg()
+                        .path(icons::PLUS)
+                        .w(px(10.))
+                        .h(px(10.))
+                        .text_color(theme::text_faint()),
+                ),
         )
         .child(div().flex_1())
         .into_any_element()
@@ -834,7 +846,17 @@ impl Pane {
                             entity.update(cx, |pane, cx| pane.go_parent(cx));
                         })
                 })
-                .child(svg().path(icons::ARROW_UP).w(px(11.)).h(px(11.)))
+                .child(
+                    svg()
+                        .path(icons::ARROW_UP)
+                        .w(px(11.))
+                        .h(px(11.))
+                        .text_color(if can_go_up {
+                            theme::text_muted()
+                        } else {
+                            theme::text_faint()
+                        }),
+                )
         };
 
         let path_area: AnyElement = if self.editing_path {
@@ -867,12 +889,7 @@ impl Pane {
                 .min_w_0()
                 .overflow_hidden();
             if cut {
-                trail = trail.child(
-                    div()
-                        .text_xs()
-                        .text_color(theme::text_faint())
-                        .child("… ›"),
-                );
+                trail = trail.child(div().text_xs().text_color(theme::text_faint()).child("… ›"));
             }
             for (index, crumb) in shown.iter().enumerate() {
                 let entity = cx.entity();
@@ -962,7 +979,17 @@ impl Pane {
                         }
                     });
                 })
-                .child(svg().path(icons::SEARCH).w(px(11.)).h(px(11.)))
+                .child(
+                    svg()
+                        .path(icons::SEARCH)
+                        .w(px(11.))
+                        .h(px(11.))
+                        .text_color(if active {
+                            theme::accent()
+                        } else {
+                            theme::text_faint()
+                        }),
+                )
         };
 
         let _ = (focused, window);
@@ -1074,7 +1101,12 @@ impl Pane {
 
     fn render_body(&mut self, focused: bool, cx: &mut Context<Self>) -> AnyElement {
         if let Some(error) = self.error.clone() {
-            return render_message(icons::CLOSE, "Cannot open this folder", &error, theme::red());
+            return render_message(
+                icons::CLOSE,
+                "Cannot open this folder",
+                &error,
+                theme::red(),
+            );
         }
         if self.loading && self.listing.entries.is_empty() {
             return render_message(icons::FOLDER, "Loading…", "", theme::text_muted());
@@ -1181,7 +1213,6 @@ fn render_row(
     pane_focused: bool,
     entity: Entity<Pane>,
 ) -> AnyElement {
-    let color = theme::kind_color(entry);
     let is_dir = entry.is_dir();
     let name = entry.name.clone();
     let size = if is_dir {
@@ -1190,7 +1221,7 @@ fn render_row(
         format_size(entry.size)
     };
     let modified = format_relative(entry.modified);
-    let icon = icons::file_icon(entry);
+    let icon = entry_icon(entry, 16.0);
 
     // Finder semantics: blue highlight in the active pane, grey in the other.
     let on_accent = highlighted && pane_focused;
@@ -1252,13 +1283,7 @@ fn render_row(
                         .items_center()
                         .justify_center()
                         .flex_shrink_0()
-                        .child(
-                            svg()
-                                .path(icon)
-                                .w(px(15.))
-                                .h(px(15.))
-                                .text_color(if on_accent { gpui::white() } else { color }),
-                        ),
+                        .child(icon),
                 )
                 .child(
                     div()
@@ -1290,6 +1315,30 @@ fn render_row(
                         .child(size),
                 ),
         )
+        .into_any_element()
+}
+
+/// Full-colour Material icon for an entry. Symlinks keep the Lucide link glyph so
+/// they stay recognisable whatever they point at.
+pub(crate) fn entry_icon(entry: &FileEntry, size: f32) -> AnyElement {
+    if entry.kind == FileKind::Symlink {
+        return svg()
+            .path(icons::LINK)
+            .w(px(size))
+            .h(px(size))
+            .flex_shrink_0()
+            .text_color(theme::purple())
+            .into_any_element();
+    }
+    let id = if entry.is_dir() {
+        file_icons::folder_icon_id(&entry.name, false)
+    } else {
+        file_icons::file_icon_id(&entry.name)
+    };
+    img(file_icons::asset_path(id))
+        .w(px(size))
+        .h(px(size))
+        .flex_shrink_0()
         .into_any_element()
 }
 

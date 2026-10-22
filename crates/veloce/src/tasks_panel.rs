@@ -264,7 +264,13 @@ fn render_task(task: &TaskSnapshot, entity: gpui::Entity<TaskPanel>) -> AnyEleme
             .on_click(move |_, _, cx| {
                 entity.update(cx, |panel, cx| panel.cancel(task_id, cx));
             })
-            .child(svg().path(icons::CLOSE).w(px(8.)).h(px(8.)))
+            .child(
+                svg()
+                    .path(icons::CLOSE)
+                    .w(px(8.))
+                    .h(px(8.))
+                    .text_color(theme::text_faint()),
+            )
     });
 
     let ratio = task.progress().unwrap_or(0.0);

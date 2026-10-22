@@ -81,7 +81,8 @@ compile once at first launch.
 | `/` | filter this folder (fuzzy, live) |
 | `⌘P` | fuzzy jump to any file in the tree |
 | `⌘⇧P` | command palette |
-| `tab` | switch pane |
+| `⌘\` | show / hide the second pane (single pane by default) |
+| `tab` | switch pane (when split) |
 | `F5` / `F6` | copy / move to the other pane |
 | `⌘⌫` | move to trash (recoverable) |
 | `⌘⇧N` / `shift-R` | new folder / rename |
@@ -108,7 +109,7 @@ compile once at first launch.
 ## Tests
 
 ```sh
-cargo test              # 203 tests, no GPU or window server needed
+cargo test              # 216 tests, no GPU or window server needed
 cargo test -p vfs-core  # 136 core tests
 ```
 
@@ -134,5 +135,7 @@ See `docs/research.md` for the full product and engineering analysis.
 
 ## Credits
 
-Icons are from [Lucide](https://lucide.dev) (ISC); the license is kept in
-`crates/veloce/assets/icons/LICENSE-lucide.txt`.
+UI glyphs are from [Lucide](https://lucide.dev) (ISC) and file/folder icons from
+[Material Icon Theme](https://github.com/material-extensions/vscode-material-icon-theme)
+(MIT); licenses sit next to the assets. Regenerate the file-icon tables with
+`scripts/gen-file-icons.py`.

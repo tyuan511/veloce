@@ -9,6 +9,9 @@
 //!   except through `vfs-core`, which keeps the UI honest about what a backend can do.
 
 mod actions;
+mod file_icons;
+#[rustfmt::skip]
+mod file_icons_data;
 mod icons;
 mod listing;
 mod palette;
@@ -17,6 +20,7 @@ mod preview;
 mod tasks_panel;
 mod text_input;
 mod theme;
+mod tree;
 mod workspace;
 
 use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, px, size};

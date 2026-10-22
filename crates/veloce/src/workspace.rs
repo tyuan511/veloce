@@ -19,7 +19,7 @@ use vfs_core::{FsWatcher, VfsUri, WatchEvent};
 
 use crate::{
     actions::*,
-    icons,
+    file_icons, icons,
     listing::{Place, expand_home, favorite_places, place_is_current},
     palette::{Palette, PaletteChoice, PaletteEvent, PaletteMode},
     pane::{Pane, PaneEvent, PaneSide, Services},
@@ -27,6 +27,7 @@ use crate::{
     tasks_panel::TaskPanel,
     text_input::{TextInput, TextInputEvent},
     theme,
+    tree::{TreeState, list_subdirs},
 };
 
 /// Files created by the inline "new folder / rename" prompt.
@@ -44,8 +45,12 @@ pub struct Workspace {
     pub tasks: Entity<TaskPanel>,
     pub palette: Entity<Palette>,
     pub tasks_open: bool,
+    /// Second pane visible. Off by default, like Finder; ⌘\ turns it on.
+    pub split: bool,
     /// Finder-style shortcuts down the left edge.
     places: Vec<Place>,
+    /// Lazy folder tree under the favorites, rooted at home.
+    tree: TreeState,
     /// Inline name prompt shown over the list (new folder / rename).
     pub(crate) prompt: Option<(InlinePrompt, Entity<TextInput>)>,
     focus_handle: FocusHandle,
@@ -95,7 +100,9 @@ impl Workspace {
             tasks,
             palette: palette.clone(),
             tasks_open: false,
+            split: false,
             places: favorite_places(&home_dir),
+            tree: TreeState::new(home_dir.clone()),
             prompt: None,
             focus_handle: cx.focus_handle(),
             watcher: None,
@@ -122,6 +129,9 @@ impl Workspace {
         self.right.update(cx, |pane, cx| pane.reload(cx));
         self.sync_preview(cx);
         self.retarget_watcher(cx);
+        let root = self.tree.root.clone();
+        self.load_tree_dir(root, cx);
+        self.reveal_in_tree(cx);
         let handle = self.focus_handle.clone();
         window.focus(&handle);
         self.focus_pane(PaneSide::Left, window, cx);
@@ -138,6 +148,7 @@ impl Workspace {
                         PaneEvent::ListingChanged => {
                             workspace.sync_preview(cx);
                             workspace.retarget_watcher(cx);
+                            workspace.reveal_in_tree(cx);
                         }
                         PaneEvent::OpenExternally(uri) => {
                             if let Some(path) = uri.as_local_path() {
@@ -166,6 +177,41 @@ impl Workspace {
         subscriptions
     }
 
+    /// Read one folder's sub-directories off the UI thread and cache them.
+    fn load_tree_dir(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| {
+            let target = dir.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { list_subdirs(&target) })
+                .await;
+            this.update(cx, |workspace, cx| {
+                // An unreadable folder just shows no children rather than an error.
+                workspace.tree.set_children(dir, result.unwrap_or_default());
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Open the tree down to the focused pane's folder so the user can see where they are.
+    fn reveal_in_tree(&mut self, cx: &mut Context<Self>) {
+        let Some(path) = self.focused_pane().read(cx).current_uri().as_local_path() else {
+            return;
+        };
+        for dir in self.tree.reveal(&path) {
+            self.load_tree_dir(dir, cx);
+        }
+    }
+
+    fn toggle_tree_dir(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        if self.tree.toggle(&path) {
+            self.load_tree_dir(path, cx);
+        }
+        cx.notify();
+    }
+
     fn pane(&self, side: PaneSide) -> Entity<Pane> {
         match side {
             PaneSide::Left => self.left.clone(),
@@ -182,6 +228,8 @@ impl Workspace {
     }
 
     fn focus_pane(&mut self, side: PaneSide, window: &mut Window, cx: &mut Context<Self>) {
+        // Without the split there is only the left pane to focus.
+        let side = if self.split { side } else { PaneSide::Left };
         self.focused = side;
         let handle = self.pane(side).read(cx).focus_handle.clone();
         window.focus(&handle);
@@ -191,6 +239,9 @@ impl Workspace {
     }
 
     fn switch_pane(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.split {
+            return;
+        }
         self.focus_pane(self.focused.other(), window, cx);
     }
 
@@ -315,7 +366,9 @@ impl Workspace {
                         pane.update(cx, |pane, cx| pane.cycle_sort(cx));
                     }
                     crate::palette::CommandId::TogglePane => {
-                        self.focused = self.focused.other();
+                        if self.split {
+                            self.focused = self.focused.other();
+                        }
                     }
                 }
             }
@@ -323,7 +376,32 @@ impl Workspace {
         cx.notify();
     }
 
+    fn toggle_split(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.split = !self.split;
+        if self.split {
+            // Start the new pane where the user already is, ready as a copy target.
+            let uri = self.left.read(cx).current_uri();
+            self.right.update(cx, |pane, cx| pane.navigate_to(uri, cx));
+        }
+        self.focus_pane(PaneSide::Left, window, cx);
+    }
+
+    /// Copy/move need a destination pane; say so instead of silently doing nothing.
+    fn require_split(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.split {
+            self.banner = Some((
+                "Open the second pane first (⌘\\) to choose a destination".to_string(),
+                std::time::Instant::now(),
+            ));
+            cx.notify();
+        }
+        self.split
+    }
+
     fn copy_to_other_pane(&mut self, cx: &mut Context<Self>) {
+        if !self.require_split(cx) {
+            return;
+        }
         let other_dir = self.other_pane().read(cx).current_uri().as_local_path();
         let Some(dir) = other_dir else {
             self.banner = Some((
@@ -343,6 +421,9 @@ impl Workspace {
     }
 
     fn move_to_other_pane(&mut self, cx: &mut Context<Self>) {
+        if !self.require_split(cx) {
+            return;
+        }
         let other_dir = self.other_pane().read(cx).current_uri().as_local_path();
         let Some(dir) = other_dir else {
             return;
@@ -538,12 +619,8 @@ impl Workspace {
         pane.update(cx, |pane, cx| pane.cycle_tab(false, cx));
     }
 
-    fn on_new_pane(&mut self, _: &NewPane, window: &mut Window, cx: &mut Context<Self>) {
-        // A second window would be a second workspace; the useful "new pane" is a
-        // new tab in the other pane so a copy target appears instantly.
-        let other = self.other_pane();
-        other.update(cx, |pane, cx| pane.new_tab(cx));
-        self.focus_pane(self.focused.other(), window, cx);
+    fn on_toggle_split(&mut self, _: &ToggleSplit, window: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_split(window, cx);
     }
 
     fn on_start_filter(&mut self, _: &StartFilter, window: &mut Window, cx: &mut Context<Self>) {
@@ -681,9 +758,11 @@ impl Render for Workspace {
         let left = self
             .left
             .update(cx, |pane, cx| pane.render_pane(left_focused, window, cx));
-        let right = self
-            .right
-            .update(cx, |pane, cx| pane.render_pane(right_focused, window, cx));
+        let split = self.split;
+        let right = split.then(|| {
+            self.right
+                .update(cx, |pane, cx| pane.render_pane(right_focused, window, cx))
+        });
         let preview_open = self.focused_pane().read(cx).preview_open;
         let preview = preview_open.then(|| self.preview.clone());
         let palette_open = self.palette.read(cx).open;
@@ -726,7 +805,7 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_close_tab))
             .on_action(cx.listener(Self::on_next_tab))
             .on_action(cx.listener(Self::on_prev_tab))
-            .on_action(cx.listener(Self::on_new_pane))
+            .on_action(cx.listener(Self::on_toggle_split))
             .on_action(cx.listener(Self::on_start_filter))
             .on_action(cx.listener(Self::on_open_palette))
             .on_action(cx.listener(Self::on_open_commands))
@@ -756,8 +835,10 @@ impl Render for Workspace {
                     .min_h_0()
                     .child(sidebar)
                     .child(left)
-                    .child(div().w(px(1.)).flex_shrink_0().bg(theme::border()))
-                    .child(right)
+                    .when_some(right, |this, right| {
+                        this.child(div().w(px(1.)).flex_shrink_0().bg(theme::border()))
+                            .child(right)
+                    })
                     .children(preview.map(|preview| preview.into_any_element())),
             )
             .when(tasks_open, |this| {
@@ -801,20 +882,39 @@ impl Workspace {
                         workspace.open_palette(PaletteMode::Files, window, cx);
                     });
                 })
-                .child(svg().path(icons::SEARCH).w(px(12.)).h(px(12.)))
+                .child(
+                    svg()
+                        .path(icons::SEARCH)
+                        .w(px(12.))
+                        .h(px(12.))
+                        .text_color(theme::text_faint()),
+                )
                 .child(div().flex_1().text_sm().child("Search"))
                 .child(div().text_xs().child("⌘P"))
         };
 
         let preview_button = {
             let entity = entity.clone();
-            toolbar_button("titlebar-preview", icons::EYE, preview_open, theme::accent()).on_click(
-                move |_, _, cx| {
-                    entity.update(cx, |workspace, cx| {
-                        let pane = workspace.focused_pane();
-                        pane.update(cx, |pane, cx| pane.toggle_preview(cx));
-                        cx.notify();
-                    });
+            toolbar_button(
+                "titlebar-preview",
+                icons::EYE,
+                preview_open,
+                theme::accent(),
+            )
+            .on_click(move |_, _, cx| {
+                entity.update(cx, |workspace, cx| {
+                    let pane = workspace.focused_pane();
+                    pane.update(cx, |pane, cx| pane.toggle_preview(cx));
+                    cx.notify();
+                });
+            })
+        };
+
+        let split_button = {
+            let entity = entity.clone();
+            toolbar_button("titlebar-split", icons::SPLIT, self.split, theme::accent()).on_click(
+                move |_, window, cx| {
+                    entity.update(cx, |workspace, cx| workspace.toggle_split(window, cx));
                 },
             )
         };
@@ -866,6 +966,7 @@ impl Workspace {
                     .items_center()
                     .justify_end()
                     .gap_1()
+                    .child(split_button)
                     .child(preview_button)
                     .child(tasks_button),
             )
@@ -876,20 +977,15 @@ impl Workspace {
     /// the dual-pane analogue of Finder's single content area.
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let current = self.focused_pane().read(cx).current_uri().path.clone();
-        let mut list = div()
-            .flex()
-            .flex_col()
-            .gap_0p5()
-            .px_2()
-            .child(
-                div()
-                    .px_2()
-                    .pb_1()
-                    .text_xs()
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                    .text_color(theme::text_faint())
-                    .child("Favorites"),
-            );
+        let mut list = div().flex().flex_col().gap_0p5().px_2().child(
+            div()
+                .px_2()
+                .pb_1()
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme::text_faint())
+                .child("Favorites"),
+        );
 
         for (index, place) in self.places.iter().enumerate() {
             let active = place_is_current(place, &current);
@@ -940,17 +1036,114 @@ impl Workspace {
             );
         }
 
+        let mut tree = div().flex().flex_col().gap_0p5().px_2().pb_2().child(
+            div()
+                .px_2()
+                .pt_3()
+                .pb_1()
+                .text_xs()
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(theme::text_faint())
+                .child("Folders"),
+        );
+        for (index, row) in self.tree.rows().into_iter().enumerate() {
+            let active =
+                row.path.to_string_lossy().trim_end_matches('/') == current.trim_end_matches('/');
+            let toggle_entity = cx.entity();
+            let open_entity = cx.entity();
+            let toggle_path = row.path.clone();
+            let open_path = row.path.clone();
+            let icon_id = file_icons::folder_icon_id(&row.name, row.expanded);
+            tree = tree.child(
+                div()
+                    .id(gpui::ElementId::Name(format!("tree-{index}").into()))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .h(px(24.))
+                    .pl(px(4. + row.depth as f32 * 12.))
+                    .pr_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_sm()
+                    .when(active, |this| {
+                        this.bg(theme::bg_hover()).text_color(theme::text())
+                    })
+                    .when(!active, |this| {
+                        this.text_color(theme::text_muted())
+                            .hover(|this| this.bg(theme::bg_raised()).text_color(theme::text()))
+                    })
+                    .on_click(move |_, window, cx| {
+                        let target = open_path.clone();
+                        open_entity.update(cx, |workspace, cx| {
+                            let side = workspace.focused;
+                            workspace.pane(side).update(cx, |pane, cx| {
+                                pane.navigate_to(VfsUri::local(&target), cx)
+                            });
+                            workspace.focus_pane(side, window, cx);
+                        });
+                    })
+                    .child(
+                        div()
+                            .id(gpui::ElementId::Name(format!("tree-{index}-toggle").into()))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .w(px(14.))
+                            .h(px(14.))
+                            .flex_shrink_0()
+                            .rounded_sm()
+                            .hover(|this| this.bg(theme::bg_hover()))
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                let path = toggle_path.clone();
+                                toggle_entity.update(cx, |workspace, cx| {
+                                    workspace.toggle_tree_dir(path, cx)
+                                });
+                            })
+                            .child(
+                                svg()
+                                    .path(if row.expanded {
+                                        icons::CHEVRON_DOWN
+                                    } else {
+                                        icons::CHEVRON_RIGHT
+                                    })
+                                    .w(px(10.))
+                                    .h(px(10.))
+                                    .text_color(theme::text_faint()),
+                            ),
+                    )
+                    .child(
+                        gpui::img(file_icons::asset_path(icon_id))
+                            .w(px(15.))
+                            .h(px(15.))
+                            .flex_shrink_0(),
+                    )
+                    .child(div().truncate().min_w_0().child(row.name)),
+            );
+        }
+
         div()
             .flex()
             .flex_col()
             .w(px(theme::SIDEBAR_WIDTH))
             .h_full()
+            .min_h_0()
             .flex_shrink_0()
             .pt_3()
             .bg(theme::bg())
             .border_r_1()
             .border_color(theme::border_soft())
             .child(list)
+            .child(
+                div()
+                    .id("sidebar-tree")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .child(tree),
+            )
             .into_any_element()
     }
 }
@@ -974,9 +1167,23 @@ fn toolbar_button(
         .px_1()
         .rounded_md()
         .when(active, |this| this.bg(theme::bg_raised()))
-        .text_color(if active { active_color } else { theme::text_muted() })
+        .text_color(if active {
+            active_color
+        } else {
+            theme::text_muted()
+        })
         .hover(|this| this.bg(theme::bg_hover()).text_color(theme::text()))
-        .child(svg().path(icon).w(px(14.)).h(px(14.)))
+        .child(
+            svg()
+                .path(icon)
+                .w(px(14.))
+                .h(px(14.))
+                .text_color(if active {
+                    active_color
+                } else {
+                    theme::text_muted()
+                }),
+        )
 }
 
 fn render_prompt(

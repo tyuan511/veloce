@@ -31,7 +31,7 @@ actions!(
         CloseTab,
         NextTab,
         PrevTab,
-        NewPane,
+        ToggleSplit,
         // filtering & palette
         StartFilter,
         OpenPalette,
@@ -92,7 +92,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-w", CloseTab, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-]", NextTab, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-[", PrevTab, Some(CONTEXT)),
-        KeyBinding::new("cmd-d", NewPane, Some(CONTEXT)),
+        KeyBinding::new("cmd-\\", ToggleSplit, Some(CONTEXT)),
         KeyBinding::new("cmd-1", FocusLeft, Some(CONTEXT)),
         KeyBinding::new("cmd-2", FocusRight, Some(CONTEXT)),
         // ---- filtering & palette ----
