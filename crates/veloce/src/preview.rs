@@ -288,6 +288,8 @@ pub struct PreviewView {
     /// Entry metadata shown in the header (kept so the panel can render the
     /// footer without asking the pane again).
     pub entry: Option<FileEntry>,
+    /// Panel width: the inspector is narrow, Quick Look is wide.
+    pub width: f32,
 }
 
 impl gpui::Focusable for PreviewView {
@@ -302,6 +304,15 @@ impl PreviewView {
             preview: Preview::new(),
             focus_handle: cx.focus_handle(),
             entry: None,
+            width: 340.0,
+        }
+    }
+
+    /// A wider panel, for the Quick Look overlay.
+    pub fn with_width(width: f32, cx: &mut Context<Self>) -> Self {
+        Self {
+            width,
+            ..Self::new(cx)
         }
     }
 
@@ -318,7 +329,7 @@ impl gpui::Render for PreviewView {
         _window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) -> impl gpui::IntoElement {
-        render_preview(&self.preview, self.entry.as_ref(), cx).into_any_element()
+        render_preview(&self.preview, self.entry.as_ref(), self.width, cx).into_any_element()
     }
 }
 
@@ -326,6 +337,7 @@ impl gpui::Render for PreviewView {
 pub fn render_preview(
     preview: &Preview,
     entry: Option<&FileEntry>,
+    width: f32,
     _cx: &mut Context<PreviewView>,
 ) -> AnyElement {
     let header = render_header(entry, &preview.content);
@@ -342,7 +354,7 @@ pub fn render_preview(
     div()
         .flex()
         .flex_col()
-        .w(px(340.0))
+        .w(px(width))
         .flex_shrink_0()
         .h_full()
         .bg(theme::bg())

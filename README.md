@@ -77,7 +77,10 @@ compile once at first launch.
 | `gg` / `G` | first / last |
 | `shift-j` | extend selection |
 | `⌘A` / `esc` | select all / clear |
-| `space` | quick preview |
+| `space` | Quick Look: large preview of the selected file (`space` / `esc` to close, arrows keep moving) |
+| `⌘1` / `⌘2` / `⌘3` | view as icons / list / columns |
+| `⌥⌘I` | toggle the inspector panel |
+| `⌃1` / `⌃2` | focus left / right pane |
 | `/` | filter this folder (fuzzy, live) |
 | `⌘P` | fuzzy jump to any file in the tree |
 | `⌘⇧P` | command palette |
@@ -93,7 +96,7 @@ compile once at first launch.
 | right-click | Explorer-style menu: open, compress to ZIP, cut, copy, paste, create shortcut, delete, rename, properties |
 | `⌘T` / `⌘W` | new / close tab |
 | `⌘J` | task panel |
-| `s` | cycle sort column |
+| `s` | cycle sort column (toolbar ⇅ menu: name, kind, date modified, date created, size; ascending/descending; folders on top) |
 | `⌘R` | refresh |
 
 ## Design decisions worth knowing
@@ -114,8 +117,8 @@ compile once at first launch.
 ## Tests
 
 ```sh
-cargo test              # 241 tests, no GPU or window server needed
-cargo test -p vfs-core  # 143 core tests
+cargo test              # 258 tests, no GPU or window server needed
+cargo test -p vfs-core  # 145 core tests
 ```
 
 **UI is not covered by automated tests** (see `AGENTS.md`): interaction is verified

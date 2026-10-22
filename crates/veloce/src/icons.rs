@@ -20,6 +20,11 @@ pub const PLUS: &str = "icons/plus.svg";
 pub const TERMINAL: &str = "icons/terminal.svg";
 pub const TASKS: &str = "icons/list-checks.svg";
 pub const APPS: &str = "icons/app-window.svg";
+pub const VIEW_LIST: &str = "icons/list.svg";
+pub const VIEW_ICONS: &str = "icons/layout-grid.svg";
+pub const VIEW_COLUMNS: &str = "icons/columns-3.svg";
+pub const SORT: &str = "icons/arrow-up-down.svg";
+pub const CHECK: &str = "icons/check.svg";
 pub const SPLIT: &str = "icons/columns-2.svg";
 pub const EYE: &str = "icons/eye.svg";
 pub const HOME: &str = "icons/house.svg";
@@ -46,6 +51,11 @@ const ICONS: &[(&str, &str)] = &[
     (TERMINAL, include_str!("../assets/icons/terminal.svg")),
     (TASKS, include_str!("../assets/icons/list-checks.svg")),
     (APPS, include_str!("../assets/icons/app-window.svg")),
+    (VIEW_LIST, include_str!("../assets/icons/list.svg")),
+    (VIEW_ICONS, include_str!("../assets/icons/layout-grid.svg")),
+    (VIEW_COLUMNS, include_str!("../assets/icons/columns-3.svg")),
+    (SORT, include_str!("../assets/icons/arrow-up-down.svg")),
+    (CHECK, include_str!("../assets/icons/check.svg")),
     (SPLIT, include_str!("../assets/icons/columns-2.svg")),
     (EYE, include_str!("../assets/icons/eye.svg")),
     (HOME, include_str!("../assets/icons/house.svg")),

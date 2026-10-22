@@ -5,7 +5,10 @@
 //! own cancellation tokens and text inputs. The workspace owns the shared services
 //! (task manager, provider) and routes actions to whichever pane has focus.
 
+mod views;
+
 use std::{
+    collections::{HashMap, HashSet},
     path::PathBuf,
     sync::{
         Arc,
@@ -32,6 +35,7 @@ use crate::{
     },
     text_input::{TextInput, TextInputEvent},
     theme::{self, ROW_HEIGHT},
+    view::{GridMove, ViewMode, grid_move},
 };
 
 /// Icon / size / time column widths, shared by the header and every row so they
@@ -39,6 +43,7 @@ use crate::{
 pub const ICON_WIDTH: f32 = 22.0;
 pub const SIZE_WIDTH: f32 = 84.0;
 pub const TIME_WIDTH: f32 = 128.0;
+pub const KIND_WIDTH: f32 = 112.0;
 
 /// Rows moved by a page-down / page-up.
 const PAGE_ROWS: isize = 15;
@@ -129,6 +134,15 @@ pub struct Pane {
     pub sort: SortSpec,
     pub filter: Filter,
     pub filter_active: bool,
+    pub view: ViewMode,
+    /// Width the workspace grants this pane; drives the icon grid's column count.
+    pub avail_width: f32,
+    pub grid_cols: usize,
+    /// Side-column folder contents (columns view), loaded lazily.
+    pub columns: HashMap<PathBuf, Arc<Vec<FileEntry>>>,
+    columns_loading: HashSet<PathBuf>,
+    column_scrolls: HashMap<PathBuf, UniformListScrollHandle>,
+    columns_scrolled: HashSet<PathBuf>,
     /// Files cut to the clipboard; drawn dimmed until pasted.
     pub cut_paths: Vec<PathBuf>,
     pub preview_open: bool,
@@ -202,6 +216,13 @@ impl Pane {
             sort: SortSpec::default(),
             filter: Filter::new(),
             filter_active: false,
+            view: ViewMode::default(),
+            avail_width: 800.0,
+            grid_cols: 1,
+            columns: HashMap::new(),
+            columns_loading: HashSet::new(),
+            column_scrolls: HashMap::new(),
+            columns_scrolled: HashSet::new(),
             cut_paths: Vec::new(),
             preview_open: false,
             scroll: UniformListScrollHandle::new(),
@@ -365,11 +386,82 @@ impl Pane {
         cx.notify();
     }
 
+    /// Keep the cursor visible. The icon grid scrolls by row, not by item.
+    fn scroll_to_cursor(&self) {
+        let position = self.listing.cursor;
+        let row = match self.view {
+            ViewMode::Icons => position / self.grid_cols.max(1),
+            _ => position,
+        };
+        self.scroll
+            .scroll_to_item(row, gpui::ScrollStrategy::Center);
+    }
+
+    /// Up/Down: one row in lists and columns, one grid row in the icon view.
+    pub fn move_vertical(&mut self, down: bool, cx: &mut Context<Self>) {
+        if self.view != ViewMode::Icons {
+            self.move_cursor(if down { 1 } else { -1 }, false, cx);
+            return;
+        }
+        let direction = if down { GridMove::Down } else { GridMove::Up };
+        self.move_grid(direction, cx);
+    }
+
+    fn move_grid(&mut self, direction: GridMove, cx: &mut Context<Self>) {
+        let target = grid_move(
+            self.listing.cursor,
+            self.listing.len(),
+            self.grid_cols,
+            direction,
+        );
+        self.listing.set_cursor(target, false);
+        self.scroll_to_cursor();
+        self.refresh_status();
+        cx.notify();
+    }
+
+    pub fn set_view(&mut self, view: ViewMode, cx: &mut Context<Self>) {
+        if self.view == view {
+            return;
+        }
+        self.view = view;
+        self.scroll = UniformListScrollHandle::new();
+        self.scroll_to_cursor();
+        cx.notify();
+    }
+
+    pub fn set_sort(&mut self, sort: SortSpec, cx: &mut Context<Self>) {
+        self.sort = sort;
+        self.recompute_visible();
+        self.invalidate_columns();
+        cx.notify();
+    }
+
+    /// Re-read the folder and drop cached side columns (they may be stale too).
+    pub fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.invalidate_columns();
+        self.reload(cx);
+    }
+
+    /// Left/right in the icon grid move one item; everywhere else they navigate.
+    pub fn move_horizontal(&mut self, forward: bool, cx: &mut Context<Self>) {
+        match self.view {
+            ViewMode::Icons => self.move_grid(
+                if forward {
+                    GridMove::Right
+                } else {
+                    GridMove::Left
+                },
+                cx,
+            ),
+            _ if forward => self.activate_cursor(cx),
+            _ => self.go_parent(cx),
+        }
+    }
+
     pub fn move_cursor(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
         self.listing.move_cursor(delta, extend);
-        let position = self.listing.cursor;
-        self.scroll
-            .scroll_to_item(position, gpui::ScrollStrategy::Center);
+        self.scroll_to_cursor();
         self.refresh_status();
         cx.notify();
     }
@@ -380,9 +472,7 @@ impl Pane {
 
     pub fn jump_to(&mut self, target: JumpTarget, cx: &mut Context<Self>) {
         self.listing.jump(target);
-        let position = self.listing.cursor;
-        self.scroll
-            .scroll_to_item(position, gpui::ScrollStrategy::Center);
+        self.scroll_to_cursor();
         self.refresh_status();
         cx.notify();
     }
@@ -408,9 +498,7 @@ impl Pane {
     /// behaviour a keyboard user actually wants from `shift-j`.
     pub fn extend_selection(&mut self, delta: isize, cx: &mut Context<Self>) {
         self.listing.extend_selection(delta);
-        let position = self.listing.cursor;
-        self.scroll
-            .scroll_to_item(position, gpui::ScrollStrategy::Center);
+        self.scroll_to_cursor();
         self.refresh_status();
         cx.notify();
     }
@@ -509,15 +597,11 @@ impl Pane {
     // ---- sorting ----------------------------------------------------------
 
     pub fn cycle_sort(&mut self, cx: &mut Context<Self>) {
-        self.sort = self.sort.toggle(self.sort.key.next());
-        self.recompute_visible();
-        cx.notify();
+        self.set_sort(self.sort.toggle(self.sort.key.next()), cx);
     }
 
     pub fn sort_by(&mut self, key: SortKey, cx: &mut Context<Self>) {
-        self.sort = self.sort.toggle(key);
-        self.recompute_visible();
-        cx.notify();
+        self.set_sort(self.sort.toggle(key), cx);
     }
 
     // ---- preview ----------------------------------------------------------
@@ -601,7 +685,7 @@ impl Pane {
                     break;
                 }
             }
-            this.update(cx, |pane, cx| pane.reload(cx)).ok();
+            this.update(cx, |pane, cx| pane.refresh(cx)).ok();
         })
         .detach();
     }
@@ -798,12 +882,6 @@ impl Pane {
         .detach();
     }
 
-    pub fn show_preview(&mut self, cx: &mut Context<Self>) {
-        self.preview_open = true;
-        cx.emit(PaneEvent::ListingChanged);
-        cx.notify();
-    }
-
     // ---- tabs -------------------------------------------------------------
 
     pub fn new_tab(&mut self, cx: &mut Context<Self>) {
@@ -861,7 +939,7 @@ impl Pane {
         let tabs = (self.tabs.len() > 1).then(|| self.render_tabs(focused, cx));
         let path_bar = self.render_path_bar(focused, window, cx);
         let filter_bar = self.filter_active.then(|| self.render_filter_bar(cx));
-        let header = self.render_header(cx);
+        let header = (self.view == ViewMode::List).then(|| self.render_header(cx));
         let body = self.render_body(focused, cx);
         let status = self.render_status();
         let entity = cx.entity();
@@ -893,7 +971,7 @@ impl Pane {
             .children(tabs)
             .child(path_bar)
             .children(filter_bar)
-            .child(header)
+            .children(header)
             .child(body_area)
             .child(status)
             .into_any_element()
@@ -1261,6 +1339,7 @@ impl Pane {
             (SortKey::Name, "Name", None),
             (SortKey::Modified, "Date Modified", Some(TIME_WIDTH)),
             (SortKey::Size, "Size", Some(SIZE_WIDTH)),
+            (SortKey::Kind, "Kind", Some(KIND_WIDTH)),
         ] {
             let active = sort.key == key;
             let arrow = if active {
@@ -1298,16 +1377,32 @@ impl Pane {
     }
 
     fn render_body(&mut self, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+        match self.view {
+            ViewMode::List => self.render_list_body(focused, cx),
+            ViewMode::Icons => self
+                .state_message()
+                .unwrap_or_else(|| self.render_icons_body(focused, cx)),
+            ViewMode::Columns => self.render_columns_body(focused, cx),
+        }
+    }
+
+    /// Error / loading / empty placeholder, if the listing has nothing to draw.
+    fn state_message(&self) -> Option<AnyElement> {
         if let Some(error) = self.error.clone() {
-            return render_message(
+            return Some(render_message(
                 icons::CLOSE,
                 "Cannot open this folder",
                 &error,
                 theme::red(),
-            );
+            ));
         }
         if self.loading && self.listing.entries.is_empty() {
-            return render_message(icons::FOLDER, "Loading…", "", theme::text_muted());
+            return Some(render_message(
+                icons::FOLDER,
+                "Loading…",
+                "",
+                theme::text_muted(),
+            ));
         }
         if self.listing.is_empty() {
             let (title, detail) = if self.filter.is_active() {
@@ -1318,7 +1413,19 @@ impl Pane {
             } else {
                 ("This folder is empty".to_string(), String::new())
             };
-            return render_message(icons::FOLDER, &title, &detail, theme::text_faint());
+            return Some(render_message(
+                icons::FOLDER,
+                &title,
+                &detail,
+                theme::text_faint(),
+            ));
+        }
+        None
+    }
+
+    fn render_list_body(&mut self, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+        if let Some(message) = self.state_message() {
+            return message;
         }
 
         let count = self.listing.len();
@@ -1426,6 +1533,7 @@ fn render_row(
         format_size(entry.size)
     };
     let modified = format_relative(entry.modified);
+    let kind = crate::info::kind_label(entry);
     let icon = entry_icon(entry, 16.0);
 
     // Finder semantics: blue highlight in the active pane, grey in the other.
@@ -1521,6 +1629,17 @@ fn render_row(
                         .when(!on_accent, |this| this.text_color(theme::text_muted()))
                         .when(on_accent, |this| this.text_color(gpui::white()))
                         .child(size),
+                )
+                .child(
+                    div()
+                        .w(px(KIND_WIDTH))
+                        .px_2()
+                        .flex_shrink_0()
+                        .truncate()
+                        .text_xs()
+                        .when(!on_accent, |this| this.text_color(theme::text_muted()))
+                        .when(on_accent, |this| this.text_color(gpui::white()))
+                        .child(kind),
                 ),
         )
         .into_any_element()

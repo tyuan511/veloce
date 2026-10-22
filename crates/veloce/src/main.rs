@@ -23,6 +23,7 @@ mod preview;
 mod tasks_panel;
 mod text_input;
 mod theme;
+mod view;
 mod workspace;
 
 use gpui::{App, Application, Bounds, WindowBounds, WindowOptions, px, size};

@@ -212,14 +212,16 @@ impl Listing {
 
     /// Move the cursor onto the entry with this uri, if it is visible.
     pub fn focus_uri(&mut self, uri: &VfsUri) {
-        let Some(position) = self
-            .visible
+        if let Some(position) = self.position_of(uri) {
+            self.set_cursor(position, false);
+        }
+    }
+
+    /// Row position of the visible entry with this uri.
+    pub fn position_of(&self, uri: &VfsUri) -> Option<usize> {
+        self.visible
             .iter()
             .position(|index| &self.entries[*index].uri == uri)
-        else {
-            return;
-        };
-        self.set_cursor(position, false);
     }
 }
 
@@ -503,6 +505,14 @@ mod tests {
         let mut filter = Filter::new();
         listing.set_entries(sample(), &SortSpec::default(), &mut filter);
         listing
+    }
+
+    #[test]
+    fn position_of_finds_visible_entries_only() {
+        let listing = listing();
+        let target = listing.entries[2].uri.clone();
+        assert_eq!(listing.position_of(&target), Some(2));
+        assert_eq!(listing.position_of(&VfsUri::local("/tmp/missing")), None);
     }
 
     #[test]

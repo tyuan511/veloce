@@ -22,7 +22,7 @@ use crate::{
     clipboard::FileClipboard,
     context_menu::{
         ActionItem, MENU_PADDING, MENU_WIDTH, MenuAction, MenuItem, MenuTarget, build_menu,
-        clamp_origin, menu_height,
+        clamp_origin, menu_height, sort_menu,
     },
     icons,
     info::info_rows,
@@ -33,6 +33,7 @@ use crate::{
     tasks_panel::TaskPanel,
     text_input::{TextInput, TextInputEvent},
     theme,
+    view::{ViewMode, pane_width},
 };
 
 /// Files created by the inline "new folder / rename" prompt.
@@ -54,12 +55,17 @@ pub(crate) struct InfoState {
     folder_bytes: Option<u64>,
 }
 
+const QUICK_LOOK_WIDTH: f32 = 720.0;
+
 /// The application root view.
 pub struct Workspace {
     pub left: Entity<Pane>,
     pub right: Entity<Pane>,
     pub focused: PaneSide,
     pub preview: Entity<PreviewView>,
+    /// Quick Look: a large preview opened with Space.
+    quick_look: Entity<PreviewView>,
+    quick_look_open: bool,
     pub tasks: Entity<TaskPanel>,
     pub palette: Entity<Palette>,
     pub tasks_open: bool,
@@ -109,6 +115,7 @@ impl Workspace {
             cx.new(|cx| Pane::new(PaneSide::Right, VfsUri::local(&start), services.clone(), cx));
 
         let preview = cx.new(PreviewView::new);
+        let quick_look = cx.new(|cx| PreviewView::with_width(QUICK_LOOK_WIDTH, cx));
         let tasks = cx.new(|cx| TaskPanel::new(services.tasks.clone(), cx));
         let palette = cx.new(Palette::new);
 
@@ -117,6 +124,8 @@ impl Workspace {
             right: right.clone(),
             focused: PaneSide::Left,
             preview,
+            quick_look,
+            quick_look_open: false,
             tasks,
             palette: palette.clone(),
             tasks_open: false,
@@ -224,7 +233,21 @@ impl Workspace {
         };
         self.menu = Some(OpenMenu {
             origin: (f32::from(position.x), f32::from(position.y)),
-            items: build_menu(&target, !self.clipboard.is_empty()),
+            items: build_menu(
+                &target,
+                !self.clipboard.is_empty(),
+                self.focused_pane().read(cx).view,
+            ),
+        });
+        cx.notify();
+    }
+
+    /// The toolbar's "Sort By" menu, dropped just below the click.
+    fn open_sort_menu(&mut self, at: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        let spec = self.focused_pane().read(cx).sort;
+        self.menu = Some(OpenMenu {
+            origin: (f32::from(at.x), f32::from(at.y) + 14.0),
+            items: sort_menu(spec),
         });
         cx.notify();
     }
@@ -326,7 +349,11 @@ impl Workspace {
                     Self::open_terminal_at(&dir);
                 }
             }
-            MenuAction::Preview => pane.update(cx, |pane, cx| pane.show_preview(cx)),
+            MenuAction::Preview => {
+                if !self.quick_look_open {
+                    self.toggle_quick_look(cx);
+                }
+            }
             MenuAction::CompressZip => pane.update(cx, |pane, cx| pane.compress_selection(cx)),
             MenuAction::CopyPath => {
                 let paths = pane.read(cx).selection_paths();
@@ -374,7 +401,30 @@ impl Workspace {
                 window,
                 cx,
             ),
-            MenuAction::Refresh => pane.update(cx, |pane, cx| pane.reload(cx)),
+            MenuAction::SortBy(key) => {
+                let spec = vfs_core::SortSpec {
+                    key,
+                    ..pane.read(cx).sort
+                };
+                pane.update(cx, |pane, cx| pane.set_sort(spec, cx));
+            }
+            MenuAction::SortDescending(descending) => {
+                let spec = vfs_core::SortSpec {
+                    descending,
+                    ..pane.read(cx).sort
+                };
+                pane.update(cx, |pane, cx| pane.set_sort(spec, cx));
+            }
+            MenuAction::SortFoldersFirst => {
+                let current = pane.read(cx).sort;
+                let spec = vfs_core::SortSpec {
+                    dirs_first: !current.dirs_first,
+                    ..current
+                };
+                pane.update(cx, |pane, cx| pane.set_sort(spec, cx));
+            }
+            MenuAction::SetView(view) => self.set_view(view, cx),
+            MenuAction::Refresh => pane.update(cx, |pane, cx| pane.refresh(cx)),
         }
         cx.notify();
     }
@@ -429,8 +479,28 @@ impl Workspace {
     /// Mirror the focused pane's cursor entry into the inspector.
     fn sync_preview(&mut self, cx: &mut Context<Self>) {
         let entry = self.focused_pane().read(cx).cursor_entry().cloned();
+        if self.quick_look_open {
+            let entry = entry.clone();
+            self.quick_look
+                .update(cx, |preview, cx| preview.show(entry, cx));
+        }
         self.preview
             .update(cx, |preview, cx| preview.show(entry, cx));
+    }
+
+    /// Space: open Quick Look on the cursor entry, or close it.
+    fn toggle_quick_look(&mut self, cx: &mut Context<Self>) {
+        if self.quick_look_open {
+            self.quick_look_open = false;
+            cx.notify();
+            return;
+        }
+        if self.focused_pane().read(cx).cursor_entry().is_none() {
+            return;
+        }
+        self.quick_look_open = true;
+        self.sync_preview(cx);
+        cx.notify();
     }
 
     /// Point the filesystem watcher at the focused pane's directory.
@@ -476,11 +546,11 @@ impl Workspace {
                                 .update(cx, |workspace, cx| {
                                     let side = workspace.focused;
                                     let pane = workspace.pane(side);
-                                    pane.update(cx, |pane, cx| pane.reload(cx));
+                                    pane.update(cx, |pane, cx| pane.refresh(cx));
                                     let other = workspace.pane(side.other());
                                     let other_dir = other.read(cx).current_uri().as_local_path();
                                     if other_dir.as_deref() == workspace.watched_dir.as_deref() {
-                                        other.update(cx, |pane, cx| pane.reload(cx));
+                                        other.update(cx, |pane, cx| pane.refresh(cx));
                                     }
                                     let _ = (&left, &right);
                                     cx.notify();
@@ -541,7 +611,7 @@ impl Workspace {
                         pane.update(cx, |pane, cx| pane.trash_selection(cx));
                     }
                     crate::palette::CommandId::Refresh => {
-                        pane.update(cx, |pane, cx| pane.reload(cx));
+                        pane.update(cx, |pane, cx| pane.refresh(cx));
                     }
                     crate::palette::CommandId::CycleSort => {
                         pane.update(cx, |pane, cx| pane.cycle_sort(cx));
@@ -630,6 +700,11 @@ impl Workspace {
             cx.notify();
             return;
         }
+        if self.quick_look_open {
+            self.quick_look_open = false;
+            cx.notify();
+            return;
+        }
         if self.palette.read(cx).open {
             self.palette.update(cx, |palette, cx| palette.close(cx));
             return;
@@ -695,18 +770,50 @@ impl Workspace {
 // ---------------------------------------------------------------------------
 
 impl Workspace {
-    fn move_cursor(&mut self, delta: isize, extend: bool, cx: &mut Context<Self>) {
+    fn on_move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
         let pane = self.focused_pane();
-        pane.update(cx, |pane, cx| pane.move_cursor(delta, extend, cx));
+        pane.update(cx, |pane, cx| pane.move_vertical(true, cx));
         self.sync_preview(cx);
     }
 
-    fn on_move_down(&mut self, _: &MoveDown, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_cursor(1, false, cx);
+    fn on_move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.focused_pane();
+        pane.update(cx, |pane, cx| pane.move_vertical(false, cx));
+        self.sync_preview(cx);
     }
 
-    fn on_move_up(&mut self, _: &MoveUp, _: &mut Window, cx: &mut Context<Self>) {
-        self.move_cursor(-1, false, cx);
+    fn on_move_left(&mut self, _: &MoveLeft, _: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.focused_pane();
+        pane.update(cx, |pane, cx| pane.move_horizontal(false, cx));
+        self.sync_preview(cx);
+    }
+
+    fn on_move_right(&mut self, _: &MoveRight, _: &mut Window, cx: &mut Context<Self>) {
+        let pane = self.focused_pane();
+        pane.update(cx, |pane, cx| pane.move_horizontal(true, cx));
+        self.sync_preview(cx);
+    }
+
+    fn on_quick_look(&mut self, _: &QuickLook, _: &mut Window, cx: &mut Context<Self>) {
+        self.toggle_quick_look(cx);
+    }
+
+    fn set_view(&mut self, view: ViewMode, cx: &mut Context<Self>) {
+        let pane = self.focused_pane();
+        pane.update(cx, |pane, cx| pane.set_view(view, cx));
+        cx.notify();
+    }
+
+    fn on_view_icons(&mut self, _: &ViewIcons, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_view(ViewMode::Icons, cx);
+    }
+
+    fn on_view_list(&mut self, _: &ViewList, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_view(ViewMode::List, cx);
+    }
+
+    fn on_view_columns(&mut self, _: &ViewColumns, _: &mut Window, cx: &mut Context<Self>) {
+        self.set_view(ViewMode::Columns, cx);
     }
 
     fn on_page_down(&mut self, _: &MovePageDown, _: &mut Window, cx: &mut Context<Self>) {
@@ -897,7 +1004,7 @@ impl Workspace {
 
     fn on_refresh(&mut self, _: &Refresh, _: &mut Window, cx: &mut Context<Self>) {
         let pane = self.focused_pane();
-        pane.update(cx, |pane, cx| pane.reload(cx));
+        pane.update(cx, |pane, cx| pane.refresh(cx));
     }
 
     fn on_cycle_sort(&mut self, _: &CycleSort, _: &mut Window, cx: &mut Context<Self>) {
@@ -911,6 +1018,7 @@ impl Workspace {
             || self.prompt.is_some()
             || self.menu.is_some()
             || self.info.is_some()
+            || self.quick_look_open
         {
             self.close_overlays(cx);
             return;
@@ -977,13 +1085,27 @@ impl Render for Workspace {
         let left_focused = focused == PaneSide::Left;
         let right_focused = focused == PaneSide::Right;
 
-        let left = self
-            .left
-            .update(cx, |pane, cx| pane.render_pane(left_focused, window, cx));
+        let inspector = if self.focused_pane().read(cx).preview_open {
+            340.0
+        } else {
+            0.0
+        };
+        let width = pane_width(
+            f32::from(window.viewport_size().width),
+            theme::SIDEBAR_WIDTH,
+            inspector,
+            self.split,
+        );
+        let left = self.left.update(cx, |pane, cx| {
+            pane.avail_width = width;
+            pane.render_pane(left_focused, window, cx)
+        });
         let split = self.split;
         let right = split.then(|| {
-            self.right
-                .update(cx, |pane, cx| pane.render_pane(right_focused, window, cx))
+            self.right.update(cx, |pane, cx| {
+                pane.avail_width = width;
+                pane.render_pane(right_focused, window, cx)
+            })
         });
         let preview_open = self.focused_pane().read(cx).preview_open;
         let preview = preview_open.then(|| self.preview.clone());
@@ -1006,12 +1128,19 @@ impl Render for Workspace {
         let sidebar = self.render_sidebar(cx);
         let menu = self.render_context_menu(window, cx);
         let info = self.render_info(cx);
+        let quick_look = self.render_quick_look(window);
 
         div()
             .key_context("Workspace")
             .track_focus(&self.focus_handle)
             .on_action(cx.listener(Self::on_move_down))
             .on_action(cx.listener(Self::on_move_up))
+            .on_action(cx.listener(Self::on_move_left))
+            .on_action(cx.listener(Self::on_move_right))
+            .on_action(cx.listener(Self::on_quick_look))
+            .on_action(cx.listener(Self::on_view_icons))
+            .on_action(cx.listener(Self::on_view_list))
+            .on_action(cx.listener(Self::on_view_columns))
             .on_action(cx.listener(Self::on_page_down))
             .on_action(cx.listener(Self::on_page_up))
             .on_action(cx.listener(Self::on_jump_top))
@@ -1081,6 +1210,7 @@ impl Render for Workspace {
             .when(palette_open, |this| this.child(palette))
             .when_some(menu, |this, menu| this.child(menu))
             .when_some(info, |this, info| this.child(info))
+            .when_some(quick_look, |this, ql| this.child(ql))
             .when_some(banner, |this, message| this.child(render_banner(&message)))
     }
 }
@@ -1100,6 +1230,10 @@ impl Workspace {
             (f32::from(viewport.width), f32::from(viewport.height)),
         );
 
+        let has_checks = menu
+            .items
+            .iter()
+            .any(|item| matches!(item, MenuItem::Action(a) if a.checked));
         let rows = menu
             .items
             .iter()
@@ -1116,8 +1250,10 @@ impl Workspace {
                     label,
                     shortcut,
                     enabled,
+                    checked,
                 }) => {
                     let action = *action;
+                    let checked = *checked;
                     let entity = cx.entity();
                     let row = div()
                         .id(gpui::ElementId::Name(format!("menu-item-{index}").into()))
@@ -1130,7 +1266,31 @@ impl Workspace {
                         .px_2()
                         .rounded_sm()
                         .text_sm()
-                        .child(div().truncate().min_w_0().child(label.clone()))
+                        .child(
+                            div()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .min_w_0()
+                                // Menus with check marks reserve a column for them,
+                                // so labels line up whether or not a row is checked.
+                                .when(has_checks, |this| {
+                                    this.child(div().w(px(14.)).flex_shrink_0().when(
+                                        checked,
+                                        |this| {
+                                            this.child(
+                                                svg()
+                                                    .path(icons::CHECK)
+                                                    .w(px(12.))
+                                                    .h(px(12.))
+                                                    .text_color(theme::text()),
+                                            )
+                                        },
+                                    ))
+                                })
+                                .child(div().truncate().min_w_0().child(label.clone())),
+                        )
                         .child(
                             div()
                                 .flex_shrink_0()
@@ -1195,6 +1355,44 @@ impl Workspace {
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .on_mouse_down(MouseButton::Right, |_, _, cx| cx.stop_propagation())
                         .children(rows),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Quick Look: a large preview of the cursor entry, closed with Space or Esc.
+    fn render_quick_look(&mut self, window: &Window) -> Option<AnyElement> {
+        if !self.quick_look_open {
+            return None;
+        }
+        let viewport = window.viewport_size();
+        let height = (f32::from(viewport.height) * 0.72).max(320.0);
+        let preview = self.quick_look.clone();
+        let entity = self.focus_handle.clone();
+        let _ = entity;
+        Some(
+            div()
+                .absolute()
+                .top(px(0.))
+                .left(px(0.))
+                .right(px(0.))
+                .bottom(px(0.))
+                .occlude()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::hsla(0.0, 0.0, 0.0, 0.35))
+                .child(
+                    div()
+                        .w(px(QUICK_LOOK_WIDTH))
+                        .h(px(height))
+                        .overflow_hidden()
+                        .rounded_lg()
+                        .border_1()
+                        .border_color(theme::border())
+                        .shadow_lg()
+                        .bg(theme::bg())
+                        .child(preview),
                 )
                 .into_any_element(),
         )
@@ -1338,6 +1536,53 @@ impl Workspace {
             })
         };
 
+        let current_view = self.focused_pane().read(cx).view;
+        let view_buttons = {
+            let mut group = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_0p5()
+                .p_0p5()
+                .rounded_md()
+                .bg(theme::bg_raised());
+            for (mode, icon) in [
+                (ViewMode::Icons, icons::VIEW_ICONS),
+                (ViewMode::List, icons::VIEW_LIST),
+                (ViewMode::Columns, icons::VIEW_COLUMNS),
+            ] {
+                let entity = entity.clone();
+                let active = current_view == mode;
+                group = group.child(
+                    toolbar_button(
+                        match mode {
+                            ViewMode::Icons => "view-icons",
+                            ViewMode::List => "view-list",
+                            ViewMode::Columns => "view-columns",
+                        },
+                        icon,
+                        false,
+                        theme::text(),
+                    )
+                    .when(active, |this| this.bg(theme::bg_hover()))
+                    .on_click(move |_, _, cx| {
+                        entity.update(cx, |workspace, cx| workspace.set_view(mode, cx));
+                    }),
+                );
+            }
+            group
+        };
+
+        let sort_button = {
+            let entity = entity.clone();
+            toolbar_button("titlebar-sort", icons::SORT, false, theme::text()).on_click(
+                move |event, _, cx| {
+                    let at = event.position();
+                    entity.update(cx, |workspace, cx| workspace.open_sort_menu(at, cx));
+                },
+            )
+        };
+
         let split_button = {
             let entity = entity.clone();
             toolbar_button("titlebar-split", icons::SPLIT, self.split, theme::accent()).on_click(
@@ -1384,7 +1629,16 @@ impl Workspace {
             .bg(theme::bg())
             .border_b_1()
             .border_color(theme::border_soft())
-            .child(div().flex_1())
+            .child(
+                div()
+                    .flex_1()
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_1()
+                    .child(view_buttons)
+                    .child(sort_button),
+            )
             .child(search)
             .child(
                 div()

@@ -4,6 +4,10 @@
 //! Compress / Duplicate / Make Alias / Quick Look / Copy / Paste Item ...). Only
 //! the model lives here; the workspace draws it and runs the chosen action.
 
+use vfs_core::{SortKey, SortSpec};
+
+use crate::view::ViewMode;
+
 /// Everything a menu row can do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuAction {
@@ -25,6 +29,10 @@ pub enum MenuAction {
     Properties,
     NewFolder,
     Refresh,
+    SortBy(SortKey),
+    SortDescending(bool),
+    SortFoldersFirst,
+    SetView(ViewMode),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -33,6 +41,8 @@ pub struct ActionItem {
     pub label: String,
     pub shortcut: Option<&'static str>,
     pub enabled: bool,
+    /// Draws a check mark (current sort key, current view ...).
+    pub checked: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -65,13 +75,68 @@ fn action(
         label: label.to_string(),
         shortcut,
         enabled,
+        checked: false,
     })
+}
+
+fn checked(item: MenuItem, on: bool) -> MenuItem {
+    match item {
+        MenuItem::Action(mut item) => {
+            item.checked = on;
+            MenuItem::Action(item)
+        }
+        separator => separator,
+    }
+}
+
+/// Finder's wording for sort keys ("Date Modified", not "Modified").
+pub fn sort_key_label(key: SortKey) -> &'static str {
+    match key {
+        SortKey::Name => "Name",
+        SortKey::Kind => "Kind",
+        SortKey::Modified => "Date Modified",
+        SortKey::Created => "Date Created",
+        SortKey::Size => "Size",
+    }
+}
+
+/// The toolbar's "Sort By" menu, with the current choice checked.
+pub fn sort_menu(spec: SortSpec) -> Vec<MenuItem> {
+    let mut items: Vec<MenuItem> = SortKey::ALL
+        .iter()
+        .map(|key| {
+            checked(
+                action(MenuAction::SortBy(*key), sort_key_label(*key), None, true),
+                spec.key == *key,
+            )
+        })
+        .collect();
+    items.push(MenuItem::Separator);
+    items.push(checked(
+        action(MenuAction::SortDescending(false), "Ascending", None, true),
+        !spec.descending,
+    ));
+    items.push(checked(
+        action(MenuAction::SortDescending(true), "Descending", None, true),
+        spec.descending,
+    ));
+    items.push(MenuItem::Separator);
+    items.push(checked(
+        action(
+            MenuAction::SortFoldersFirst,
+            "Keep Folders on Top",
+            None,
+            true,
+        ),
+        spec.dirs_first,
+    ));
+    items
 }
 
 /// Build the menu for `target`, laid out like Explorer's classic context menu:
 /// open actions, then Cut / Copy / Paste, then shortcut / Delete / Rename, then
 /// Properties. `can_paste` is whether the file clipboard holds anything.
-pub fn build_menu(target: &MenuTarget, can_paste: bool) -> Vec<MenuItem> {
+pub fn build_menu(target: &MenuTarget, can_paste: bool, view: ViewMode) -> Vec<MenuItem> {
     use MenuAction::*;
     match target {
         MenuTarget::Background => vec![
@@ -81,6 +146,24 @@ pub fn build_menu(target: &MenuTarget, can_paste: bool) -> Vec<MenuItem> {
             MenuItem::Separator,
             action(NewFolder, "New folder", Some("⇧⌘N"), true),
             action(OpenInTerminal, "Open in Terminal", None, true),
+            MenuItem::Separator,
+            checked(
+                action(SetView(ViewMode::Icons), "View as Icons", Some("⌘1"), true),
+                view == ViewMode::Icons,
+            ),
+            checked(
+                action(SetView(ViewMode::List), "View as List", Some("⌘2"), true),
+                view == ViewMode::List,
+            ),
+            checked(
+                action(
+                    SetView(ViewMode::Columns),
+                    "View as Columns",
+                    Some("⌘3"),
+                    true,
+                ),
+                view == ViewMode::Columns,
+            ),
         ],
         MenuTarget::Items { count, is_dir } => {
             let single = *count == 1;
@@ -192,7 +275,7 @@ mod tests {
 
     #[test]
     fn file_menu_has_the_explorer_core_in_order() {
-        let items = build_menu(&files(1), false);
+        let items = build_menu(&files(1), false, ViewMode::List);
         let labels = labels(&items);
         let at = |label: &str| labels.iter().position(|l| *l == label).unwrap();
         assert_eq!(labels[0], "Open");
@@ -205,7 +288,7 @@ mod tests {
     #[test]
     fn no_finder_only_commands_remain() {
         for target in [files(1), folder(), MenuTarget::Background] {
-            let labels = labels(&build_menu(&target, true))
+            let labels = labels(&build_menu(&target, true, ViewMode::List))
                 .iter()
                 .map(|l| l.to_string())
                 .collect::<Vec<_>>();
@@ -217,7 +300,7 @@ mod tests {
 
     #[test]
     fn several_items_disable_rename_and_properties_but_not_delete() {
-        let items = build_menu(&files(3), false);
+        let items = build_menu(&files(3), false, ViewMode::List);
         assert!(!find(&items, MenuAction::Rename).enabled);
         assert!(!find(&items, MenuAction::Properties).enabled);
         assert!(find(&items, MenuAction::Delete).enabled);
@@ -226,28 +309,46 @@ mod tests {
 
     #[test]
     fn folders_gain_tab_terminal_and_paste_into() {
-        let items = build_menu(&folder(), true);
+        let items = build_menu(&folder(), true, ViewMode::List);
         assert!(has(&items, MenuAction::OpenInNewTab));
         assert!(has(&items, MenuAction::OpenInTerminal));
         assert!(find(&items, MenuAction::PasteInto).enabled);
-        assert!(!find(&build_menu(&folder(), false), MenuAction::PasteInto).enabled);
-        assert!(!has(&build_menu(&files(1), true), MenuAction::PasteInto));
+        assert!(
+            !find(
+                &build_menu(&folder(), false, ViewMode::List),
+                MenuAction::PasteInto
+            )
+            .enabled
+        );
+        assert!(!has(
+            &build_menu(&files(1), true, ViewMode::List),
+            MenuAction::PasteInto
+        ));
     }
 
     #[test]
     fn single_files_can_be_previewed_but_folders_cannot() {
-        assert!(has(&build_menu(&files(1), false), MenuAction::Preview));
-        assert!(!has(&build_menu(&folder(), false), MenuAction::Preview));
-        assert!(!has(&build_menu(&files(2), false), MenuAction::Preview));
+        assert!(has(
+            &build_menu(&files(1), false, ViewMode::List),
+            MenuAction::Preview
+        ));
+        assert!(!has(
+            &build_menu(&folder(), false, ViewMode::List),
+            MenuAction::Preview
+        ));
+        assert!(!has(
+            &build_menu(&files(2), false, ViewMode::List),
+            MenuAction::Preview
+        ));
     }
 
     #[test]
     fn background_menu_pastes_only_with_a_clipboard() {
-        let empty = build_menu(&MenuTarget::Background, false);
+        let empty = build_menu(&MenuTarget::Background, false, ViewMode::List);
         assert!(!find(&empty, MenuAction::Paste).enabled);
         assert!(
             find(
-                &build_menu(&MenuTarget::Background, true),
+                &build_menu(&MenuTarget::Background, true, ViewMode::List),
                 MenuAction::Paste
             )
             .enabled
@@ -258,13 +359,77 @@ mod tests {
     #[test]
     fn no_menu_starts_or_ends_with_a_separator_or_doubles_one() {
         for target in [MenuTarget::Background, files(1), files(2), folder()] {
-            let items = build_menu(&target, true);
+            let items = build_menu(&target, true, ViewMode::List);
             assert_ne!(items.first(), Some(&MenuItem::Separator));
             assert_ne!(items.last(), Some(&MenuItem::Separator));
             assert!(
                 !items
                     .windows(2)
                     .any(|w| w[0] == MenuItem::Separator && w[1] == MenuItem::Separator)
+            );
+        }
+    }
+
+    fn checked_actions(items: &[MenuItem]) -> Vec<MenuAction> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                MenuItem::Action(a) if a.checked => Some(a.action),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sort_menu_lists_every_key_and_checks_the_current_one() {
+        let items = build_sort_for_test(SortKey::Size, false);
+        let checked = checked_actions(&items);
+        assert!(checked.contains(&MenuAction::SortBy(SortKey::Size)));
+        assert!(!checked.contains(&MenuAction::SortBy(SortKey::Name)));
+        for key in SortKey::ALL {
+            assert!(has(&items, MenuAction::SortBy(key)), "{key:?}");
+        }
+    }
+
+    #[test]
+    fn sort_menu_checks_exactly_one_direction() {
+        let asc = checked_actions(&build_sort_for_test(SortKey::Name, false));
+        assert!(asc.contains(&MenuAction::SortDescending(false)));
+        assert!(!asc.contains(&MenuAction::SortDescending(true)));
+        let desc = checked_actions(&build_sort_for_test(SortKey::Name, true));
+        assert!(desc.contains(&MenuAction::SortDescending(true)));
+        assert!(!desc.contains(&MenuAction::SortDescending(false)));
+    }
+
+    #[test]
+    fn sort_menu_reflects_folders_on_top() {
+        let on = SortSpec::new(SortKey::Name, false);
+        assert!(checked_actions(&sort_menu(on)).contains(&MenuAction::SortFoldersFirst));
+        let off = SortSpec {
+            dirs_first: false,
+            ..on
+        };
+        assert!(!checked_actions(&sort_menu(off)).contains(&MenuAction::SortFoldersFirst));
+    }
+
+    #[test]
+    fn sort_labels_follow_finder() {
+        assert_eq!(sort_key_label(SortKey::Modified), "Date Modified");
+        assert_eq!(sort_key_label(SortKey::Created), "Date Created");
+    }
+
+    fn build_sort_for_test(key: SortKey, descending: bool) -> Vec<MenuItem> {
+        sort_menu(SortSpec::new(key, descending))
+    }
+
+    #[test]
+    fn background_menu_checks_the_current_view() {
+        for mode in [ViewMode::Icons, ViewMode::List, ViewMode::Columns] {
+            let items = build_menu(&MenuTarget::Background, false, mode);
+            assert_eq!(
+                checked_actions(&items),
+                [MenuAction::SetView(mode)],
+                "{mode:?}"
             );
         }
     }

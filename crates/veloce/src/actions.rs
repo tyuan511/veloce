@@ -20,6 +20,8 @@ actions!(
         OpenEntry,
         FocusLeft,
         FocusRight,
+        MoveLeft,
+        MoveRight,
         // selection
         ExtendDown,
         ExtendUp,
@@ -38,6 +40,10 @@ actions!(
         OpenCommands,
         // preview
         TogglePreview,
+        QuickLook,
+        ViewIcons,
+        ViewList,
+        ViewColumns,
         // transfers
         CopyToOtherPane,
         MoveToOtherPane,
@@ -82,11 +88,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-g", JumpBottom, Some(CONTEXT)),
         KeyBinding::new("end", JumpBottom, Some(CONTEXT)),
         KeyBinding::new("h", GoParent, Some(CONTEXT)),
-        KeyBinding::new("left", GoParent, Some(CONTEXT)),
+        KeyBinding::new("left", MoveLeft, Some(CONTEXT)),
         KeyBinding::new("backspace", GoParent, Some(CONTEXT)),
         KeyBinding::new("cmd-up", GoParent, Some(CONTEXT)),
         KeyBinding::new("l", OpenEntry, Some(CONTEXT)),
-        KeyBinding::new("right", OpenEntry, Some(CONTEXT)),
+        KeyBinding::new("right", MoveRight, Some(CONTEXT)),
         KeyBinding::new("enter", OpenEntry, Some(CONTEXT)),
         // ---- selection ----
         KeyBinding::new("shift-j", ExtendDown, Some(CONTEXT)),
@@ -101,14 +107,19 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-]", NextTab, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-[", PrevTab, Some(CONTEXT)),
         KeyBinding::new("cmd-\\", ToggleSplit, Some(CONTEXT)),
-        KeyBinding::new("cmd-1", FocusLeft, Some(CONTEXT)),
-        KeyBinding::new("cmd-2", FocusRight, Some(CONTEXT)),
+        KeyBinding::new("ctrl-1", FocusLeft, Some(CONTEXT)),
+        KeyBinding::new("ctrl-2", FocusRight, Some(CONTEXT)),
+        // ---- views (Finder: ⌘1 icons, ⌘2 list, ⌘3 columns) ----
+        KeyBinding::new("cmd-1", ViewIcons, Some(CONTEXT)),
+        KeyBinding::new("cmd-2", ViewList, Some(CONTEXT)),
+        KeyBinding::new("cmd-3", ViewColumns, Some(CONTEXT)),
         // ---- filtering & palette ----
         KeyBinding::new("/", StartFilter, Some(CONTEXT)),
         KeyBinding::new("cmd-p", OpenPalette, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-p", OpenCommands, Some(CONTEXT)),
         // ---- preview ----
-        KeyBinding::new("space", TogglePreview, Some(CONTEXT)),
+        KeyBinding::new("space", QuickLook, Some(CONTEXT)),
+        KeyBinding::new("cmd-alt-i", TogglePreview, Some(CONTEXT)),
         // ---- transfers ----
         KeyBinding::new("f5", CopyToOtherPane, Some(CONTEXT)),
         KeyBinding::new("f6", MoveToOtherPane, Some(CONTEXT)),
@@ -138,7 +149,7 @@ pub fn bind_keys(cx: &mut App) {
 pub const SHORTCUTS: &[(&str, &str)] = &[
     ("j / k", "move down / up"),
     ("h / l", "parent / open"),
-    ("space", "quick preview"),
+    ("space", "quick look"),
     ("/", "filter this folder"),
     ("⌘P", "fuzzy jump"),
     ("⌘⇧P", "commands"),
