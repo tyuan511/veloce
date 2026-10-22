@@ -1,0 +1,15 @@
+[package]
+name = "veloce-store"
+description = "SQLite-backed application state for Veloce: settings, per-folder view preferences, session, recents and the thumbnail cache"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# `bundled` compiles SQLite in, so there is no system library to depend on.
+rusqlite = { version = "0.40", features = ["bundled"] }
+dirs.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
