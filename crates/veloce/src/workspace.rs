@@ -259,6 +259,16 @@ impl Workspace {
                             }
                         }
                         PaneEvent::TabsChanged => workspace.save_tabs(cx),
+                        PaneEvent::SelectionChanged => {
+                            // Clicking in the other pane makes it the active one,
+                            // so the preview follows what the user just selected.
+                            let side = pane.read(cx).side;
+                            if workspace.split && workspace.focused != side {
+                                workspace.focused = side;
+                                workspace.retarget_watcher(cx);
+                            }
+                            workspace.sync_preview(cx);
+                        }
                         PaneEvent::Notice(message) => {
                             workspace.banner = Some((message.clone(), std::time::Instant::now()));
                         }
@@ -1542,7 +1552,13 @@ impl Render for Workspace {
             .bg(theme::bg())
             .text_color(theme::text())
             .child(sidebar)
-            .child(resize_handle("handle-sidebar", Divider::Sidebar, cx))
+            .child(resize_handle(
+                "handle-sidebar",
+                Divider::Sidebar,
+                theme::bg(),
+                theme::bg_pane(),
+                cx,
+            ))
             .child(
                 // Everything right of the sidebar: toolbar, then the panes and the
                 // inspector side by side, then the task panel.
@@ -1561,13 +1577,21 @@ impl Render for Workspace {
                             .min_h_0()
                             .child(left)
                             .when_some(right, |this, right| {
-                                this.child(resize_handle("handle-panes", Divider::Panes, cx))
-                                    .child(right)
+                                this.child(resize_handle(
+                                    "handle-panes",
+                                    Divider::Panes,
+                                    theme::bg_pane(),
+                                    theme::bg_pane(),
+                                    cx,
+                                ))
+                                .child(right)
                             })
                             .when_some(preview, |this, preview| {
                                 this.child(resize_handle(
                                     "handle-inspector",
                                     Divider::Inspector,
+                                    theme::bg_pane(),
+                                    theme::bg(),
                                     cx,
                                 ))
                                 .child(preview)
@@ -1980,27 +2004,45 @@ impl Workspace {
     }
 }
 
-/// A draggable divider: a 1px line inside a wider hit area that tints on hover.
-fn resize_handle(id: &'static str, divider: Divider, cx: &mut Context<Workspace>) -> AnyElement {
+/// A draggable divider between two regions.
+///
+/// The hit area is wider than the 1px line, but it must not look like a stripe of
+/// foreign background: each side is therefore filled with the colour of the
+/// region it borders (`left_bg` / `right_bg`), so the line sits exactly on the
+/// seam and nothing appears to overflow.
+fn resize_handle(
+    id: &'static str,
+    divider: Divider,
+    left_bg: gpui::Hsla,
+    right_bg: gpui::Hsla,
+    cx: &mut Context<Workspace>,
+) -> AnyElement {
     let entity = cx.entity();
-    let mut hover = theme::accent();
-    hover.a = 0.35;
+    let side = (HANDLE_WIDTH - 1.0) / 2.0;
     div()
         .id(id)
+        .group(id)
         .w(px(HANDLE_WIDTH))
         .h_full()
         .flex_shrink_0()
         .flex()
-        .justify_center()
+        .flex_row()
         .cursor(gpui::CursorStyle::ResizeLeftRight)
-        .hover(move |this| this.bg(hover))
         .on_mouse_down(MouseButton::Left, move |_, _, cx| {
             entity.update(cx, |workspace, cx| {
                 workspace.drag = Some(divider);
                 cx.notify();
             });
         })
-        .child(div().w(px(1.)).h_full().bg(theme::border_soft()))
+        .child(div().w(px(side)).h_full().bg(left_bg))
+        .child(
+            div()
+                .w(px(1.))
+                .h_full()
+                .bg(theme::border_soft())
+                .group_hover(id, |this| this.bg(theme::accent())),
+        )
+        .child(div().w(px(side)).h_full().bg(right_bg))
         .into_any_element()
 }
 

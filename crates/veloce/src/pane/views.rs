@@ -12,7 +12,7 @@ use crate::{
     thumbs,
     view::{
         COLUMN_WIDTH, GRID_PADDING, ICON_CELL_H, ICON_CELL_W, MAX_COLUMN_DIRS, column_dirs,
-        grid_columns, grid_rows,
+        columns_content_width, grid_columns, grid_rows,
     },
 };
 
@@ -242,7 +242,14 @@ impl Pane {
         };
         let dirs = column_dirs(&current, MAX_COLUMN_DIRS);
         let side = self.side.index();
-        let mut row = div().flex().flex_row().flex_1().min_h_0().overflow_hidden();
+        let mut row = div()
+            .flex()
+            .flex_row()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            // Every open folder keeps its width; a narrow pane scrolls sideways.
+            .min_w(px(columns_content_width(dirs.len())));
 
         // Ancestor columns, with the folder we came through highlighted.
         for (index, dir) in dirs.iter().enumerate() {
@@ -279,8 +286,15 @@ impl Pane {
             Some(entry) => render_file_detail(&entry),
             None => div().into_any_element(),
         };
-        let _ = side;
-        row.child(detail).into_any_element()
+        div()
+            .id(gpui::ElementId::Name(
+                format!("pane{side}-columns-scroll").into(),
+            ))
+            .flex_1()
+            .min_h_0()
+            .overflow_x_scroll()
+            .child(row.child(detail))
+            .into_any_element()
     }
 
     /// The interactive column: the pane's own listing in the compact row style.

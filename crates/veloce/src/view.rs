@@ -195,6 +195,35 @@ pub fn ratio_from_pointer(pointer_x: f32, sidebar: f32, area: f32) -> f32 {
     clamp_ratio(left / area, area)
 }
 
+// ---- minimum widths --------------------------------------------------------
+
+/// Narrowest the list may be laid out: icon, a readable name, and the three data
+/// columns. A pane narrower than this scrolls sideways instead of letting the
+/// columns pile onto each other.
+pub const LIST_NAME_MIN: f32 = 180.0;
+pub const LIST_ICON_AREA: f32 = 26.0;
+
+/// Minimum content width of a view, given the fixed data-column widths. `None`
+/// means the view adapts by itself and never needs a sideways scroll.
+pub fn min_content_width(view: ViewMode, data_columns: f32) -> Option<f32> {
+    match view {
+        ViewMode::List => Some(LIST_ICON_AREA + LIST_NAME_MIN + data_columns),
+        // The grid reflows into fewer columns; one cell is the floor.
+        ViewMode::Icons => Some(ICON_CELL_W + GRID_PADDING * 2.0),
+        // Columns lay out their own scrolling area (their width depends on how
+        // many folders are open).
+        ViewMode::Columns => None,
+    }
+}
+
+/// Width of the columns browser: every open folder plus the detail column.
+pub fn columns_content_width(folders: usize) -> f32 {
+    folders as f32 * COLUMN_WIDTH + DETAIL_MIN
+}
+
+/// Narrowest the detail column (selected file or folder contents) may get.
+pub const DETAIL_MIN: f32 = 240.0;
+
 // ---- columns ---------------------------------------------------------------
 
 pub const COLUMN_WIDTH: f32 = 220.0;
@@ -381,6 +410,27 @@ mod tests {
             let (l, r) = pane_widths(window, 176.0, 340.0, true, true, 0.5);
             assert!(l >= 0.0 && r >= 0.0 && l.is_finite() && r.is_finite());
         }
+    }
+
+    #[test]
+    fn the_list_floor_covers_icon_name_and_every_data_column() {
+        let min = min_content_width(ViewMode::List, 324.0).unwrap();
+        assert_eq!(min, LIST_ICON_AREA + LIST_NAME_MIN + 324.0);
+        assert!(min > 500.0, "wide enough that columns cannot overlap");
+    }
+
+    #[test]
+    fn the_icon_grid_floor_is_one_cell() {
+        let min = min_content_width(ViewMode::Icons, 0.0).unwrap();
+        assert_eq!(min, ICON_CELL_W + GRID_PADDING * 2.0);
+        assert_eq!(grid_columns(min), 1);
+    }
+
+    #[test]
+    fn the_columns_view_sizes_itself_from_its_folders() {
+        assert_eq!(min_content_width(ViewMode::Columns, 0.0), None);
+        assert_eq!(columns_content_width(1), COLUMN_WIDTH + DETAIL_MIN);
+        assert!(columns_content_width(3) > columns_content_width(2));
     }
 
     #[test]

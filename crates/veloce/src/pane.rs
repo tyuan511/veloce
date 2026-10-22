@@ -42,7 +42,7 @@ use crate::{
     persist::Persist,
     text_input::{TextInput, TextInputEvent},
     theme::{self, ROW_HEIGHT},
-    view::{GridMove, ViewMode, grid_move},
+    view::{GridMove, ViewMode, grid_move, min_content_width},
 };
 
 /// Icon / size / time column widths, shared by the header and every row so they
@@ -142,6 +142,8 @@ pub enum PaneEvent {
     Navigated(VfsUri),
     /// Tabs were opened, closed, switched or pointed elsewhere.
     TabsChanged,
+    /// The cursor moved (by key or click), so the preview must follow.
+    SelectionChanged,
 }
 
 /// Jump targets for `gg` / `G`.
@@ -507,6 +509,7 @@ impl Pane {
     pub fn set_cursor_position(&mut self, position: usize, extend: bool, cx: &mut Context<Self>) {
         self.listing.set_cursor(position, extend);
         self.refresh_status();
+        cx.emit(PaneEvent::SelectionChanged);
         cx.notify();
     }
 
@@ -541,6 +544,7 @@ impl Pane {
         self.listing.set_cursor(target, false);
         self.scroll_to_cursor();
         self.refresh_status();
+        cx.emit(PaneEvent::SelectionChanged);
         cx.notify();
     }
 
@@ -602,6 +606,7 @@ impl Pane {
         self.listing.move_cursor(delta, extend);
         self.scroll_to_cursor();
         self.refresh_status();
+        cx.emit(PaneEvent::SelectionChanged);
         cx.notify();
     }
 
@@ -613,6 +618,7 @@ impl Pane {
         self.listing.jump(target);
         self.scroll_to_cursor();
         self.refresh_status();
+        cx.emit(PaneEvent::SelectionChanged);
         cx.notify();
     }
 
@@ -639,6 +645,7 @@ impl Pane {
         self.listing.extend_selection(delta);
         self.scroll_to_cursor();
         self.refresh_status();
+        cx.emit(PaneEvent::SelectionChanged);
         cx.notify();
     }
 
@@ -1127,6 +1134,44 @@ impl Pane {
             })
             .child(body);
 
+        // Header and rows share one sideways-scrolling area with a minimum width:
+        // in a narrow pane the list scrolls instead of its columns overlapping.
+        let data_columns = TIME_WIDTH + SIZE_WIDTH + KIND_WIDTH;
+        let content: AnyElement = match min_content_width(self.view, data_columns) {
+            Some(min) => div()
+                .id(gpui::ElementId::Name(
+                    format!("pane{}-hscroll", self.side.index()).into(),
+                ))
+                // A flex column so the content below can take the remaining height
+                // with `flex_1` (a percentage height would not resolve inside a
+                // scrolling element).
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .overflow_x_scroll()
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .w_full()
+                        .min_w(px(min))
+                        .children(header)
+                        .child(body_area),
+                )
+                .into_any_element(),
+            None => div()
+                .flex()
+                .flex_col()
+                .flex_1()
+                .min_h_0()
+                .children(header)
+                .child(body_area)
+                .into_any_element(),
+        };
+
         div()
             .flex()
             .flex_col()
@@ -1144,8 +1189,7 @@ impl Pane {
             .children(tabs)
             .child(path_bar)
             .children(filter_bar)
-            .children(header)
-            .child(body_area)
+            .child(content)
             .child(status)
             .into_any_element()
     }
@@ -1605,11 +1649,12 @@ impl Pane {
         let entity = cx.entity();
         let selected = self.listing.selected.clone();
         let cursor = self.listing.cursor;
-
         div()
             .flex_1()
             .min_h_0()
             .overflow_hidden()
+            // A little air between the header and the first row.
+            .pt(px(4.))
             .child(
                 uniform_list(
                     gpui::ElementId::Name(format!("pane{}-list", self.side.index()).into()),
