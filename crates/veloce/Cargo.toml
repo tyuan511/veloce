@@ -12,6 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 vfs-core = { path = "../vfs-core" }
+veloce-store = { path = "../store" }
 gpui = { version = "0.2.2", features = ["runtime_shaders"] }
 anyhow.workspace = true
 async-channel.workspace = true

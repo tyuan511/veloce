@@ -39,6 +39,7 @@ use crate::{
     listing::{
         Listing, breadcrumbs, cycle_index, index_after_close, parse_path_input, visible_crumbs,
     },
+    persist::Persist,
     text_input::{TextInput, TextInputEvent},
     theme::{self, ROW_HEIGHT},
     view::{GridMove, ViewMode, grid_move},
@@ -84,25 +85,38 @@ pub struct Tab {
     pub history: History<VfsUri>,
 }
 
+/// What the icon view knows about one file's thumbnail.
+#[derive(Clone)]
+pub struct ThumbEntry {
+    /// The file version this answer is for; a changed file is asked again.
+    pub stamp: crate::thumbs::Stamp,
+    pub state: ThumbState,
+}
+
+#[derive(Clone)]
+pub enum ThumbState {
+    Pending,
+    Ready(Arc<gpui::Image>),
+    /// No thumbnail could be made: keep the ordinary icon.
+    Unavailable,
+}
+
 /// Shared services the panes borrow.
 #[derive(Clone)]
 pub struct Services {
     pub provider: Arc<dyn VfsProvider>,
     pub tasks: Arc<TaskManager>,
+    /// Saved per-folder views, and the queue for writing new ones.
+    pub persist: Persist,
 }
 
 impl Services {
-    pub fn new() -> Self {
+    pub fn new(persist: Persist) -> Self {
         Self {
             provider: Arc::new(LocalProvider::new()),
             tasks: Arc::new(TaskManager::with_defaults()),
+            persist,
         }
-    }
-}
-
-impl Default for Services {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -123,6 +137,11 @@ pub enum PaneEvent {
     },
     /// A background operation failed; the workspace shows it as a banner.
     Notice(String),
+    /// The pane moved to a folder (not emitted for Back/Forward replays of a
+    /// reload, only for real changes of folder).
+    Navigated(VfsUri),
+    /// Tabs were opened, closed, switched or pointed elsewhere.
+    TabsChanged,
 }
 
 /// Jump targets for `gg` / `G`.
@@ -147,6 +166,9 @@ pub struct Pane {
     pub grid_cols: usize,
     /// Side-column folder contents (columns view), loaded lazily.
     pub columns: HashMap<PathBuf, Arc<Vec<FileEntry>>>,
+    /// Thumbnails for the icon view, generated lazily for visible files.
+    pub thumbs: HashMap<PathBuf, ThumbEntry>,
+    thumbs_in_flight: usize,
     columns_loading: HashSet<PathBuf>,
     column_scrolls: HashMap<PathBuf, UniformListScrollHandle>,
     columns_scrolled: HashSet<PathBuf>,
@@ -228,6 +250,8 @@ impl Pane {
             avail_width: 800.0,
             grid_cols: 1,
             columns: HashMap::new(),
+            thumbs: HashMap::new(),
+            thumbs_in_flight: 0,
             columns_loading: HashSet::new(),
             column_scrolls: HashMap::new(),
             columns_scrolled: HashSet::new(),
@@ -403,9 +427,71 @@ impl Pane {
         }
     }
 
+    /// The view and sort saved for this folder (or Finder's default for one never
+    /// customised). Only local folders are remembered.
+    fn apply_folder_prefs(&mut self, uri: &VfsUri) {
+        let Some(path) = uri.as_local_path() else {
+            return;
+        };
+        let (view, sort) = self.services.persist.folder_view(&path.to_string_lossy());
+        self.view = view;
+        self.sort = sort;
+        self.recompute_visible();
+        self.scroll = UniformListScrollHandle::new();
+    }
+
+    /// Save the current view and sort as this folder's.
+    fn remember_folder_prefs(&mut self, cx: &mut Context<Self>) {
+        if let Some(path) = self.current_uri().as_local_path() {
+            self.services.persist.remember_folder(
+                cx,
+                &path.to_string_lossy(),
+                self.view,
+                self.sort,
+            );
+        }
+    }
+
+    /// Local paths of the open tabs and the active index, for the saved session.
+    pub fn tab_paths(&self) -> (Vec<String>, usize) {
+        let mut paths = Vec::new();
+        let mut active = 0;
+        for (index, tab) in self.tabs.iter().enumerate() {
+            if let Some(path) = tab.uri.as_local_path() {
+                if index == self.active_tab {
+                    active = paths.len();
+                }
+                paths.push(path.to_string_lossy().into_owned());
+            }
+        }
+        (paths, active)
+    }
+
+    /// Replace the tabs with a restored session. Call before the first `reload`.
+    pub fn restore_tabs(&mut self, uris: Vec<VfsUri>, active: usize) {
+        if uris.is_empty() {
+            // Nothing saved, but the starting folder may have its own view.
+            let uri = self.current_uri();
+            self.apply_folder_prefs(&uri);
+            return;
+        }
+        self.tabs = uris
+            .into_iter()
+            .map(|uri| Tab {
+                title: uri.file_name().to_string(),
+                history: History::new(uri.clone()),
+                uri,
+            })
+            .collect();
+        self.active_tab = active.min(self.tabs.len() - 1);
+        let uri = self.current_uri();
+        self.apply_folder_prefs(&uri);
+    }
+
     /// Show a folder without touching the history (Back/Forward and `navigate_to`
     /// both end here).
     fn show_uri(&mut self, uri: VfsUri, cx: &mut Context<Self>) {
+        self.apply_folder_prefs(&uri);
         self.tabs[self.active_tab].uri = uri.clone();
         self.tabs[self.active_tab].title = uri.file_name().to_string();
         self.listing.clear_selection();
@@ -414,6 +500,8 @@ impl Pane {
         self.filter_input.update(cx, |input, cx| input.clear(cx));
         self.scroll = UniformListScrollHandle::new();
         self.reload(cx);
+        cx.emit(PaneEvent::Navigated(uri));
+        cx.emit(PaneEvent::TabsChanged);
     }
 
     pub fn set_cursor_position(&mut self, position: usize, extend: bool, cx: &mut Context<Self>) {
@@ -463,6 +551,7 @@ impl Pane {
         self.view = view;
         self.scroll = UniformListScrollHandle::new();
         self.scroll_to_cursor();
+        self.remember_folder_prefs(cx);
         cx.notify();
     }
 
@@ -483,6 +572,7 @@ impl Pane {
         self.sort = sort;
         self.recompute_visible();
         self.invalidate_columns();
+        self.remember_folder_prefs(cx);
         cx.notify();
     }
 
@@ -970,6 +1060,7 @@ impl Pane {
         });
         self.active_tab = self.tabs.len() - 1;
         self.reload(cx);
+        cx.emit(PaneEvent::TabsChanged);
         cx.notify();
     }
 
@@ -982,6 +1073,7 @@ impl Pane {
         self.tabs.remove(index);
         self.listing.clear_selection();
         self.reload(cx);
+        cx.emit(PaneEvent::TabsChanged);
         cx.notify();
     }
 
@@ -992,6 +1084,7 @@ impl Pane {
         self.active_tab = index;
         self.listing.clear_selection();
         self.reload(cx);
+        cx.emit(PaneEvent::TabsChanged);
         cx.notify();
     }
 

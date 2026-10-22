@@ -21,10 +21,13 @@ mod listing;
 mod open_with;
 mod palette;
 mod pane;
+mod persist;
+mod prefs;
 mod preview;
 mod tasks_panel;
 mod text_input;
 mod theme;
+mod thumbs;
 mod view;
 mod workspace;
 
@@ -39,6 +42,9 @@ fn main() {
         text_input::init(cx);
         actions::bind_keys(cx);
 
+        // Load everything saved before the window exists, so the first frame is
+        // already the restored layout.
+        let (persist, startup) = persist::Persist::open();
         let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
         let window = cx
             .open_window(
@@ -52,7 +58,7 @@ fn main() {
                     }),
                     ..Default::default()
                 },
-                |_, cx| new_workspace(cx),
+                |_, cx| new_workspace(persist, startup, cx),
             )
             .expect("open window");
 

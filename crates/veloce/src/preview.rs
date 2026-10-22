@@ -225,7 +225,7 @@ fn is_image_extension(ext: &str) -> bool {
 
 /// Formats GPUI cannot decode but macOS Quick Look can render as a thumbnail:
 /// documents, video, audio artwork, camera RAW, HEIC, fonts and 3D models.
-fn is_thumbnail_extension(ext: &str) -> bool {
+pub(crate) fn is_thumbnail_extension(ext: &str) -> bool {
     matches!(
         ext,
         "pdf"
@@ -348,7 +348,7 @@ pub fn hex_dump(bytes: &[u8], max_bytes: usize) -> Vec<String> {
 }
 
 /// Stable cache directory name for a thumbnail: changes when the file does.
-pub fn thumbnail_cache_key(path: &Path, size: u64, modified_secs: u64) -> String {
+pub(crate) fn thumbnail_cache_key(path: &Path, size: u64, modified_secs: u64) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut hasher);

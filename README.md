@@ -31,6 +31,8 @@ crates/
     search.rs        parallel recursive search (ignore + nucleo)
     watch.rs         debounced filesystem watcher
     ops.rs           TaskManager: background copy/move/trash with progress
+  store/             veloce-store: SQLite state (settings, folder views, session, recents,
+                     thumbnail cache), no GUI dependency
   veloce/            GPUI front-end
     listing.rs       pure list logic: sort/filter/cursor/selection/path parsing
     workspace.rs     sidebar + two panes + inspector + task panel + palette, all actions
@@ -100,6 +102,21 @@ compile once at first launch.
 | `s` | cycle sort column (toolbar ⇅ menu: name, kind, date modified, date created, size; ascending/descending; folders on top) |
 | `⌘R` | refresh |
 
+## Saved state
+
+Veloce keeps what you would miss in one SQLite file
+(`~/Library/Application Support/Veloce/veloce.db`): window layout and toggles, the
+view and sort of each folder (like Finder, an unvisited folder opens as a list),
+the open tabs of both panes, recently visited folders (the sidebar's *Recent*
+section) and generated thumbnails. Everything is loaded before the window opens;
+writes happen on a background thread, so the UI never waits on disk. If the file
+cannot be opened or is damaged it is moved aside and the app carries on without
+remembering.
+
+The icon view shows real previews: pictures through `sips`, everything else
+(PDF, video, documents, web pages) through Quick Look, cached in that database and
+pruned least-recently-used past 256 MB.
+
 ## Layout
 
 Drag the dividers to resize the sidebar, the preview panel and, when split, the two panes.
@@ -128,7 +145,7 @@ Drag the dividers to resize the sidebar, the preview panel and, when split, the 
 ## Tests
 
 ```sh
-cargo test              # 380 tests, no GPU or window server needed
+cargo test              # 430 tests, no GPU or window server needed
 cargo test -p vfs-core  # 156 core tests
 ```
 

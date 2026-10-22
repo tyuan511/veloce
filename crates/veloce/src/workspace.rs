@@ -30,17 +30,21 @@ use crate::{
     },
     icons,
     info::info_rows,
-    listing::{Place, expand_home, favorite_places, location_places, place_is_current},
+    listing::{
+        Place, expand_home, favorite_places, location_places, place_is_current, recent_places,
+    },
     open_with::{self, AppInfo},
     palette::{Palette, PaletteChoice, PaletteEvent, PaletteMode},
     pane::{Pane, PaneEvent, PaneSide, Services},
+    persist::{Persist, RECENT_SHOWN, Startup},
+    prefs::LayoutPrefs,
     preview::{PreviewEvent, PreviewView},
     tasks_panel::TaskPanel,
     text_input::{TextInput, TextInputEvent},
     theme,
     view::{
-        Divider, HANDLE_WIDTH, INSPECTOR_DEFAULT, SIDEBAR_DEFAULT, ViewMode,
-        inspector_from_pointer, pane_widths, panes_area, ratio_from_pointer, sidebar_from_pointer,
+        Divider, HANDLE_WIDTH, ViewMode, inspector_from_pointer, pane_widths, panes_area,
+        ratio_from_pointer, sidebar_from_pointer,
     },
 };
 
@@ -84,6 +88,9 @@ pub struct Workspace {
     pub tasks_open: bool,
     /// Second pane visible. Off by default, like Finder; ⌘\ turns it on.
     pub split: bool,
+    persist: Persist,
+    /// Recently visited folders, newest first.
+    recents: Vec<PathBuf>,
     /// User-resizable layout: sidebar and inspector widths, and the left pane's
     /// share when split.
     sidebar_width: f32,
@@ -120,26 +127,52 @@ impl Focusable for Workspace {
 }
 
 impl Workspace {
-    pub fn new(cx: &mut Context<Self>) -> Self {
-        let services = Services::new();
+    pub fn new(persist: Persist, startup: Startup, cx: &mut Context<Self>) -> Self {
+        let services = Services::new(persist.clone());
 
         let home_dir = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/"));
         let home = home_dir.clone();
-        let start = std::env::args()
+        // A folder on the command line wins over the saved session for the left
+        // pane; otherwise the last session comes back.
+        let cli_start = std::env::args()
             .nth(1)
             .map(|arg| expand_home(&arg))
-            .filter(|path| path.is_dir())
-            .unwrap_or(home);
+            .filter(|path| path.is_dir());
+        let start = cli_start.clone().unwrap_or_else(|| home.clone());
+        let [(left_saved, left_active), (right_saved, right_active)] = startup.tabs;
+        let restore = |saved: Vec<String>, active: usize| {
+            (saved.iter().map(VfsUri::local).collect::<Vec<_>>(), active)
+        };
+        let (left_tabs, left_active) = if cli_start.is_some() {
+            (Vec::new(), 0)
+        } else {
+            restore(left_saved, left_active)
+        };
+        let (right_tabs, right_active) = restore(right_saved, right_active);
+        let layout = startup.layout;
 
-        let left =
-            cx.new(|cx| Pane::new(PaneSide::Left, VfsUri::local(&start), services.clone(), cx));
-        let right =
-            cx.new(|cx| Pane::new(PaneSide::Right, VfsUri::local(&start), services.clone(), cx));
+        let left = cx.new(|cx| {
+            let mut pane = Pane::new(PaneSide::Left, VfsUri::local(&start), services.clone(), cx);
+            pane.restore_tabs(left_tabs, left_active);
+            pane.preview_open = layout.preview_open;
+            pane.listing.show_hidden = layout.show_hidden;
+            pane
+        });
+        let right = cx.new(|cx| {
+            let mut pane = Pane::new(PaneSide::Right, VfsUri::local(&start), services.clone(), cx);
+            pane.restore_tabs(right_tabs, right_active);
+            pane.preview_open = layout.preview_open;
+            pane.listing.show_hidden = layout.show_hidden;
+            pane
+        });
 
         let preview = cx.new(PreviewView::new);
         let tasks = cx.new(|cx| TaskPanel::new(services.tasks.clone(), cx));
+        if layout.tasks_open {
+            tasks.update(cx, |panel, cx| panel.toggle(cx));
+        }
         let palette = cx.new(Palette::new);
 
         let mut workspace = Self {
@@ -149,11 +182,13 @@ impl Workspace {
             preview,
             tasks,
             palette: palette.clone(),
-            tasks_open: false,
-            split: false,
-            sidebar_width: SIDEBAR_DEFAULT,
-            inspector_width: INSPECTOR_DEFAULT,
-            split_ratio: 0.5,
+            tasks_open: layout.tasks_open,
+            split: layout.split,
+            sidebar_width: layout.sidebar_width,
+            inspector_width: layout.inspector_width,
+            split_ratio: layout.split_ratio,
+            persist,
+            recents: startup.recents.iter().map(PathBuf::from).collect(),
             drag: None,
             clipboard: FileClipboard::default(),
             menu: None,
@@ -216,6 +251,13 @@ impl Workspace {
                         PaneEvent::ContextMenu { position, on_entry } => {
                             workspace.open_context_menu(&pane, *position, *on_entry, cx);
                         }
+                        PaneEvent::Navigated(uri) => {
+                            if let Some(path) = uri.as_local_path() {
+                                workspace.persist.record_visit(cx, &path.to_string_lossy());
+                                workspace.note_recent(path);
+                            }
+                        }
+                        PaneEvent::TabsChanged => workspace.save_tabs(cx),
                         PaneEvent::Notice(message) => {
                             workspace.banner = Some((message.clone(), std::time::Instant::now()));
                         }
@@ -247,6 +289,39 @@ impl Workspace {
         ));
 
         subscriptions
+    }
+
+    // ---- persistence -------------------------------------------------------
+
+    /// Move `path` to the front of the recent list.
+    fn note_recent(&mut self, path: PathBuf) {
+        self.recents.retain(|existing| existing != &path);
+        self.recents.insert(0, path);
+        self.recents.truncate(64);
+    }
+
+    fn layout_prefs(&self, cx: &App) -> LayoutPrefs {
+        let pane = self.left.read(cx);
+        LayoutPrefs {
+            sidebar_width: self.sidebar_width,
+            inspector_width: self.inspector_width,
+            split_ratio: self.split_ratio,
+            split: self.split,
+            preview_open: self.focused_pane().read(cx).preview_open,
+            tasks_open: self.tasks_open,
+            show_hidden: pane.listing.show_hidden,
+        }
+    }
+
+    fn save_layout(&self, cx: &App) {
+        self.persist.save_layout(cx, &self.layout_prefs(cx));
+    }
+
+    fn save_tabs(&self, cx: &App) {
+        for (index, pane) in [&self.left, &self.right].into_iter().enumerate() {
+            let (paths, active) = pane.read(cx).tab_paths();
+            self.persist.save_tabs(cx, index as u8, &paths, active);
+        }
     }
 
     // ---- context menu & file-menu commands ----------------------------------
@@ -621,6 +696,7 @@ impl Workspace {
             MenuAction::ToggleHidden => {
                 let show = !pane.read(cx).listing.show_hidden;
                 pane.update(cx, |pane, cx| pane.set_show_hidden(show, cx));
+                self.save_layout(cx);
             }
             MenuAction::Refresh => pane.update(cx, |pane, cx| pane.refresh(cx)),
         }
@@ -694,6 +770,7 @@ impl Workspace {
             }
         });
         self.sync_preview(cx);
+        self.save_layout(cx);
         cx.notify();
     }
 
@@ -829,6 +906,7 @@ impl Workspace {
             self.right.update(cx, |pane, cx| pane.navigate_to(uri, cx));
         }
         self.focus_pane(PaneSide::Left, window, cx);
+        self.save_layout(cx);
     }
 
     /// Copy/move need a destination pane; say so instead of silently doing nothing.
@@ -1162,6 +1240,7 @@ impl Workspace {
         pane.update(cx, |pane, cx| pane.toggle_preview(cx));
         // Opening it should show the current entry straight away.
         self.sync_preview(cx);
+        self.save_layout(cx);
         cx.notify();
     }
 
@@ -1214,6 +1293,8 @@ impl Workspace {
 
     fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
         if self.drag.take().is_some() {
+            // Save once the drag ends, not on every pointer move.
+            self.save_layout(cx);
             cx.notify();
         }
     }
@@ -1256,6 +1337,7 @@ impl Workspace {
     fn on_toggle_tasks(&mut self, _: &ToggleTasks, _: &mut Window, cx: &mut Context<Self>) {
         self.tasks_open = !self.tasks_open;
         self.tasks.update(cx, |panel, cx| panel.toggle(cx));
+        self.save_layout(cx);
         cx.notify();
     }
 
@@ -1696,6 +1778,7 @@ impl Workspace {
                             workspace.tasks_open = !workspace.tasks_open;
                             let panel = workspace.tasks.clone();
                             panel.update(cx, |panel, cx| panel.toggle(cx));
+                            workspace.save_layout(cx);
                             cx.notify();
                         });
                     }),
@@ -1810,10 +1893,14 @@ impl Workspace {
     /// the dual-pane analogue of Finder's single content area.
     fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let current = self.focused_pane().read(cx).current_uri().path.clone();
-        let sections = [
+        let recent = recent_places(&self.recents, &self.places, RECENT_SHOWN);
+        let mut sections = vec![
             ("Favorites", self.places.clone()),
             ("Locations", location_places()),
         ];
+        if !recent.is_empty() {
+            sections.push(("Recent", recent));
+        }
 
         // Room for the window's traffic lights, which sit in the sidebar.
         let mut column = div().flex().flex_col().gap_0p5().px_2().pt(px(46.));
@@ -2080,8 +2167,8 @@ fn render_banner(message: &str) -> AnyElement {
 }
 
 /// Build the workspace entity.
-pub fn new_workspace(cx: &mut App) -> Entity<Workspace> {
-    cx.new(Workspace::new)
+pub fn new_workspace(persist: Persist, startup: Startup, cx: &mut App) -> Entity<Workspace> {
+    cx.new(|cx| Workspace::new(persist, startup, cx))
 }
 
 /// Kept so the module compiles if mouse handlers are added later.

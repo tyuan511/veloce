@@ -414,6 +414,21 @@ pub fn location_places() -> Vec<Place> {
     vec![place("Macintosh HD", "/", crate::icons::DISK)]
 }
 
+/// Sidebar "Recent" entries: the newest visited folders that are not already a
+/// favorite and are not the disk root.
+pub fn recent_places(recents: &[PathBuf], favorites: &[Place], limit: usize) -> Vec<Place> {
+    recents
+        .iter()
+        .filter(|path| path.parent().is_some())
+        .filter(|path| !favorites.iter().any(|place| &place.path == *path))
+        .filter_map(|path| {
+            let label = path.file_name()?.to_string_lossy().into_owned();
+            Some(place(label, path.clone(), crate::icons::FOLDER))
+        })
+        .take(limit)
+        .collect()
+}
+
 /// Whether `place` is the sidebar entry that matches `current` exactly.
 pub fn place_is_current(place: &Place, current: &str) -> bool {
     let current = current.trim_end_matches('/');
@@ -493,6 +508,25 @@ mod tests {
         let places = location_places();
         assert_eq!(places.len(), 1);
         assert_eq!(places[0].path, PathBuf::from("/"));
+    }
+
+    #[test]
+    fn recent_places_skip_favorites_the_root_and_respect_the_limit() {
+        let favorites = favorite_places(std::path::Path::new("/Users/me"));
+        let recents: Vec<PathBuf> = [
+            "/Users/me/Downloads",
+            "/",
+            "/Users/me/code/veloce",
+            "/Users/me/code",
+            "/tmp/a",
+        ]
+        .iter()
+        .map(PathBuf::from)
+        .collect();
+        let places = recent_places(&recents, &favorites, 2);
+        let labels: Vec<&str> = places.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(labels, ["veloce", "code"]);
+        assert!(recent_places(&[], &favorites, 5).is_empty());
     }
 
     #[test]

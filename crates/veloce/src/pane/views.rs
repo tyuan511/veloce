@@ -8,6 +8,8 @@ use gpui::{ClickEvent, Stateful};
 use super::*;
 use crate::{
     info::kind_label,
+    pane::{ThumbEntry, ThumbState},
+    thumbs,
     view::{
         COLUMN_WIDTH, GRID_PADDING, ICON_CELL_H, ICON_CELL_W, MAX_COLUMN_DIRS, column_dirs,
         grid_columns, grid_rows,
@@ -38,7 +40,7 @@ impl Pane {
                 uniform_list(
                     gpui::ElementId::Name(format!("pane{}-grid", self.side.index()).into()),
                     rows,
-                    cx.processor(move |pane, range: std::ops::Range<usize>, _window, _cx| {
+                    cx.processor(move |pane, range: std::ops::Range<usize>, _window, cx| {
                         range
                             .map(|row| {
                                 let mut line = div()
@@ -47,21 +49,27 @@ impl Pane {
                                     .h(px(ICON_CELL_H))
                                     .px(px(GRID_PADDING));
                                 for position in row * cols..((row + 1) * cols).min(count) {
-                                    let Some(index) = pane.listing.visible.get(position) else {
+                                    let Some(index) = pane.listing.visible.get(position).copied()
+                                    else {
                                         continue;
                                     };
-                                    let Some(entry) = pane.listing.entries.get(*index) else {
+                                    let Some(entry) = pane.listing.entries.get(index).cloned()
+                                    else {
                                         continue;
                                     };
                                     let highlighted =
-                                        selected.contains(index) || position == cursor;
+                                        selected.contains(&index) || position == cursor;
+                                    let look = CellLook {
+                                        highlighted,
+                                        pane_focused: focused,
+                                        dimmed: pane.is_cut(&entry),
+                                        thumb: pane.thumbnail_for(&entry, cx),
+                                    };
                                     line = line.child(render_cell(
                                         pane.side.index(),
                                         position,
-                                        entry,
-                                        highlighted,
-                                        focused,
-                                        pane.is_cut(entry),
+                                        &entry,
+                                        look,
                                         entity.clone(),
                                     ));
                                 }
@@ -74,6 +82,74 @@ impl Pane {
                 .h_full(),
             )
             .into_any_element()
+    }
+
+    /// A ready thumbnail for `entry`, starting its generation if nobody has yet.
+    /// Called while drawing, so it never blocks: generation runs in the background
+    /// and the pane repaints when it lands.
+    pub(super) fn thumbnail_for(
+        &mut self,
+        entry: &FileEntry,
+        cx: &mut Context<Self>,
+    ) -> Option<Arc<gpui::Image>> {
+        const MAX_IN_FLIGHT: usize = 4;
+        const MAX_KEPT: usize = 4000;
+        if entry.is_dir() {
+            return None;
+        }
+        let ext = entry.extension()?;
+        if !thumbs::is_thumbnailable(&ext) {
+            return None;
+        }
+        let path = entry.uri.as_local_path()?;
+        let stamp = thumbs::Stamp::new(entry.size, entry.modified);
+        if let Some(known) = self.thumbs.get(&path).filter(|known| known.stamp == stamp) {
+            return match &known.state {
+                ThumbState::Ready(image) => Some(image.clone()),
+                ThumbState::Pending | ThumbState::Unavailable => None,
+            };
+        }
+        // A burst of cells must not fork a burst of image tools; the rest ask
+        // again on the repaint that every finished thumbnail triggers.
+        if self.thumbs_in_flight >= MAX_IN_FLIGHT {
+            return None;
+        }
+        if self.thumbs.len() >= MAX_KEPT {
+            self.thumbs.clear();
+        }
+        self.thumbs.insert(
+            path.clone(),
+            ThumbEntry {
+                stamp,
+                state: ThumbState::Pending,
+            },
+        );
+        self.thumbs_in_flight += 1;
+        let store = self.services.persist.store();
+        cx.spawn(async move |this, cx| {
+            let job_path = path.clone();
+            let bytes =
+                cx.background_executor()
+                    .spawn(async move {
+                        thumbs::thumbnail_bytes(store.as_deref(), &job_path, &ext, stamp)
+                    })
+                    .await;
+            this.update(cx, |pane, cx| {
+                pane.thumbs_in_flight = pane.thumbs_in_flight.saturating_sub(1);
+                let state = match bytes {
+                    Some(png) => ThumbState::Ready(Arc::new(gpui::Image::from_bytes(
+                        gpui::ImageFormat::Png,
+                        png,
+                    ))),
+                    None => ThumbState::Unavailable,
+                };
+                pane.thumbs.insert(path, ThumbEntry { stamp, state });
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        None
     }
 
     /// Whether `entry` is waiting to be moved by a Paste.
@@ -395,17 +471,60 @@ fn highlight_colors(highlighted: bool, pane_focused: bool) -> (Option<Hsla>, boo
     (background, on_accent)
 }
 
+/// How one icon-view cell is drawn.
+struct CellLook {
+    highlighted: bool,
+    pane_focused: bool,
+    dimmed: bool,
+    /// The file's picture, when one has been generated.
+    thumb: Option<Arc<gpui::Image>>,
+}
+
+/// Square the icon or thumbnail is fitted into.
+const THUMB_BOX: f32 = 64.0;
+
 /// One icon-view cell: large icon over a two-line name.
 fn render_cell(
     side: u8,
     position: usize,
     entry: &FileEntry,
-    highlighted: bool,
-    pane_focused: bool,
-    dimmed: bool,
+    look: CellLook,
     entity: Entity<Pane>,
 ) -> AnyElement {
+    let CellLook {
+        highlighted,
+        pane_focused,
+        dimmed,
+        thumb,
+    } = look;
     let (background, on_accent) = highlight_colors(highlighted, pane_focused);
+    // A picture of the file where there is one, the file-type icon otherwise.
+    let picture: AnyElement = match thumb {
+        Some(image) => div()
+            .w(px(THUMB_BOX))
+            .h(px(THUMB_BOX))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(
+                gpui::img(image)
+                    .max_w(px(THUMB_BOX))
+                    .max_h(px(THUMB_BOX))
+                    .object_fit(gpui::ObjectFit::Contain)
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(theme::border_soft()),
+            )
+            .into_any_element(),
+        None => div()
+            .w(px(THUMB_BOX))
+            .h(px(THUMB_BOX))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(entry_icon(entry, 48.0))
+            .into_any_element(),
+    };
     let cell = div()
         .id(gpui::ElementId::Name(
             format!("{side}-cell-{position}").into(),
@@ -431,7 +550,7 @@ fn render_cell(
         } else {
             theme::text()
         })
-        .child(entry_icon(entry, 48.0))
+        .child(picture)
         .child(
             div()
                 .w_full()
