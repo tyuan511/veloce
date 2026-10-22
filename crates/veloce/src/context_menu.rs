@@ -218,7 +218,7 @@ fn compress_menu() -> Vec<MenuItem> {
 }
 
 /// Open With submenu: the default app first, the rest alphabetical, then "Other…".
-fn open_with_menu(open_with: &OpenWith) -> Vec<MenuItem> {
+pub fn open_with_menu(open_with: &OpenWith) -> Vec<MenuItem> {
     let mut items = match open_with {
         OpenWith::Loading => vec![action(MenuAction::Nothing, "Loading…", None, false)],
         OpenWith::Apps(names) if names.is_empty() => {

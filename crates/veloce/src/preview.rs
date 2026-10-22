@@ -726,7 +726,7 @@ pub fn render_preview(
     embedded: bool,
     _cx: &mut Context<PreviewView>,
 ) -> AnyElement {
-    let header = (!embedded).then(|| render_header(entry, &preview.content));
+    let header = (!embedded).then(|| render_header(entry));
     let body = match &preview.content {
         PreviewContent::Empty => empty_state(),
         PreviewContent::Loading { name } => loading_state(name),
@@ -770,38 +770,29 @@ pub fn render_preview(
         .into_any_element()
 }
 
-fn render_header(entry: Option<&FileEntry>, content: &PreviewContent) -> AnyElement {
-    let name = entry.map(|entry| entry.name.clone()).unwrap_or_default();
-    let (icon, tint) = match content {
-        PreviewContent::Directory { .. } => (icons::FOLDER, theme::blue()),
-        PreviewContent::Archive { .. } => (icons::FILE, theme::yellow()),
-        PreviewContent::Image { .. } => (icons::FILE, theme::green()),
-        _ => (
-            icons::FILE,
-            entry.map(theme::kind_color).unwrap_or(theme::text_faint()),
-        ),
+/// The inspector's header: a large icon with the name and "kind · size", then a
+/// quiet grid of dates and permissions, like Finder's preview pane.
+fn render_header(entry: Option<&FileEntry>) -> AnyElement {
+    let Some(entry) = entry else {
+        return div().into_any_element();
     };
-
-    let mut details: Vec<String> = Vec::new();
-    if let Some(entry) = entry {
-        if !entry.is_dir() {
-            details.push(format_size(entry.size));
-        }
-        if entry.modified.is_some() {
-            details.push(format_time(entry.modified));
-        }
-        if let Some(mode) = entry.permissions {
-            details.push(format!("{:o}", mode & 0o777));
-        }
-    }
+    let subtitle = if entry.is_dir() {
+        crate::info::kind_label(entry)
+    } else {
+        format!(
+            "{} · {}",
+            crate::info::kind_label(entry),
+            format_size(entry.size)
+        )
+    };
+    let facts = header_facts(entry);
 
     div()
         .flex()
         .flex_col()
-        .gap_1()
+        .gap_3()
         .flex_shrink_0()
-        .px_3()
-        .py_2()
+        .p_4()
         .border_b_1()
         .border_color(theme::border_soft())
         .child(
@@ -809,31 +800,78 @@ fn render_header(entry: Option<&FileEntry>, content: &PreviewContent) -> AnyElem
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap_2()
-                .child(
-                    svg()
-                        .path(icon)
-                        .w(px(13.))
-                        .h(px(13.))
-                        .flex_shrink_0()
-                        .text_color(tint),
-                )
+                .gap_3()
+                .child(crate::pane::entry_icon(entry, 44.0))
                 .child(
                     div()
-                        .text_sm()
-                        .text_color(theme::text())
-                        .truncate()
+                        .flex_1()
                         .min_w_0()
-                        .child(name),
+                        .flex()
+                        .flex_col()
+                        .gap_0p5()
+                        .child(
+                            div()
+                                .text_sm()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(theme::text())
+                                .line_clamp(2)
+                                .child(entry.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(theme::text_faint())
+                                .truncate()
+                                .child(subtitle),
+                        ),
                 ),
         )
-        .child(
-            div()
-                .text_xs()
-                .text_color(theme::text_faint())
-                .child(details.join(" · ")),
-        )
+        .when(!facts.is_empty(), |this| {
+            this.child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .children(facts.into_iter().map(|(label, value)| {
+                        div()
+                            .flex()
+                            .flex_row()
+                            .justify_between()
+                            .gap_3()
+                            .text_xs()
+                            .child(
+                                div()
+                                    .flex_shrink_0()
+                                    .text_color(theme::text_faint())
+                                    .child(label),
+                            )
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme::text_muted())
+                                    .child(value),
+                            )
+                    })),
+            )
+        })
         .into_any_element()
+}
+
+/// Rows under the header: only what is known, so an entry without a creation
+/// time does not show an empty line.
+pub(crate) fn header_facts(entry: &FileEntry) -> Vec<(&'static str, String)> {
+    let mut facts = Vec::new();
+    if entry.modified.is_some() {
+        facts.push(("Modified", format_time(entry.modified)));
+    }
+    if entry.created.is_some() {
+        facts.push(("Created", format_time(entry.created)));
+    }
+    if let Some(mode) = crate::info::permissions_label(entry.permissions) {
+        facts.push(("Permissions", mode));
+    }
+    facts
 }
 
 fn empty_state() -> AnyElement {
@@ -1385,6 +1423,24 @@ mod tests {
             matches!(content, PreviewContent::Binary { .. }),
             "{content:?}"
         );
+    }
+
+    #[test]
+    fn header_facts_list_only_what_is_known() {
+        let mut entry = FileEntry::new(
+            vfs_core::VfsUri::local("/tmp/a.txt"),
+            "a.txt",
+            vfs_core::FileKind::File,
+        );
+        assert!(header_facts(&entry).is_empty());
+        entry.modified = Some(std::time::SystemTime::now());
+        entry.permissions = Some(0o100644);
+        let facts = header_facts(&entry);
+        assert_eq!(facts.len(), 2);
+        assert_eq!(facts[0].0, "Modified");
+        assert_eq!(facts[1], ("Permissions", "644".to_string()));
+        entry.created = Some(std::time::SystemTime::now());
+        assert_eq!(header_facts(&entry)[1].0, "Created");
     }
 
     #[test]

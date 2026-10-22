@@ -24,7 +24,7 @@ use crate::{
     clipboard::FileClipboard,
     context_menu::{
         ActionItem, MENU_PADDING, MENU_WIDTH, MenuAction, MenuContext, MenuItem, MenuTarget,
-        OpenWith, build_menu, clamp_origin, menu_height, sort_menu,
+        OpenWith, build_menu, clamp_origin, menu_height, open_with_menu, sort_menu,
     },
     icons,
     info::info_rows,
@@ -58,6 +58,8 @@ pub(crate) struct OpenMenu {
     ctx: MenuContext,
     /// Applications behind the Open With rows, in menu order.
     apps: Vec<AppInfo>,
+    /// The menu is just the Open With list (Quick Look's Open button).
+    open_with_only: bool,
 }
 
 /// The Get Info window's subject plus its slowly computed folder size.
@@ -280,6 +282,7 @@ impl Workspace {
             target,
             ctx,
             apps: Vec::new(),
+            open_with_only: false,
         });
         cx.notify();
         if wants_apps {
@@ -307,7 +310,11 @@ impl Workspace {
                 menu.ctx.open_with =
                     OpenWith::Apps(apps.iter().map(|app| app.name.clone()).collect());
                 menu.apps = apps;
-                menu.items = build_menu(&menu.target, &menu.ctx);
+                menu.items = if menu.open_with_only {
+                    open_with_menu(&menu.ctx.open_with)
+                } else {
+                    build_menu(&menu.target, &menu.ctx)
+                };
                 cx.notify();
             })
             .ok();
@@ -327,8 +334,38 @@ impl Workspace {
             target: MenuTarget::Background,
             ctx: MenuContext::default(),
             apps: Vec::new(),
+            open_with_only: false,
         });
         cx.notify();
+    }
+
+    /// Quick Look's Open button: the same application list as the context menu's
+    /// "Open With", dropped under the button.
+    fn open_quick_look_apps(&mut self, at: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+        let Some(entry) = self.focused_pane().read(cx).cursor_entry().cloned() else {
+            return;
+        };
+        let Some(path) = entry.uri.as_local_path() else {
+            return;
+        };
+        let ctx = MenuContext::default();
+        self.menu_counter += 1;
+        let id = self.menu_counter;
+        self.menu = Some(OpenMenu {
+            id,
+            origin: (f32::from(at.x) - MENU_WIDTH + 24.0, f32::from(at.y) + 14.0),
+            items: open_with_menu(&ctx.open_with),
+            open_sub: None,
+            target: MenuTarget::Background,
+            ctx,
+            apps: Vec::new(),
+            open_with_only: true,
+        });
+        cx.notify();
+        // Folders have no "open with": the list simply stays at its placeholder.
+        if !entry.is_dir() {
+            self.load_open_with(id, path, cx);
+        }
     }
 
     fn set_open_sub(&mut self, index: Option<usize>, cx: &mut Context<Self>) {
@@ -1369,9 +1406,10 @@ impl Render for Workspace {
                 this.child(render_prompt(title, input, cx))
             })
             .when(palette_open, |this| this.child(palette))
-            .when_some(menu, |this, menu| this.child(menu))
             .when_some(info, |this, info| this.child(info))
             .when_some(quick_look, |this, ql| this.child(ql))
+            // Last, so a menu opened from Quick Look is drawn above it.
+            .when_some(menu, |this, menu| this.child(menu))
             .when_some(banner, |this, message| this.child(render_banner(&message)))
     }
 }
@@ -1394,6 +1432,7 @@ impl Workspace {
         let close = cx.entity();
         let backdrop = cx.entity();
         let open = cx.entity();
+        let apps = cx.entity();
         let subtitle = {
             let kind = crate::info::kind_label(&entry);
             if entry.is_dir() {
@@ -1436,7 +1475,8 @@ impl Workspace {
                         .bg(theme::bg())
                         .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
                         .child(
-                            // Title bar: transparent, separated by a hairline.
+                            // Title bar: transparent, separated by a hairline. The
+                            // name sits in the middle; Open and close are on the right.
                             div()
                                 .flex()
                                 .flex_row()
@@ -1447,36 +1487,9 @@ impl Workspace {
                                 .gap_3()
                                 .border_b_1()
                                 .border_color(theme::border_soft())
+                                .child(div().flex_1())
                                 .child(
                                     div()
-                                        .id("quick-look-close")
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .w(px(22.))
-                                        .h(px(22.))
-                                        .flex_shrink_0()
-                                        .rounded_full()
-                                        .bg(theme::bg_hover())
-                                        .cursor_pointer()
-                                        .hover(|this| this.bg(theme::border()))
-                                        .on_click(move |_, _, cx| {
-                                            close.update(cx, |workspace, cx| {
-                                                workspace.quick_look_open = false;
-                                                cx.notify();
-                                            });
-                                        })
-                                        .child(
-                                            svg()
-                                                .path(icons::CLOSE)
-                                                .w(px(10.))
-                                                .h(px(10.))
-                                                .text_color(theme::text_muted()),
-                                        ),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
                                         .min_w_0()
                                         .flex()
                                         .flex_row()
@@ -1508,29 +1521,102 @@ impl Workspace {
                                 )
                                 .child(
                                     div()
-                                        .id("quick-look-open")
-                                        .flex_shrink_0()
-                                        .px_3()
-                                        .h(px(24.))
+                                        .flex_1()
                                         .flex()
+                                        .flex_row()
                                         .items_center()
-                                        .rounded_md()
-                                        .bg(theme::bg_hover())
-                                        .text_sm()
-                                        .text_color(theme::text())
-                                        .cursor_pointer()
-                                        .hover(|this| this.bg(theme::border()))
-                                        .on_click(move |_, window, cx| {
-                                            open.update(cx, |workspace, cx| {
-                                                workspace.quick_look_open = false;
-                                                workspace.run_menu_action(
-                                                    MenuAction::Open,
-                                                    window,
-                                                    cx,
-                                                );
-                                            });
-                                        })
-                                        .child("Open"),
+                                        .justify_end()
+                                        .gap_2()
+                                        // Split button: the label opens with the default
+                                        // app, the arrow lists every application.
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_row()
+                                                .items_center()
+                                                .h(px(24.))
+                                                .rounded_md()
+                                                .bg(theme::bg_hover())
+                                                .text_sm()
+                                                .text_color(theme::text())
+                                                .child(
+                                                    div()
+                                                        .id("quick-look-open")
+                                                        .h_full()
+                                                        .px_3()
+                                                        .flex()
+                                                        .items_center()
+                                                        .rounded_l_md()
+                                                        .cursor_pointer()
+                                                        .hover(|this| this.bg(theme::border()))
+                                                        .on_click(move |_, window, cx| {
+                                                            open.update(cx, |workspace, cx| {
+                                                                workspace.quick_look_open = false;
+                                                                workspace.run_menu_action(
+                                                                    MenuAction::Open,
+                                                                    window,
+                                                                    cx,
+                                                                );
+                                                            });
+                                                        })
+                                                        .child("Open"),
+                                                )
+                                                .child(
+                                                    div().w(px(1.)).h(px(14.)).bg(theme::border()),
+                                                )
+                                                .child(
+                                                    div()
+                                                        .id("quick-look-open-with")
+                                                        .h_full()
+                                                        .w(px(24.))
+                                                        .flex()
+                                                        .items_center()
+                                                        .justify_center()
+                                                        .rounded_r_md()
+                                                        .cursor_pointer()
+                                                        .hover(|this| this.bg(theme::border()))
+                                                        .on_click(move |event, _, cx| {
+                                                            let at = event.position();
+                                                            apps.update(cx, |workspace, cx| {
+                                                                workspace
+                                                                    .open_quick_look_apps(at, cx)
+                                                            });
+                                                        })
+                                                        .child(
+                                                            svg()
+                                                                .path(icons::CHEVRON_DOWN)
+                                                                .w(px(10.))
+                                                                .h(px(10.))
+                                                                .text_color(theme::text_muted()),
+                                                        ),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("quick-look-close")
+                                                .flex()
+                                                .items_center()
+                                                .justify_center()
+                                                .w(px(24.))
+                                                .h(px(24.))
+                                                .flex_shrink_0()
+                                                .rounded_md()
+                                                .cursor_pointer()
+                                                .hover(|this| this.bg(theme::bg_hover()))
+                                                .on_click(move |_, _, cx| {
+                                                    close.update(cx, |workspace, cx| {
+                                                        workspace.quick_look_open = false;
+                                                        cx.notify();
+                                                    });
+                                                })
+                                                .child(
+                                                    svg()
+                                                        .path(icons::CLOSE)
+                                                        .w(px(12.))
+                                                        .h(px(12.))
+                                                        .text_color(theme::text_muted()),
+                                                ),
+                                        ),
                                 ),
                         )
                         .child(div().flex_1().min_h_0().child(preview)),
