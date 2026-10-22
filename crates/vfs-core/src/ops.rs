@@ -1073,53 +1073,71 @@ mod edge_tests {
     }
 }
 
-/// Finder-style duplicate name: `report.txt` -> `report copy.txt`, then
-/// `report copy 2.txt`, ... The first candidate that does not exist wins.
-pub fn duplicate_path(path: &Path) -> PathBuf {
-    suffixed_path(path, "copy")
+/// Explorer-style name for pasting into the folder the source already lives in:
+/// `report.txt` -> `report - Copy.txt`, then `report - Copy (2).txt`, ...
+pub fn copy_path(path: &Path) -> PathBuf {
+    suffixed_path(path, "Copy")
 }
 
-/// Finder-style alias name: `report.txt` -> `report alias.txt`.
-pub fn alias_path(path: &Path) -> PathBuf {
-    suffixed_path(path, "alias")
+/// Explorer-style shortcut name: `report.txt` -> `report - Shortcut.txt`.
+pub fn shortcut_path(path: &Path) -> PathBuf {
+    suffixed_path(path, "Shortcut")
 }
 
-/// Where "Compress" writes: `<name>.zip` for one item, `Archive.zip` for several,
-/// placed next to the first source and numbered (`Archive 2.zip`) if taken.
+/// Where "Compress to ZIP file" writes: `<first item's stem>.zip` next to the
+/// first source, numbered (`notes (2).zip`) if that name is taken.
 pub fn archive_path(sources: &[PathBuf]) -> Option<PathBuf> {
     let first = sources.first()?;
     let parent = first.parent()?;
-    let name = if sources.len() == 1 {
-        format!("{}.zip", first.file_name()?.to_string_lossy())
+    let stem = if first.is_dir() {
+        first.file_name()?.to_string_lossy().into_owned()
     } else {
-        "Archive.zip".to_string()
+        first
+            .file_stem()
+            .or_else(|| first.file_name())?
+            .to_string_lossy()
+            .into_owned()
     };
-    Some(unique_path(&parent.join(name)))
+    Some(first_free(parent, |label| match label {
+        None => format!("{stem}.zip"),
+        Some(index) => format!("{stem} ({index}).zip"),
+    }))
+}
+
+/// First candidate name (`None` = the plain name, then `Some(2)`, `Some(3)` ...)
+/// that does not exist in `parent`.
+fn first_free(parent: &Path, name: impl Fn(Option<u32>) -> String) -> PathBuf {
+    let plain = parent.join(name(None));
+    if !plain.exists() {
+        return plain;
+    }
+    for index in 2..10_000 {
+        let candidate = parent.join(name(Some(index)));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    plain
 }
 
 fn suffixed_path(path: &Path, word: &str) -> PathBuf {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    // `.bashrc` has no extension, `a.tar.gz` keeps only `.gz`, matching Finder.
+    // `.bashrc` has no extension and `a.tar.gz` keeps only `.gz`, as in Explorer.
     let stem = path
         .file_stem()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "untitled".to_string());
     let extension = path.extension().map(|e| e.to_string_lossy().to_string());
-    let name_with = |label: String| match &extension {
-        Some(extension) => format!("{stem} {label}.{extension}"),
-        None => format!("{stem} {label}"),
-    };
-    let first = parent.join(name_with(word.to_string()));
-    if !first.exists() {
-        return first;
-    }
-    for index in 2..10_000 {
-        let candidate = parent.join(name_with(format!("{word} {index}")));
-        if !candidate.exists() {
-            return candidate;
+    first_free(parent, |index| {
+        let label = match index {
+            None => word.to_string(),
+            Some(index) => format!("{word} ({index})"),
+        };
+        match &extension {
+            Some(extension) => format!("{stem} - {label}.{extension}"),
+            None => format!("{stem} - {label}"),
         }
-    }
-    first
+    })
 }
 
 #[cfg(test)]
@@ -1128,64 +1146,71 @@ mod naming_tests {
     use std::fs;
 
     #[test]
-    fn duplicate_appends_copy_before_the_extension() {
+    fn copy_appends_dash_copy_before_the_extension() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("report.txt");
         fs::write(&file, b"x").unwrap();
-        assert_eq!(duplicate_path(&file), dir.path().join("report copy.txt"));
+        assert_eq!(copy_path(&file), dir.path().join("report - Copy.txt"));
     }
 
     #[test]
-    fn duplicate_numbers_when_the_copy_exists() {
+    fn copy_numbers_in_parentheses_when_the_copy_exists() {
         let dir = tempfile::tempdir().unwrap();
         let file = dir.path().join("a.txt");
         fs::write(&file, b"x").unwrap();
-        fs::write(dir.path().join("a copy.txt"), b"x").unwrap();
-        assert_eq!(duplicate_path(&file), dir.path().join("a copy 2.txt"));
+        fs::write(dir.path().join("a - Copy.txt"), b"x").unwrap();
+        assert_eq!(copy_path(&file), dir.path().join("a - Copy (2).txt"));
+        fs::write(dir.path().join("a - Copy (2).txt"), b"x").unwrap();
+        assert_eq!(copy_path(&file), dir.path().join("a - Copy (3).txt"));
     }
 
     #[test]
-    fn duplicate_handles_folders_and_extensionless_names() {
+    fn copy_handles_folders_and_extensionless_names() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(
-            duplicate_path(&dir.path().join("Makefile")),
-            dir.path().join("Makefile copy")
+            copy_path(&dir.path().join("Makefile")),
+            dir.path().join("Makefile - Copy")
         );
         assert_eq!(
-            duplicate_path(&dir.path().join("src")),
-            dir.path().join("src copy")
-        );
-    }
-
-    #[test]
-    fn alias_uses_its_own_suffix() {
-        let dir = tempfile::tempdir().unwrap();
-        assert_eq!(
-            alias_path(&dir.path().join("photo.png")),
-            dir.path().join("photo alias.png")
+            copy_path(&dir.path().join("src")),
+            dir.path().join("src - Copy")
         );
     }
 
     #[test]
-    fn archive_is_named_after_a_single_source() {
+    fn shortcut_uses_its_own_suffix() {
         let dir = tempfile::tempdir().unwrap();
-        let sources = vec![dir.path().join("notes.md")];
         assert_eq!(
-            archive_path(&sources),
-            Some(dir.path().join("notes.md.zip"))
+            shortcut_path(&dir.path().join("photo.png")),
+            dir.path().join("photo - Shortcut.png")
         );
     }
 
     #[test]
-    fn archive_of_many_is_called_archive_and_never_overwrites() {
+    fn archive_is_named_after_the_first_item_without_its_extension() {
         let dir = tempfile::tempdir().unwrap();
-        let sources = vec![dir.path().join("a"), dir.path().join("b")];
-        assert_eq!(archive_path(&sources), Some(dir.path().join("Archive.zip")));
-        fs::write(dir.path().join("Archive.zip"), b"x").unwrap();
+        let file = dir.path().join("notes.md");
+        fs::write(&file, b"x").unwrap();
+        assert_eq!(archive_path(&[file]), Some(dir.path().join("notes.zip")));
+    }
+
+    #[test]
+    fn archive_of_a_folder_keeps_the_whole_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("my.project");
+        fs::create_dir(&folder).unwrap();
         assert_eq!(
-            archive_path(&sources),
-            Some(dir.path().join("Archive 2.zip"))
+            archive_path(&[folder]),
+            Some(dir.path().join("my.project.zip"))
         );
+    }
+
+    #[test]
+    fn archive_never_overwrites_an_existing_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let sources = vec![dir.path().join("a.txt"), dir.path().join("b.txt")];
+        fs::write(dir.path().join("a.zip"), b"x").unwrap();
+        assert_eq!(archive_path(&sources), Some(dir.path().join("a (2).zip")));
     }
 
     #[test]
