@@ -16,7 +16,6 @@ const KEY_RATIO: &str = "layout.split_ratio";
 const KEY_SPLIT: &str = "layout.split";
 const KEY_PREVIEW: &str = "layout.preview_open";
 const KEY_TASKS: &str = "layout.tasks_open";
-const KEY_HIDDEN: &str = "files.show_hidden";
 
 /// Window layout and the toggles that should come back after a restart.
 #[derive(Debug, Clone, PartialEq)]
@@ -27,7 +26,6 @@ pub struct LayoutPrefs {
     pub split: bool,
     pub preview_open: bool,
     pub tasks_open: bool,
-    pub show_hidden: bool,
 }
 
 impl Default for LayoutPrefs {
@@ -39,7 +37,6 @@ impl Default for LayoutPrefs {
             split: false,
             preview_open: false,
             tasks_open: false,
-            show_hidden: false,
         }
     }
 }
@@ -86,7 +83,6 @@ impl LayoutPrefs {
             split: flag(KEY_SPLIT, defaults.split),
             preview_open: flag(KEY_PREVIEW, defaults.preview_open),
             tasks_open: flag(KEY_TASKS, defaults.tasks_open),
-            show_hidden: flag(KEY_HIDDEN, defaults.show_hidden),
         }
     }
 
@@ -100,7 +96,6 @@ impl LayoutPrefs {
             (KEY_SPLIT, flag(self.split)),
             (KEY_PREVIEW, flag(self.preview_open)),
             (KEY_TASKS, flag(self.tasks_open)),
-            (KEY_HIDDEN, flag(self.show_hidden)),
         ]
     }
 }
@@ -235,7 +230,6 @@ mod tests {
             split: true,
             preview_open: true,
             tasks_open: true,
-            show_hidden: true,
         };
         let entries = prefs.entries();
         let restored = LayoutPrefs::from_lookup(|key| {

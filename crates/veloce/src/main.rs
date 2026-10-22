@@ -10,6 +10,7 @@
 
 mod actions;
 mod clipboard;
+mod connections;
 mod context_menu;
 mod file_icons;
 #[rustfmt::skip]
@@ -25,6 +26,9 @@ mod path_query;
 mod persist;
 mod prefs;
 mod preview;
+mod settings;
+mod settings_apply;
+mod settings_window;
 mod tasks_panel;
 mod text_input;
 mod theme;
@@ -46,6 +50,8 @@ fn main() {
         // Load everything saved before the window exists, so the first frame is
         // already the restored layout.
         let (persist, startup) = persist::Persist::open();
+        settings_apply::init(cx, startup.settings.clone());
+        cx.set_global(persist.clone());
         let bounds = Bounds::centered(None, size(px(1280.0), px(800.0)), cx);
         let window = cx
             .open_window(
@@ -68,6 +74,26 @@ fn main() {
                 workspace.start(window, cx);
             })
             .ok();
+
+        // The Settings window is its own window, so ⌘, and the menu bar are app-level
+        // rather than handled by a workspace.
+        cx.on_action(|_: &actions::OpenSettings, cx| settings_window::open(cx));
+        cx.on_action(|_: &actions::Quit, cx| cx.quit());
+        cx.set_menus(vec![gpui::Menu {
+            name: "Veloce".into(),
+            items: vec![
+                gpui::MenuItem::action("Settings…", actions::OpenSettings),
+                gpui::MenuItem::separator(),
+                gpui::MenuItem::action("Quit Veloce", actions::Quit),
+            ],
+        }]);
+        // Closing the main window ends the app even if Settings is still open.
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
 
         cx.activate(true);
     });

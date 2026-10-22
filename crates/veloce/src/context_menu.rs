@@ -47,6 +47,7 @@ pub enum MenuAction {
     TogglePreviewPanel,
     ToggleTasks,
     CommandPalette,
+    OpenSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,6 +290,8 @@ pub fn more_menu(state: MoreState) -> Vec<MenuItem> {
         action(Refresh, "Refresh", Some("⌘R"), true),
         action(OpenInTerminal, "Open in Terminal", None, true),
         action(CommandPalette, "Command palette…", Some("⇧⌘P"), true),
+        MenuItem::Separator,
+        action(OpenSettings, "Settings…", Some("⌘,"), true),
     ]
 }
 

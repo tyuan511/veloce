@@ -25,9 +25,6 @@ const RASTER: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "heic", "heif", "webp", "ico",
 ];
 
-/// Cached thumbnails above this size are pruned, least recently used first.
-pub const CACHE_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Generator {
     Sips,

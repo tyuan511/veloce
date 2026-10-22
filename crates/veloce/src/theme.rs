@@ -5,9 +5,11 @@
 //! reads the active palette at render time. The UI stays mostly neutral greys and
 //! only the focus ring, selection and active tab are tinted.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, Ordering};
 
 use gpui::{Hsla, WindowAppearance};
+
+use crate::settings::ThemePref;
 
 struct Palette {
     bg: Hsla,
@@ -239,17 +241,58 @@ const LIGHT: Palette = Palette {
     },
 };
 
-static IS_DARK: AtomicBool = AtomicBool::new(true);
+/// What the operating system currently asks for.
+static OS_DARK: AtomicBool = AtomicBool::new(true);
+/// The user's choice in Settings: 0 follow the system, 1 light, 2 dark.
+static THEME_PREF: AtomicU8 = AtomicU8::new(0);
+/// List row height in whole pixels (Settings → density).
+static ROW_HEIGHT_PX: AtomicU32 = AtomicU32::new(28);
 
-/// Adopt the OS appearance. Returns `true` if the active palette changed.
+/// Adopt the OS appearance. Returns `true` if the palette in use changed.
 pub fn set_appearance(appearance: WindowAppearance) -> bool {
-    let dark = is_dark_appearance(appearance);
-    IS_DARK.swap(dark, Ordering::Relaxed) != dark
+    let before = is_dark();
+    OS_DARK.store(is_dark_appearance(appearance), Ordering::Relaxed);
+    is_dark() != before
+}
+
+/// Adopt the user's theme choice. Returns `true` if the palette in use changed.
+pub fn set_preference(pref: ThemePref) -> bool {
+    let before = is_dark();
+    let code = match pref {
+        ThemePref::System => 0,
+        ThemePref::Light => 1,
+        ThemePref::Dark => 2,
+    };
+    THEME_PREF.store(code, Ordering::Relaxed);
+    is_dark() != before
+}
+
+/// The preference and the OS setting decide which palette is active.
+pub fn effective_dark(pref: ThemePref, os_dark: bool) -> bool {
+    match pref {
+        ThemePref::System => os_dark,
+        ThemePref::Light => false,
+        ThemePref::Dark => true,
+    }
 }
 
 /// Whether the dark palette is active.
 pub fn is_dark() -> bool {
-    IS_DARK.load(Ordering::Relaxed)
+    let pref = match THEME_PREF.load(Ordering::Relaxed) {
+        1 => ThemePref::Light,
+        2 => ThemePref::Dark,
+        _ => ThemePref::System,
+    };
+    effective_dark(pref, OS_DARK.load(Ordering::Relaxed))
+}
+
+pub fn set_row_height(pixels: f32) {
+    ROW_HEIGHT_PX.store(pixels.max(1.0) as u32, Ordering::Relaxed);
+}
+
+/// Height of one list row. Fixed per density because the list is virtualized.
+pub fn row_height() -> f32 {
+    ROW_HEIGHT_PX.load(Ordering::Relaxed) as f32
 }
 
 /// Pure mapping from the OS appearance to "use the dark palette".
@@ -261,11 +304,7 @@ pub fn is_dark_appearance(appearance: WindowAppearance) -> bool {
 }
 
 fn palette() -> &'static Palette {
-    if IS_DARK.load(Ordering::Relaxed) {
-        &DARK
-    } else {
-        &LIGHT
-    }
+    if is_dark() { &DARK } else { &LIGHT }
 }
 
 pub fn bg() -> Hsla {
@@ -336,8 +375,6 @@ pub fn purple() -> Hsla {
     palette().purple
 }
 
-/// Row height for the file list. Fixed so `uniform_list` can virtualize on it.
-pub const ROW_HEIGHT: f32 = 28.0;
 pub const STATUS_HEIGHT: f32 = 24.0;
 
 pub const MONO_FAMILY: &str = "Menlo";
@@ -361,12 +398,28 @@ const fn contrast_ok(p: &Palette, dark: bool) -> bool {
 const _: () = {
     assert!(contrast_ok(&DARK, true));
     assert!(contrast_ok(&LIGHT, false));
-    assert!(ROW_HEIGHT.fract() == 0.0, "uniform_list needs whole rows");
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_theme_preference_overrides_or_follows_the_system() {
+        for os_dark in [true, false] {
+            assert_eq!(effective_dark(ThemePref::System, os_dark), os_dark);
+            assert!(effective_dark(ThemePref::Dark, os_dark));
+            assert!(!effective_dark(ThemePref::Light, os_dark));
+        }
+    }
+
+    #[test]
+    fn row_heights_are_stored_as_whole_pixels() {
+        set_row_height(34.0);
+        assert_eq!(row_height(), 34.0);
+        set_row_height(28.0);
+        assert_eq!(row_height(), 28.0);
+    }
 
     #[test]
     fn only_dark_appearances_pick_the_dark_palette() {

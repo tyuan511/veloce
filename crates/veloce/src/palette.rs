@@ -19,12 +19,13 @@ use gpui::{
 };
 use vfs_core::{
     SearchHit,
-    search::{SearchOptions, rank, search_recursive},
+    search::{rank, search_recursive},
 };
 
 use crate::{
     icons,
     path_query::{self, PathQuery},
+    settings::AppSettings,
     text_input::{TextInput, TextInputEvent},
     theme,
 };
@@ -311,7 +312,7 @@ impl Palette {
         }
 
         cx.notify();
-        let options = SearchOptions::default();
+        let options = cx.global::<AppSettings>().search_options();
         cx.spawn(async move |this, cx| {
             let (tx, rx) = async_channel::bounded::<Vec<SearchHit>>(8);
             // The walk runs on the background executor; the channel carries hits

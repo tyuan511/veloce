@@ -120,6 +120,15 @@ database, told apart by pixel size in the key, and pruned least-recently-used pa
 256 MB. Nothing is cached as loose files; the only temporary files are the
 short-lived work directories used while a thumbnail is being rendered.
 
+## Settings
+
+`⌘,` (or *Settings…* in the toolbar's "…" menu) opens a separate Settings window
+with General, Appearance, Files, Preview, Search, Shortcuts, Connections, Storage
+and About. Changes apply immediately in every window and are saved to the same
+database. Connections (SSH, S3, WebDAV) are managed there too: the form validates
+and stores the non-secret fields; passwords and secret keys are deliberately not
+saved, since the remote backends will keep them in the system keychain.
+
 ## Layout
 
 Drag the dividers to resize the sidebar, the preview panel and, when split, the two panes.
@@ -148,7 +157,7 @@ Drag the dividers to resize the sidebar, the preview panel and, when split, the 
 ## Tests
 
 ```sh
-cargo test              # 460 tests, no GPU or window server needed
+cargo test              # 481 tests, no GPU or window server needed
 cargo test -p vfs-core  # 156 core tests
 ```
 

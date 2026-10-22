@@ -64,6 +64,7 @@ actions!(
         ToggleTasks,
         // misc
         Quit,
+        OpenSettings,
         CloseOverlay,
         Refresh,
         CycleSort,
@@ -145,6 +146,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("shift-s", CycleSort, Some(CONTEXT)),
         // ---- misc ----
         KeyBinding::new("cmd-q", Quit, None),
+        KeyBinding::new("cmd-,", OpenSettings, None),
         // Esc is the universal "back out": overlays first, then selection.
         KeyBinding::new("escape", CloseOverlay, None),
     ]);

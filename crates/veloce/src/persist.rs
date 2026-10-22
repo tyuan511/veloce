@@ -20,6 +20,7 @@ use crate::{
         LayoutPrefs, default_folder_view, folder_prefs_for, tabs_from_state, tabs_to_state,
         view_and_sort,
     },
+    settings::AppSettings,
     view::ViewMode,
 };
 
@@ -30,6 +31,7 @@ pub const RECENT_SHOWN: usize = 6;
 #[derive(Debug, Default)]
 pub struct Startup {
     pub layout: LayoutPrefs,
+    pub settings: AppSettings,
     /// Saved tabs and the active index, per pane (left, right).
     pub tabs: [(Vec<String>, usize); 2],
     pub recents: Vec<String>,
@@ -38,6 +40,8 @@ pub struct Startup {
 #[derive(Clone)]
 pub struct Persist {
     store: Option<Arc<Store>>,
+    /// View and sort for a folder nobody customised (Settings → General).
+    defaults: Arc<RwLock<(ViewMode, SortSpec)>>,
     /// Per-folder view and sort, loaded whole so navigating never waits on disk.
     folders: Arc<RwLock<HashMap<String, FolderPrefs>>>,
 }
@@ -49,6 +53,7 @@ pub fn load_startup(
     exists: impl Fn(&str) -> bool,
 ) -> (Startup, HashMap<String, FolderPrefs>) {
     let layout = LayoutPrefs::from_lookup(|key| store.get_setting(key).ok().flatten());
+    let settings = AppSettings::from_lookup(|key| store.get_setting(key).ok().flatten());
     let tabs_for = |pane: u8| tabs_from_state(store.load_tabs(pane).unwrap_or_default(), &exists);
     let folders = store
         .all_folder_prefs()
@@ -59,12 +64,15 @@ pub fn load_startup(
     (
         Startup {
             layout,
+            settings,
             tabs: [tabs_for(0), tabs_for(1)],
             recents,
         },
         folders,
     )
 }
+
+impl gpui::Global for Persist {}
 
 impl Persist {
     /// Open the default database and load everything. On failure the app runs
@@ -80,8 +88,9 @@ impl Persist {
                 let store = Arc::new(store);
                 // Trim the thumbnail cache once per launch, off the main thread.
                 let pruning = store.clone();
+                let limit = startup.settings.cache_limit_bytes();
                 std::thread::spawn(move || {
-                    let _ = pruning.prune_thumbnails(crate::thumbs::CACHE_LIMIT_BYTES);
+                    let _ = pruning.prune_thumbnails(limit);
                     // Older builds kept preview renders as loose files in the
                     // system temp directory; they live in the database now.
                     let _ = std::fs::remove_dir_all(std::env::temp_dir().join("veloce-thumbnails"));
@@ -89,6 +98,10 @@ impl Persist {
                 (
                     Self {
                         store: Some(store),
+                        defaults: Arc::new(RwLock::new((
+                            startup.settings.default_view,
+                            startup.settings.default_sort,
+                        ))),
                         folders: Arc::new(RwLock::new(folders)),
                     },
                     startup,
@@ -105,6 +118,7 @@ impl Persist {
     pub fn disabled() -> Self {
         Self {
             store: None,
+            defaults: Arc::new(RwLock::new(default_folder_view())),
             folders: Arc::new(RwLock::new(HashMap::new())),
         }
     }
@@ -119,7 +133,38 @@ impl Persist {
             .read()
             .ok()
             .and_then(|folders| folders.get(path).map(view_and_sort))
-            .unwrap_or_else(default_folder_view)
+            .unwrap_or_else(|| self.defaults())
+    }
+
+    /// The view and sort a never-customised folder opens with.
+    pub fn defaults(&self) -> (ViewMode, SortSpec) {
+        self.defaults
+            .read()
+            .map(|defaults| *defaults)
+            .unwrap_or_else(|_| default_folder_view())
+    }
+
+    pub fn set_defaults(&self, view: ViewMode, sort: SortSpec) {
+        if let Ok(mut defaults) = self.defaults.write() {
+            *defaults = (view, sort);
+        }
+    }
+
+    pub fn save_settings(&self, cx: &App, settings: &AppSettings) {
+        let entries = settings.entries();
+        self.write(cx, move |store| store.set_settings(&entries));
+    }
+
+    /// Shrink the thumbnail cache to `max_bytes` in the background.
+    pub fn prune_thumbnails(&self, cx: &App, max_bytes: u64) {
+        self.write(cx, move |store| {
+            store.prune_thumbnails(max_bytes).map(|_| ())
+        });
+    }
+
+    /// Delete every cached thumbnail in the background.
+    pub fn clear_thumbnails(&self, cx: &App) {
+        self.write(cx, |store| store.clear_thumbnails().map(|_| ()));
     }
 
     /// Remember `path`'s view and sort: memory now, disk in the background.
@@ -234,6 +279,7 @@ mod tests {
         let (_, folders) = load_startup(&store, |_| true);
         let persist = Persist {
             store: None,
+            defaults: Arc::new(RwLock::new(default_folder_view())),
             folders: Arc::new(RwLock::new(folders)),
         };
         assert_eq!(persist.folder_view("/photos").0, ViewMode::Icons);

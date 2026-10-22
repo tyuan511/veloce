@@ -36,9 +36,11 @@ use crate::{
     open_with::{self, AppInfo},
     palette::{Palette, PaletteChoice, PaletteEvent, PaletteMode},
     pane::{Pane, PaneEvent, PaneSide, Services},
-    persist::{Persist, RECENT_SHOWN, Startup},
+    persist::{Persist, RECENT_SHOWN, Startup as SavedStartup},
     prefs::LayoutPrefs,
     preview::{PreviewEvent, PreviewView},
+    settings::{AppSettings, Startup},
+    settings_apply,
     tasks_panel::TaskPanel,
     text_input::{TextInput, TextInputEvent},
     theme,
@@ -127,7 +129,7 @@ impl Focusable for Workspace {
 }
 
 impl Workspace {
-    pub fn new(persist: Persist, startup: Startup, cx: &mut Context<Self>) -> Self {
+    pub fn new(persist: Persist, startup: SavedStartup, cx: &mut Context<Self>) -> Self {
         let services = Services::new(persist.clone());
 
         let home_dir = std::env::var_os("HOME")
@@ -141,30 +143,36 @@ impl Workspace {
             .map(|arg| expand_home(&arg))
             .filter(|path| path.is_dir());
         let start = cli_start.clone().unwrap_or_else(|| home.clone());
+        let settings = startup.settings.clone();
         let [(left_saved, left_active), (right_saved, right_active)] = startup.tabs;
         let restore = |saved: Vec<String>, active: usize| {
             (saved.iter().map(VfsUri::local).collect::<Vec<_>>(), active)
         };
-        let (left_tabs, left_active) = if cli_start.is_some() {
+        let restore_session = settings.startup == Startup::RestoreSession;
+        let (left_tabs, left_active) = if cli_start.is_some() || !restore_session {
             (Vec::new(), 0)
         } else {
             restore(left_saved, left_active)
         };
-        let (right_tabs, right_active) = restore(right_saved, right_active);
+        let (right_tabs, right_active) = if restore_session {
+            restore(right_saved, right_active)
+        } else {
+            (Vec::new(), 0)
+        };
         let layout = startup.layout;
 
         let left = cx.new(|cx| {
             let mut pane = Pane::new(PaneSide::Left, VfsUri::local(&start), services.clone(), cx);
             pane.restore_tabs(left_tabs, left_active);
             pane.preview_open = layout.preview_open;
-            pane.listing.show_hidden = layout.show_hidden;
+            pane.listing.show_hidden = settings.show_hidden;
             pane
         });
         let right = cx.new(|cx| {
             let mut pane = Pane::new(PaneSide::Right, VfsUri::local(&start), services.clone(), cx);
             pane.restore_tabs(right_tabs, right_active);
             pane.preview_open = layout.preview_open;
-            pane.listing.show_hidden = layout.show_hidden;
+            pane.listing.show_hidden = settings.show_hidden;
             pane
         });
 
@@ -278,6 +286,11 @@ impl Workspace {
             );
         }
 
+        // Settings → workspace: react when the Settings window changes something.
+        subscriptions.push(cx.observe_global::<AppSettings>(|workspace, cx| {
+            workspace.on_settings_changed(cx);
+        }));
+
         // Inspector → workspace: its Open button and application list.
         subscriptions.push(cx.subscribe(
             &self.preview,
@@ -302,6 +315,15 @@ impl Workspace {
         subscriptions
     }
 
+    /// Settings changed (in any window): bring the panes in line.
+    fn on_settings_changed(&mut self, cx: &mut Context<Self>) {
+        let show_hidden = cx.global::<AppSettings>().show_hidden;
+        for pane in [self.left.clone(), self.right.clone()] {
+            pane.update(cx, |pane, cx| pane.set_show_hidden(show_hidden, cx));
+        }
+        cx.notify();
+    }
+
     // ---- persistence -------------------------------------------------------
 
     /// Move `path` to the front of the recent list.
@@ -312,7 +334,6 @@ impl Workspace {
     }
 
     fn layout_prefs(&self, cx: &App) -> LayoutPrefs {
-        let pane = self.left.read(cx);
         LayoutPrefs {
             sidebar_width: self.sidebar_width,
             inspector_width: self.inspector_width,
@@ -320,7 +341,6 @@ impl Workspace {
             split: self.split,
             preview_open: self.focused_pane().read(cx).preview_open,
             tasks_open: self.tasks_open,
-            show_hidden: pane.listing.show_hidden,
         }
     }
 
@@ -622,7 +642,8 @@ impl Workspace {
                     }
                 };
                 if let Some(dir) = target {
-                    Self::open_terminal_at(&dir);
+                    let app = cx.global::<AppSettings>().terminal_app.clone();
+                    Self::open_terminal_at(&dir, &app);
                 }
             }
             MenuAction::Preview => self.show_inspector(cx),
@@ -704,28 +725,30 @@ impl Workspace {
             MenuAction::TogglePreviewPanel => self.on_toggle_preview(&TogglePreview, window, cx),
             MenuAction::ToggleTasks => self.on_toggle_tasks(&ToggleTasks, window, cx),
             MenuAction::CommandPalette => self.open_palette(PaletteMode::Commands, window, cx),
+            MenuAction::OpenSettings => crate::settings_window::open(cx),
             MenuAction::ToggleHidden => {
-                let show = !pane.read(cx).listing.show_hidden;
-                pane.update(cx, |pane, cx| pane.set_show_hidden(show, cx));
-                self.save_layout(cx);
+                // One setting for both panes; `on_settings_changed` applies it.
+                settings_apply::commit(cx, |settings| settings.show_hidden = !settings.show_hidden);
             }
             MenuAction::Refresh => pane.update(cx, |pane, cx| pane.refresh(cx)),
         }
         cx.notify();
     }
 
-    /// Open Terminal in `dir`. macOS only for now; elsewhere there is no single
-    /// "the terminal" to ask for, so this is a no-op rather than a wrong guess.
-    fn open_terminal_at(dir: &std::path::Path) {
+    /// Open the configured terminal application (Settings → Files) in `dir`.
+    /// macOS only for now; elsewhere there is no single "the terminal" to ask for,
+    /// so this is a no-op rather than a wrong guess.
+    fn open_terminal_at(dir: &std::path::Path, app: &str) {
         #[cfg(target_os = "macos")]
         {
             let _ = std::process::Command::new("open")
-                .args(["-a", "Terminal"])
+                .arg("-a")
+                .arg(app)
                 .arg(dir)
                 .spawn();
         }
         #[cfg(not(target_os = "macos"))]
-        let _ = dir;
+        let _ = (dir, app);
     }
 
     fn pane(&self, side: PaneSide) -> Entity<Pane> {
@@ -2226,7 +2249,7 @@ fn render_banner(message: &str) -> AnyElement {
 }
 
 /// Build the workspace entity.
-pub fn new_workspace(persist: Persist, startup: Startup, cx: &mut App) -> Entity<Workspace> {
+pub fn new_workspace(persist: Persist, startup: SavedStartup, cx: &mut App) -> Entity<Workspace> {
     cx.new(|cx| Workspace::new(persist, startup, cx))
 }
 

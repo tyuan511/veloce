@@ -9,6 +9,7 @@ use super::*;
 use crate::{
     info::kind_label,
     pane::{ThumbEntry, ThumbState},
+    settings::AppSettings,
     thumbs,
     view::{
         COLUMN_WIDTH, GRID_PADDING, ICON_CELL_H, ICON_CELL_W, MAX_COLUMN_DIRS, column_dirs,
@@ -94,7 +95,7 @@ impl Pane {
     ) -> Option<Arc<gpui::Image>> {
         const MAX_IN_FLIGHT: usize = 4;
         const MAX_KEPT: usize = 4000;
-        if entry.is_dir() {
+        if entry.is_dir() || !cx.global::<AppSettings>().thumbnails {
             return None;
         }
         let ext = entry.extension()?;
@@ -531,9 +532,7 @@ fn render_cell(
                     .max_w(px(THUMB_BOX))
                     .max_h(px(THUMB_BOX))
                     .object_fit(gpui::ObjectFit::Contain)
-                    .rounded_sm()
-                    .border_1()
-                    .border_color(theme::border_soft()),
+                    .rounded_sm(),
             )
             .into_any_element(),
         None => div()
@@ -545,6 +544,15 @@ fn render_cell(
             .child(entry_icon(entry, 48.0))
             .into_any_element(),
     };
+    // Finder 式选中：灰底只托住图片，名字单独一枚强调色胶囊，整格不上色。
+    let picture = div()
+        .p_1()
+        .rounded_md()
+        .when(highlighted, |this| this.bg(theme::bg_selected_inactive()))
+        .when(!highlighted, |this| {
+            this.hover(|this| this.bg(theme::bg_raised()))
+        })
+        .child(picture);
     let cell = div()
         .id(gpui::ElementId::Name(
             format!("{side}-cell-{position}").into(),
@@ -558,25 +566,20 @@ fn render_cell(
         .pt_2()
         .px_1()
         .gap_1()
-        .rounded_md()
         .cursor_pointer()
         .when(dimmed, |this| this.opacity(0.5))
-        .when_some(background, |this, color| this.bg(color))
-        .when(!highlighted, |this| {
-            this.hover(|this| this.bg(theme::bg_raised()))
-        })
-        .text_color(if on_accent {
-            gpui::white()
-        } else {
-            theme::text()
-        })
+        .text_color(theme::text())
         .child(picture)
         .child(
             div()
-                .w_full()
+                .max_w_full()
+                .px_1()
+                .rounded_md()
                 .text_xs()
                 .text_center()
                 .line_clamp(2)
+                .when_some(background, |this, color| this.bg(color))
+                .when(on_accent, |this| this.text_color(gpui::white()))
                 .child(entry.name.clone()),
         );
     attach_pointer(cell, position, entity).into_any_element()

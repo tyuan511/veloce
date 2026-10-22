@@ -106,6 +106,10 @@ impl TextInput {
         cx.notify();
     }
 
+    pub fn content(&self) -> &str {
+        &self.content
+    }
+
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.set_content("", cx);
     }

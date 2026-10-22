@@ -28,7 +28,7 @@ use vfs_core::{
         extract_command, extract_dir_path,
     },
     entry::{format_relative, format_size},
-    ops::{ConflictPolicy, TaskManager, shortcut_path},
+    ops::{TaskManager, shortcut_path},
 };
 
 use crate::{
@@ -38,8 +38,9 @@ use crate::{
     icons,
     listing::{Listing, cycle_index, index_after_close},
     persist::Persist,
+    settings::AppSettings,
     text_input::{TextInput, TextInputEvent},
-    theme::{self, ROW_HEIGHT},
+    theme,
     view::{GridMove, ViewMode, grid_move, min_content_width},
 };
 
@@ -739,26 +740,26 @@ impl Pane {
     // ---- file operations --------------------------------------------------
 
     pub fn copy_selection_to(&mut self, target_dir: &std::path::Path, cx: &mut Context<Self>) {
+        let policy = cx.global::<AppSettings>().on_conflict.policy();
         for entry in self.selection_or_cursor() {
             let Some(from) = entry.uri.as_local_path() else {
                 continue;
             };
             let to = target_dir.join(&entry.name);
-            self.services.tasks.copy(from, to, ConflictPolicy::Rename);
+            self.services.tasks.copy(from, to, policy);
         }
         self.reload_when_idle(cx);
         cx.notify();
     }
 
     pub fn move_selection_to(&mut self, target_dir: &std::path::Path, cx: &mut Context<Self>) {
+        let policy = cx.global::<AppSettings>().on_conflict.policy();
         for entry in self.selection_or_cursor() {
             let Some(from) = entry.uri.as_local_path() else {
                 continue;
             };
             let to = target_dir.join(&entry.name);
-            self.services
-                .tasks
-                .move_path(from, to, ConflictPolicy::Rename);
+            self.services.tasks.move_path(from, to, policy);
         }
         self.listing.clear_selection();
         self.reload_when_idle(cx);
@@ -896,18 +897,17 @@ impl Pane {
         self.navigate_to(uri, cx);
     }
 
-    /// Run a planned paste. Copies that collide keep both (`name 2`), so pasting
-    /// never silently overwrites.
+    /// Run a planned paste. What happens to a name that already exists comes from
+    /// Settings (keep both by default, so nothing is silently overwritten).
     pub fn apply_paste(&mut self, ops: Vec<PasteOp>, cx: &mut Context<Self>) {
+        let policy = cx.global::<AppSettings>().on_conflict.policy();
         for op in ops {
             match op {
                 PasteOp::Copy { from, to } => {
-                    self.services.tasks.copy(from, to, ConflictPolicy::Rename);
+                    self.services.tasks.copy(from, to, policy);
                 }
                 PasteOp::Move { from, to } => {
-                    self.services
-                        .tasks
-                        .move_path(from, to, ConflictPolicy::Rename);
+                    self.services.tasks.move_path(from, to, policy);
                 }
             }
         }
@@ -1564,7 +1564,7 @@ fn render_row(
     // inset rounded bar rather than a full-bleed stripe.
     div()
         .w_full()
-        .h(px(ROW_HEIGHT))
+        .h(px(theme::row_height()))
         .px_1()
         .child(
             div()

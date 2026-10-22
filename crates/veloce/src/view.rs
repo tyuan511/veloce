@@ -13,7 +13,7 @@ pub enum ViewMode {
 // ---- icon grid -------------------------------------------------------------
 
 pub const ICON_CELL_W: f32 = 104.0;
-pub const ICON_CELL_H: f32 = 104.0;
+pub const ICON_CELL_H: f32 = 120.0;
 pub const GRID_PADDING: f32 = 8.0;
 
 /// How many icon cells fit across `width` (always at least one).
