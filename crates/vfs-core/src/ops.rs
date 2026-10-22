@@ -1072,3 +1072,124 @@ mod edge_tests {
         assert!(snapshot.elapsed_secs >= 0.0);
     }
 }
+
+/// Finder-style duplicate name: `report.txt` -> `report copy.txt`, then
+/// `report copy 2.txt`, ... The first candidate that does not exist wins.
+pub fn duplicate_path(path: &Path) -> PathBuf {
+    suffixed_path(path, "copy")
+}
+
+/// Finder-style alias name: `report.txt` -> `report alias.txt`.
+pub fn alias_path(path: &Path) -> PathBuf {
+    suffixed_path(path, "alias")
+}
+
+/// Where "Compress" writes: `<name>.zip` for one item, `Archive.zip` for several,
+/// placed next to the first source and numbered (`Archive 2.zip`) if taken.
+pub fn archive_path(sources: &[PathBuf]) -> Option<PathBuf> {
+    let first = sources.first()?;
+    let parent = first.parent()?;
+    let name = if sources.len() == 1 {
+        format!("{}.zip", first.file_name()?.to_string_lossy())
+    } else {
+        "Archive.zip".to_string()
+    };
+    Some(unique_path(&parent.join(name)))
+}
+
+fn suffixed_path(path: &Path, word: &str) -> PathBuf {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    // `.bashrc` has no extension, `a.tar.gz` keeps only `.gz`, matching Finder.
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "untitled".to_string());
+    let extension = path.extension().map(|e| e.to_string_lossy().to_string());
+    let name_with = |label: String| match &extension {
+        Some(extension) => format!("{stem} {label}.{extension}"),
+        None => format!("{stem} {label}"),
+    };
+    let first = parent.join(name_with(word.to_string()));
+    if !first.exists() {
+        return first;
+    }
+    for index in 2..10_000 {
+        let candidate = parent.join(name_with(format!("{word} {index}")));
+        if !candidate.exists() {
+            return candidate;
+        }
+    }
+    first
+}
+
+#[cfg(test)]
+mod naming_tests {
+    use super::*;
+    use std::fs;
+
+    #[test]
+    fn duplicate_appends_copy_before_the_extension() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("report.txt");
+        fs::write(&file, b"x").unwrap();
+        assert_eq!(duplicate_path(&file), dir.path().join("report copy.txt"));
+    }
+
+    #[test]
+    fn duplicate_numbers_when_the_copy_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a.txt");
+        fs::write(&file, b"x").unwrap();
+        fs::write(dir.path().join("a copy.txt"), b"x").unwrap();
+        assert_eq!(duplicate_path(&file), dir.path().join("a copy 2.txt"));
+    }
+
+    #[test]
+    fn duplicate_handles_folders_and_extensionless_names() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            duplicate_path(&dir.path().join("Makefile")),
+            dir.path().join("Makefile copy")
+        );
+        assert_eq!(
+            duplicate_path(&dir.path().join("src")),
+            dir.path().join("src copy")
+        );
+    }
+
+    #[test]
+    fn alias_uses_its_own_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            alias_path(&dir.path().join("photo.png")),
+            dir.path().join("photo alias.png")
+        );
+    }
+
+    #[test]
+    fn archive_is_named_after_a_single_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let sources = vec![dir.path().join("notes.md")];
+        assert_eq!(
+            archive_path(&sources),
+            Some(dir.path().join("notes.md.zip"))
+        );
+    }
+
+    #[test]
+    fn archive_of_many_is_called_archive_and_never_overwrites() {
+        let dir = tempfile::tempdir().unwrap();
+        let sources = vec![dir.path().join("a"), dir.path().join("b")];
+        assert_eq!(archive_path(&sources), Some(dir.path().join("Archive.zip")));
+        fs::write(dir.path().join("Archive.zip"), b"x").unwrap();
+        assert_eq!(
+            archive_path(&sources),
+            Some(dir.path().join("Archive 2.zip"))
+        );
+    }
+
+    #[test]
+    fn archive_of_nothing_is_none() {
+        assert_eq!(archive_path(&[]), None);
+    }
+}
