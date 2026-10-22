@@ -19,6 +19,7 @@ use vfs_core::{FsWatcher, VfsUri, WatchEvent};
 
 use crate::{
     actions::*,
+    clipboard::FileClipboard,
     context_menu::{
         ActionItem, MENU_PADDING, MENU_WIDTH, MenuAction, MenuItem, MenuTarget, build_menu,
         clamp_origin, menu_height,
@@ -65,7 +66,7 @@ pub struct Workspace {
     /// Second pane visible. Off by default, like Finder; ⌘\ turns it on.
     pub split: bool,
     /// Paths copied with Copy / "Copy Item", pasted by Paste Item.
-    clipboard: Vec<PathBuf>,
+    clipboard: FileClipboard,
     menu: Option<OpenMenu>,
     info: Option<InfoState>,
     /// Finder-style shortcuts down the left edge.
@@ -120,7 +121,7 @@ impl Workspace {
             palette: palette.clone(),
             tasks_open: false,
             split: false,
-            clipboard: Vec::new(),
+            clipboard: FileClipboard::default(),
             menu: None,
             info: None,
             places: favorite_places(&home_dir),
@@ -217,7 +218,6 @@ impl Workspace {
         let target = match (on_entry, selection.first()) {
             (true, Some(first)) => MenuTarget::Items {
                 count: selection.len(),
-                name: first.name.clone(),
                 is_dir: selection.len() == 1 && first.is_dir(),
             },
             _ => MenuTarget::Background,
@@ -278,6 +278,29 @@ impl Workspace {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
     }
 
+    /// Replace the file clipboard and dim whatever was cut, in both panes.
+    fn set_clipboard(&mut self, clipboard: FileClipboard, cx: &mut Context<Self>) {
+        self.clipboard = clipboard;
+        let cut = self.clipboard.cut_paths().to_vec();
+        for pane in [self.left.clone(), self.right.clone()] {
+            pane.update(cx, |pane, cx| pane.set_cut_paths(cut.clone(), cx));
+        }
+        cx.notify();
+    }
+
+    /// Paste into `dir`: moves after Cut, copies after Copy.
+    fn paste_into(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        let ops = self.clipboard.plan_paste(&dir);
+        if ops.is_empty() {
+            return;
+        }
+        self.focused_pane()
+            .update(cx, |pane, cx| pane.apply_paste(ops, cx));
+        let clipboard = std::mem::take(&mut self.clipboard).after_paste();
+        self.set_clipboard(clipboard, cx);
+        self.show_tasks(cx);
+    }
+
     /// One entry point for the menu rows and their keyboard shortcuts, so both
     /// always do the same thing.
     fn run_menu_action(&mut self, action: MenuAction, window: &mut Window, cx: &mut Context<Self>) {
@@ -303,43 +326,51 @@ impl Workspace {
                     Self::open_terminal_at(&dir);
                 }
             }
-            MenuAction::Trash => {
+            MenuAction::Preview => pane.update(cx, |pane, cx| pane.show_preview(cx)),
+            MenuAction::CompressZip => pane.update(cx, |pane, cx| pane.compress_selection(cx)),
+            MenuAction::CopyPath => {
+                let paths = pane.read(cx).selection_paths();
+                Self::copy_text_to_clipboard(&paths, cx);
+            }
+            MenuAction::Cut => {
+                let paths = pane.read(cx).selection_paths();
+                Self::copy_text_to_clipboard(&paths, cx);
+                self.set_clipboard(FileClipboard::cut(paths), cx);
+            }
+            MenuAction::Copy => {
+                let paths = pane.read(cx).selection_paths();
+                Self::copy_text_to_clipboard(&paths, cx);
+                self.set_clipboard(FileClipboard::copy(paths), cx);
+            }
+            MenuAction::Paste => {
+                if let Some(dir) = pane.read(cx).current_uri().as_local_path() {
+                    self.paste_into(dir, cx);
+                }
+            }
+            MenuAction::PasteInto => {
+                let dir = pane
+                    .read(cx)
+                    .cursor_entry()
+                    .filter(|entry| entry.is_dir())
+                    .and_then(|entry| entry.uri.as_local_path());
+                if let Some(dir) = dir {
+                    self.paste_into(dir, cx);
+                }
+            }
+            MenuAction::CreateShortcut => pane.update(cx, |pane, cx| pane.shortcut_selection(cx)),
+            MenuAction::Delete => {
                 pane.update(cx, |pane, cx| pane.trash_selection(cx));
                 self.show_tasks(cx);
             }
-            MenuAction::GetInfo => self.show_info(cx),
             MenuAction::Rename => {
                 if let Some(entry) = pane.read(cx).cursor_entry().cloned() {
                     self.start_prompt(InlinePrompt::Rename, entry.name.clone(), window, cx);
                 }
             }
-            MenuAction::Compress => {
-                pane.update(cx, |pane, cx| pane.compress_selection(cx));
-            }
-            MenuAction::Duplicate => {
-                pane.update(cx, |pane, cx| pane.duplicate_selection(cx));
-                self.show_tasks(cx);
-            }
-            MenuAction::MakeAlias => pane.update(cx, |pane, cx| pane.alias_selection(cx)),
-            MenuAction::QuickLook => pane.update(cx, |pane, cx| pane.show_preview(cx)),
-            MenuAction::Copy => {
-                self.clipboard = pane.read(cx).selection_paths();
-                Self::copy_text_to_clipboard(&self.clipboard, cx);
-            }
-            MenuAction::CopyPath => {
-                let paths = pane.read(cx).selection_paths();
-                Self::copy_text_to_clipboard(&paths, cx);
-            }
-            MenuAction::Paste => {
-                let sources = self.clipboard.clone();
-                if !sources.is_empty() {
-                    pane.update(cx, |pane, cx| pane.paste_paths(&sources, cx));
-                    self.show_tasks(cx);
-                }
-            }
+            MenuAction::Properties => self.show_info(cx),
             MenuAction::NewFolder => self.start_prompt(
                 InlinePrompt::NewFolder,
-                "untitled folder".to_string(),
+                "New folder".to_string(),
                 window,
                 cx,
             ),
@@ -789,16 +820,20 @@ impl Workspace {
         self.run_menu_action(MenuAction::Paste, w, cx);
     }
 
-    fn on_duplicate(&mut self, _: &DuplicateEntry, w: &mut Window, cx: &mut Context<Self>) {
-        self.run_menu_action(MenuAction::Duplicate, w, cx);
+    fn on_cut_items(&mut self, _: &CutItems, w: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_action(MenuAction::Cut, w, cx);
     }
 
-    fn on_make_alias(&mut self, _: &MakeAlias, w: &mut Window, cx: &mut Context<Self>) {
-        self.run_menu_action(MenuAction::MakeAlias, w, cx);
+    fn on_copy_as_path(&mut self, _: &CopyAsPath, w: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_action(MenuAction::CopyPath, w, cx);
     }
 
-    fn on_get_info(&mut self, _: &GetInfo, w: &mut Window, cx: &mut Context<Self>) {
-        self.run_menu_action(MenuAction::GetInfo, w, cx);
+    fn on_delete_items(&mut self, _: &DeleteItems, w: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_action(MenuAction::Delete, w, cx);
+    }
+
+    fn on_properties(&mut self, _: &Properties, w: &mut Window, cx: &mut Context<Self>) {
+        self.run_menu_action(MenuAction::Properties, w, cx);
     }
 
     fn on_start_filter(&mut self, _: &StartFilter, window: &mut Window, cx: &mut Context<Self>) {
@@ -878,6 +913,11 @@ impl Workspace {
             || self.info.is_some()
         {
             self.close_overlays(cx);
+            return;
+        }
+        // Esc also cancels a pending Cut, like Explorer.
+        if self.clipboard.is_cut() {
+            self.set_clipboard(FileClipboard::default(), cx);
             return;
         }
         let pane = self.focused_pane();
@@ -993,9 +1033,10 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_open_selection))
             .on_action(cx.listener(Self::on_copy_items))
             .on_action(cx.listener(Self::on_paste_items))
-            .on_action(cx.listener(Self::on_duplicate))
-            .on_action(cx.listener(Self::on_make_alias))
-            .on_action(cx.listener(Self::on_get_info))
+            .on_action(cx.listener(Self::on_cut_items))
+            .on_action(cx.listener(Self::on_copy_as_path))
+            .on_action(cx.listener(Self::on_delete_items))
+            .on_action(cx.listener(Self::on_properties))
             .on_action(cx.listener(Self::on_start_filter))
             .on_action(cx.listener(Self::on_open_palette))
             .on_action(cx.listener(Self::on_open_commands))
@@ -1210,7 +1251,7 @@ impl Workspace {
                                         .text_color(theme::text())
                                         .font_weight(gpui::FontWeight::SEMIBOLD)
                                         .truncate()
-                                        .child(format!("{name} Info")),
+                                        .child(format!("{name} Properties")),
                                 ),
                         )
                         .child(div().h(px(1.)).bg(theme::border_soft()))

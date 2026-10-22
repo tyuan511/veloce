@@ -48,9 +48,10 @@ actions!(
         OpenSelection,
         CopyItems,
         PasteItems,
-        DuplicateEntry,
-        MakeAlias,
-        GetInfo,
+        CutItems,
+        CopyAsPath,
+        DeleteItems,
+        Properties,
         // panels
         ToggleTasks,
         // misc
@@ -117,9 +118,11 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-o", OpenSelection, Some(CONTEXT)),
         KeyBinding::new("cmd-c", CopyItems, Some(CONTEXT)),
         KeyBinding::new("cmd-v", PasteItems, Some(CONTEXT)),
-        KeyBinding::new("cmd-d", DuplicateEntry, Some(CONTEXT)),
-        KeyBinding::new("cmd-l", MakeAlias, Some(CONTEXT)),
-        KeyBinding::new("cmd-i", GetInfo, Some(CONTEXT)),
+        KeyBinding::new("cmd-x", CutItems, Some(CONTEXT)),
+        KeyBinding::new("cmd-shift-c", CopyAsPath, Some(CONTEXT)),
+        KeyBinding::new("delete", DeleteItems, Some(CONTEXT)),
+        KeyBinding::new("f2", RenameEntry, Some(CONTEXT)),
+        KeyBinding::new("alt-enter", Properties, Some(CONTEXT)),
         // ---- panels ----
         KeyBinding::new("cmd-j", ToggleTasks, Some(CONTEXT)),
         KeyBinding::new("cmd-r", Refresh, Some(CONTEXT)),

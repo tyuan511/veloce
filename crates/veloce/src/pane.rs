@@ -21,10 +21,11 @@ use gpui::{
 use vfs_core::{
     FileEntry, FileKind, Filter, LocalProvider, SortKey, SortSpec, VfsProvider, VfsUri,
     entry::{format_relative, format_size},
-    ops::{ConflictPolicy, TaskManager, alias_path, archive_path, duplicate_path},
+    ops::{ConflictPolicy, TaskManager, archive_path, shortcut_path},
 };
 
 use crate::{
+    clipboard::PasteOp,
     file_icons, icons,
     listing::{
         Listing, breadcrumbs, cycle_index, index_after_close, parse_path_input, visible_crumbs,
@@ -128,6 +129,8 @@ pub struct Pane {
     pub sort: SortSpec,
     pub filter: Filter,
     pub filter_active: bool,
+    /// Files cut to the clipboard; drawn dimmed until pasted.
+    pub cut_paths: Vec<PathBuf>,
     pub preview_open: bool,
     pub scroll: UniformListScrollHandle,
     pub services: Services,
@@ -199,6 +202,7 @@ impl Pane {
             sort: SortSpec::default(),
             filter: Filter::new(),
             filter_active: false,
+            cut_paths: Vec::new(),
             preview_open: false,
             scroll: UniformListScrollHandle::new(),
             services,
@@ -683,45 +687,40 @@ impl Pane {
         self.navigate_to(uri, cx);
     }
 
-    /// `Duplicate`: `name copy.ext` next to the original, via the task manager.
-    pub fn duplicate_selection(&mut self, cx: &mut Context<Self>) {
-        for from in self.selection_paths() {
-            let to = duplicate_path(&from);
-            self.services.tasks.copy(from, to, ConflictPolicy::Rename);
+    /// Run a planned paste. Copies that collide keep both (`name 2`), so pasting
+    /// never silently overwrites.
+    pub fn apply_paste(&mut self, ops: Vec<PasteOp>, cx: &mut Context<Self>) {
+        for op in ops {
+            match op {
+                PasteOp::Copy { from, to } => {
+                    self.services.tasks.copy(from, to, ConflictPolicy::Rename);
+                }
+                PasteOp::Move { from, to } => {
+                    self.services
+                        .tasks
+                        .move_path(from, to, ConflictPolicy::Rename);
+                }
+            }
         }
         self.reload_when_idle(cx);
     }
 
-    /// `Paste Item`: copy into the current folder. Pasting where the source already
-    /// lives duplicates it instead of clobbering or silently doing nothing.
-    pub fn paste_paths(&mut self, sources: &[PathBuf], cx: &mut Context<Self>) {
-        let Some(dir) = self.current_uri().as_local_path() else {
-            return;
-        };
-        for from in sources {
-            let Some(name) = from.file_name() else {
-                continue;
-            };
-            let to = if from.parent() == Some(dir.as_path()) {
-                duplicate_path(from)
-            } else {
-                dir.join(name)
-            };
-            self.services
-                .tasks
-                .copy(from.clone(), to, ConflictPolicy::Rename);
+    /// Which paths to draw dimmed (files waiting to be moved by a Paste).
+    pub fn set_cut_paths(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if self.cut_paths != paths {
+            self.cut_paths = paths;
+            cx.notify();
         }
-        self.reload_when_idle(cx);
     }
 
-    /// `Make Alias`: a symlink named `name alias`. Off the UI thread like every
-    /// other filesystem write.
-    pub fn alias_selection(&mut self, cx: &mut Context<Self>) {
+    /// `Create shortcut`: a symlink named `name - Shortcut`. Off the UI thread
+    /// like every other filesystem write.
+    pub fn shortcut_selection(&mut self, cx: &mut Context<Self>) {
         let pairs: Vec<(PathBuf, PathBuf)> = self
             .selection_paths()
             .into_iter()
             .map(|from| {
-                let to = alias_path(&from);
+                let to = shortcut_path(&from);
                 (from, to)
             })
             .collect();
@@ -731,7 +730,7 @@ impl Pane {
                 .spawn(async move {
                     for (from, to) in pairs {
                         std::os::unix::fs::symlink(&from, &to).map_err(|error| {
-                            format!("Cannot make an alias of {}: {error}", from.display())
+                            format!("Cannot create a shortcut to {}: {error}", from.display())
                         })?;
                     }
                     Ok::<(), String>(())
@@ -748,7 +747,7 @@ impl Pane {
         .detach();
     }
 
-    /// `Compress`: a zip next to the first item, written by the system `zip` so
+    /// `Compress to ZIP file`: a zip next to the first item, written by the system `zip` so
     /// symlinks and permissions survive.
     pub fn compress_selection(&mut self, cx: &mut Context<Self>) {
         let sources = self.selection_paths();
@@ -1352,12 +1351,18 @@ impl Pane {
                                 .get(position)
                                 .is_some_and(|index| selected.contains(index));
                             let is_cursor = position == cursor;
+                            let dimmed = !pane.cut_paths.is_empty()
+                                && entry
+                                    .uri
+                                    .as_local_path()
+                                    .is_some_and(|path| pane.cut_paths.contains(&path));
                             rows.push(render_row(
                                 pane.side.index(),
                                 position,
                                 entry,
                                 is_selected || is_cursor,
                                 focused,
+                                dimmed,
                                 entity.clone(),
                             ));
                         }
@@ -1410,6 +1415,7 @@ fn render_row(
     entry: &FileEntry,
     highlighted: bool,
     pane_focused: bool,
+    dimmed: bool,
     entity: Entity<Pane>,
 ) -> AnyElement {
     let is_dir = entry.is_dir();
@@ -1450,6 +1456,7 @@ fn render_row(
                 .size_full()
                 .rounded_md()
                 .cursor_pointer()
+                .when(dimmed, |this| this.opacity(0.5))
                 .when(highlighted, |this| this.bg(highlight))
                 .when(on_accent, |this| this.text_color(gpui::white()))
                 .when(!on_accent, |this| this.text_color(theme::text()))

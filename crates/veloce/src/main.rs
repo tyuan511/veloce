@@ -9,6 +9,7 @@
 //!   except through `vfs-core`, which keeps the UI honest about what a backend can do.
 
 mod actions;
+mod clipboard;
 mod context_menu;
 mod file_icons;
 #[rustfmt::skip]

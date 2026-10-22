@@ -5,16 +5,15 @@ use vfs_core::{
     entry::{format_size, format_time},
 };
 
-/// Finder-style kind: "Folder", "Rust source"-ish is out of scope, so files read
-/// "RS File" / "Document" and links "Alias".
+/// Explorer-style type: "File folder", "RS File", "Shortcut".
 pub fn kind_label(entry: &FileEntry) -> String {
     match entry.kind {
-        FileKind::Directory => "Folder".to_string(),
-        FileKind::Symlink => "Alias".to_string(),
+        FileKind::Directory => "File folder".to_string(),
+        FileKind::Symlink => "Shortcut".to_string(),
         FileKind::Special => "Special file".to_string(),
         FileKind::File => match entry.extension() {
             Some(ext) => format!("{} File", ext.to_uppercase()),
-            None => "Document".to_string(),
+            None => "File".to_string(),
         },
     }
 }
@@ -44,9 +43,9 @@ pub fn info_rows(entry: &FileEntry, folder_bytes: Option<u64>) -> Vec<(&'static 
         .unwrap_or_else(|| entry.uri.to_string());
 
     let mut rows = vec![
-        ("Kind", kind_label(entry)),
+        ("Type", kind_label(entry)),
         ("Size", size),
-        ("Where", location),
+        ("Location", location),
         ("Created", format_time(entry.created)),
         ("Modified", format_time(entry.modified)),
     ];
@@ -67,10 +66,10 @@ mod tests {
 
     #[test]
     fn kind_reflects_file_type_and_extension() {
-        assert_eq!(kind_label(&entry("d", FileKind::Directory)), "Folder");
-        assert_eq!(kind_label(&entry("l", FileKind::Symlink)), "Alias");
+        assert_eq!(kind_label(&entry("d", FileKind::Directory)), "File folder");
+        assert_eq!(kind_label(&entry("l", FileKind::Symlink)), "Shortcut");
         assert_eq!(kind_label(&entry("main.rs", FileKind::File)), "RS File");
-        assert_eq!(kind_label(&entry("Makefile", FileKind::File)), "Document");
+        assert_eq!(kind_label(&entry("Makefile", FileKind::File)), "File");
     }
 
     #[test]
@@ -80,7 +79,7 @@ mod tests {
         let rows = info_rows(&file, None);
         let get = |label: &str| rows.iter().find(|(l, _)| *l == label).unwrap().1.clone();
         assert!(get("Size").contains("2048 bytes"));
-        assert_eq!(get("Where"), "/home/me");
+        assert_eq!(get("Location"), "/home/me");
     }
 
     #[test]

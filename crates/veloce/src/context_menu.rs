@@ -10,16 +10,19 @@ pub enum MenuAction {
     Open,
     OpenInNewTab,
     OpenInTerminal,
-    Trash,
-    GetInfo,
-    Rename,
-    Compress,
-    Duplicate,
-    MakeAlias,
-    QuickLook,
-    Copy,
+    Preview,
+    CompressZip,
     CopyPath,
+    Cut,
+    Copy,
+    /// Paste into the folder being viewed.
     Paste,
+    /// Paste into the right-clicked folder.
+    PasteInto,
+    CreateShortcut,
+    Delete,
+    Rename,
+    Properties,
     NewFolder,
     Refresh,
 }
@@ -46,85 +49,65 @@ pub enum MenuTarget {
     /// One or more entries (the selection).
     Items {
         count: usize,
-        /// Name shown in labels when `count == 1`.
-        name: String,
         /// A single folder is selected.
         is_dir: bool,
     },
 }
 
-/// Finder quotes a single name (`Compress "notes.md"`) and counts several
-/// (`Compress 3 Items`). Long names are shortened so the menu keeps its width.
-pub fn subject(count: usize, name: &str) -> String {
-    if count == 1 {
-        let shown: String = if name.chars().count() > 24 {
-            let head: String = name.chars().take(23).collect();
-            format!("{head}…")
-        } else {
-            name.to_string()
-        };
-        format!("“{shown}”")
-    } else {
-        format!("{count} Items")
-    }
-}
-
 fn action(
     action: MenuAction,
-    label: impl Into<String>,
+    label: &str,
     shortcut: Option<&'static str>,
     enabled: bool,
 ) -> MenuItem {
     MenuItem::Action(ActionItem {
         action,
-        label: label.into(),
+        label: label.to_string(),
         shortcut,
         enabled,
     })
 }
 
-/// Build the menu for `target`. `can_paste` is whether the in-app clipboard holds
-/// anything.
+/// Build the menu for `target`, laid out like Explorer's classic context menu:
+/// open actions, then Cut / Copy / Paste, then shortcut / Delete / Rename, then
+/// Properties. `can_paste` is whether the file clipboard holds anything.
 pub fn build_menu(target: &MenuTarget, can_paste: bool) -> Vec<MenuItem> {
     use MenuAction::*;
     match target {
         MenuTarget::Background => vec![
-            action(NewFolder, "New Folder", Some("⇧⌘N"), true),
-            MenuItem::Separator,
-            action(Paste, "Paste Item", Some("⌘V"), can_paste),
-            MenuItem::Separator,
-            action(OpenInTerminal, "New Terminal at Folder", None, true),
             action(Refresh, "Refresh", Some("⌘R"), true),
+            MenuItem::Separator,
+            action(Paste, "Paste", Some("⌘V"), can_paste),
+            MenuItem::Separator,
+            action(NewFolder, "New folder", Some("⇧⌘N"), true),
+            action(OpenInTerminal, "Open in Terminal", None, true),
         ],
-        MenuTarget::Items {
-            count,
-            name,
-            is_dir,
-        } => {
+        MenuTarget::Items { count, is_dir } => {
             let single = *count == 1;
-            let who = subject(*count, name);
+            let folder = single && *is_dir;
             let mut items = vec![action(Open, "Open", Some("⌘O"), true)];
-            if single && *is_dir {
-                items.push(action(OpenInNewTab, "Open in New Tab", None, true));
-                items.push(action(OpenInTerminal, "New Terminal at Folder", None, true));
+            if folder {
+                items.push(action(OpenInNewTab, "Open in new tab", None, true));
+                items.push(action(OpenInTerminal, "Open in Terminal", None, true));
+            }
+            if single && !*is_dir {
+                items.push(action(Preview, "Preview", Some("Space"), true));
             }
             items.push(MenuItem::Separator);
-            items.push(action(Trash, "Move to Trash", Some("⌘⌫"), true));
+            items.push(action(CompressZip, "Compress to ZIP file", None, true));
+            items.push(action(CopyPath, "Copy as path", Some("⇧⌘C"), true));
             items.push(MenuItem::Separator);
-            items.push(action(GetInfo, "Get Info", Some("⌘I"), true));
-            items.push(action(Rename, "Rename", Some("⇧R"), single));
-            items.push(action(Compress, format!("Compress {who}"), None, true));
-            items.push(action(Duplicate, "Duplicate", Some("⌘D"), true));
-            items.push(action(MakeAlias, "Make Alias", Some("⌘L"), true));
-            items.push(action(
-                QuickLook,
-                format!("Quick Look {who}"),
-                Some("Space"),
-                single,
-            ));
+            items.push(action(Cut, "Cut", Some("⌘X"), true));
+            items.push(action(Copy, "Copy", Some("⌘C"), true));
+            if folder {
+                items.push(action(PasteInto, "Paste", Some("⌘V"), can_paste));
+            }
             items.push(MenuItem::Separator);
-            items.push(action(Copy, format!("Copy {who}"), Some("⌘C"), true));
-            items.push(action(CopyPath, "Copy as Pathname", None, true));
+            items.push(action(CreateShortcut, "Create shortcut", None, true));
+            items.push(action(Delete, "Delete", Some("Del"), true));
+            items.push(action(Rename, "Rename", Some("F2"), single));
+            items.push(MenuItem::Separator);
+            items.push(action(Properties, "Properties", Some("⌥↵"), single));
             items
         }
     }
@@ -187,69 +170,94 @@ mod tests {
             .expect("menu has the action")
     }
 
-    fn file(count: usize, name: &str) -> MenuTarget {
+    fn has(items: &[MenuItem], wanted: MenuAction) -> bool {
+        items
+            .iter()
+            .any(|item| matches!(item, MenuItem::Action(a) if a.action == wanted))
+    }
+
+    fn files(count: usize) -> MenuTarget {
         MenuTarget::Items {
             count,
-            name: name.to_string(),
             is_dir: false,
         }
     }
 
-    #[test]
-    fn single_file_menu_quotes_the_name_like_finder() {
-        let items = build_menu(&file(1, "notes.md"), false);
-        let labels = labels(&items);
-        assert!(labels.contains(&"Compress “notes.md”"));
-        assert!(labels.contains(&"Copy “notes.md”"));
-        assert!(labels.contains(&"Quick Look “notes.md”"));
-        assert_eq!(labels[0], "Open");
-    }
-
-    #[test]
-    fn several_items_are_counted_and_rename_and_quick_look_disable() {
-        let items = build_menu(&file(3, "a"), false);
-        assert!(labels(&items).contains(&"Compress 3 Items"));
-        assert!(!find(&items, MenuAction::Rename).enabled);
-        assert!(!find(&items, MenuAction::QuickLook).enabled);
-        assert!(find(&items, MenuAction::Trash).enabled);
-    }
-
-    #[test]
-    fn folders_gain_open_in_new_tab_and_terminal() {
-        let target = MenuTarget::Items {
+    fn folder() -> MenuTarget {
+        MenuTarget::Items {
             count: 1,
-            name: "src".into(),
             is_dir: true,
-        };
-        let items = build_menu(&target, true);
-        assert!(labels(&items).contains(&"Open in New Tab"));
-        assert!(labels(&items).contains(&"New Terminal at Folder"));
-        let plain = build_menu(&file(1, "a.txt"), true);
-        assert!(!labels(&plain).contains(&"Open in New Tab"));
+        }
     }
 
     #[test]
-    fn background_menu_offers_new_folder_and_paste_only_with_a_clipboard() {
+    fn file_menu_has_the_explorer_core_in_order() {
+        let items = build_menu(&files(1), false);
+        let labels = labels(&items);
+        let at = |label: &str| labels.iter().position(|l| *l == label).unwrap();
+        assert_eq!(labels[0], "Open");
+        assert!(at("Cut") < at("Copy"));
+        assert!(at("Copy") < at("Delete"));
+        assert!(at("Delete") < at("Rename"));
+        assert_eq!(*labels.last().unwrap(), "Properties");
+    }
+
+    #[test]
+    fn no_finder_only_commands_remain() {
+        for target in [files(1), folder(), MenuTarget::Background] {
+            let labels = labels(&build_menu(&target, true))
+                .iter()
+                .map(|l| l.to_string())
+                .collect::<Vec<_>>();
+            for banned in ["Duplicate", "Make Alias", "Get Info", "Move to Trash"] {
+                assert!(!labels.iter().any(|l| l == banned), "{banned}");
+            }
+        }
+    }
+
+    #[test]
+    fn several_items_disable_rename_and_properties_but_not_delete() {
+        let items = build_menu(&files(3), false);
+        assert!(!find(&items, MenuAction::Rename).enabled);
+        assert!(!find(&items, MenuAction::Properties).enabled);
+        assert!(find(&items, MenuAction::Delete).enabled);
+        assert!(find(&items, MenuAction::Cut).enabled);
+    }
+
+    #[test]
+    fn folders_gain_tab_terminal_and_paste_into() {
+        let items = build_menu(&folder(), true);
+        assert!(has(&items, MenuAction::OpenInNewTab));
+        assert!(has(&items, MenuAction::OpenInTerminal));
+        assert!(find(&items, MenuAction::PasteInto).enabled);
+        assert!(!find(&build_menu(&folder(), false), MenuAction::PasteInto).enabled);
+        assert!(!has(&build_menu(&files(1), true), MenuAction::PasteInto));
+    }
+
+    #[test]
+    fn single_files_can_be_previewed_but_folders_cannot() {
+        assert!(has(&build_menu(&files(1), false), MenuAction::Preview));
+        assert!(!has(&build_menu(&folder(), false), MenuAction::Preview));
+        assert!(!has(&build_menu(&files(2), false), MenuAction::Preview));
+    }
+
+    #[test]
+    fn background_menu_pastes_only_with_a_clipboard() {
         let empty = build_menu(&MenuTarget::Background, false);
-        assert_eq!(labels(&empty)[0], "New Folder");
         assert!(!find(&empty, MenuAction::Paste).enabled);
-        let full = build_menu(&MenuTarget::Background, true);
-        assert!(find(&full, MenuAction::Paste).enabled);
+        assert!(
+            find(
+                &build_menu(&MenuTarget::Background, true),
+                MenuAction::Paste
+            )
+            .enabled
+        );
+        assert!(has(&empty, MenuAction::NewFolder));
     }
 
     #[test]
     fn no_menu_starts_or_ends_with_a_separator_or_doubles_one() {
-        let targets = [
-            MenuTarget::Background,
-            file(1, "a"),
-            file(2, "a"),
-            MenuTarget::Items {
-                count: 1,
-                name: "d".into(),
-                is_dir: true,
-            },
-        ];
-        for target in targets {
+        for target in [MenuTarget::Background, files(1), files(2), folder()] {
             let items = build_menu(&target, true);
             assert_ne!(items.first(), Some(&MenuItem::Separator));
             assert_ne!(items.last(), Some(&MenuItem::Separator));
@@ -262,19 +270,11 @@ mod tests {
     }
 
     #[test]
-    fn long_names_are_shortened() {
-        let name = "a-very-long-file-name-that-keeps-going.txt";
-        let shown = subject(1, name);
-        assert!(shown.chars().count() <= 26, "{shown}");
-        assert!(shown.contains('…'));
-    }
-
-    #[test]
     fn menu_height_counts_rows_separators_and_padding() {
         let items = vec![
             action(MenuAction::Open, "Open", None, true),
             MenuItem::Separator,
-            action(MenuAction::Trash, "Trash", None, true),
+            action(MenuAction::Delete, "Delete", None, true),
         ];
         assert_eq!(
             menu_height(&items),

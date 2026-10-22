@@ -86,10 +86,11 @@ compile once at first launch.
 | `F5` / `F6` | copy / move to the other pane |
 | `⌘⌫` | move to trash (recoverable) |
 | `⌘⇧N` / `shift-R` | new folder / rename |
-| `⌘O` / `⌘I` | open / get info |
-| `⌘C` / `⌘V` | copy / paste item (pasting into the same folder duplicates) |
-| `⌘D` / `⌘L` | duplicate / make alias |
-| right-click | Finder-style menu: open, trash, rename, compress, quick look, copy … |
+| `⌘X` / `⌘C` / `⌘V` | cut / copy / paste, Explorer-style: cut + paste moves, copy + paste in the same folder makes `name - Copy`; `esc` cancels a cut |
+| `Del` / `⌘⌫` | delete (to the trash) |
+| `F2` / `⌥↵` / `⌘O` | rename / properties / open |
+| `⇧⌘C` | copy as path |
+| right-click | Explorer-style menu: open, compress to ZIP, cut, copy, paste, create shortcut, delete, rename, properties |
 | `⌘T` / `⌘W` | new / close tab |
 | `⌘J` | task panel |
 | `s` | cycle sort column |
@@ -113,7 +114,7 @@ compile once at first launch.
 ## Tests
 
 ```sh
-cargo test              # 231 tests, no GPU or window server needed
+cargo test              # 241 tests, no GPU or window server needed
 cargo test -p vfs-core  # 143 core tests
 ```
 
