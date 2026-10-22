@@ -345,9 +345,9 @@ pub fn render_preview(
         .w(px(340.0))
         .flex_shrink_0()
         .h_full()
-        .bg(theme::BG)
+        .bg(theme::bg())
         .border_l_1()
-        .border_color(theme::BORDER)
+        .border_color(theme::border())
         .child(header)
         .child(body)
         .into_any_element()
@@ -356,11 +356,11 @@ pub fn render_preview(
 fn render_header(entry: Option<&FileEntry>, content: &PreviewContent) -> AnyElement {
     let name = entry.map(|entry| entry.name.clone()).unwrap_or_default();
     let (icon, tint) = match content {
-        PreviewContent::Directory { .. } => (icons::FOLDER, theme::BLUE),
-        PreviewContent::Image { .. } => (icons::FILE, theme::GREEN),
+        PreviewContent::Directory { .. } => (icons::FOLDER, theme::blue()),
+        PreviewContent::Image { .. } => (icons::FILE, theme::green()),
         _ => (
             icons::FILE,
-            entry.map(theme::kind_color).unwrap_or(theme::TEXT_FAINT),
+            entry.map(theme::kind_color).unwrap_or(theme::text_faint()),
         ),
     };
 
@@ -385,7 +385,7 @@ fn render_header(entry: Option<&FileEntry>, content: &PreviewContent) -> AnyElem
         .px_3()
         .py_2()
         .border_b_1()
-        .border_color(theme::BORDER_SOFT)
+        .border_color(theme::border_soft())
         .child(
             div()
                 .flex()
@@ -403,7 +403,7 @@ fn render_header(entry: Option<&FileEntry>, content: &PreviewContent) -> AnyElem
                 .child(
                     div()
                         .text_sm()
-                        .text_color(theme::TEXT)
+                        .text_color(theme::text())
                         .truncate()
                         .min_w_0()
                         .child(name),
@@ -412,7 +412,7 @@ fn render_header(entry: Option<&FileEntry>, content: &PreviewContent) -> AnyElem
         .child(
             div()
                 .text_xs()
-                .text_color(theme::TEXT_FAINT)
+                .text_color(theme::text_faint())
                 .child(details.join(" · ")),
         )
         .into_any_element()
@@ -433,12 +433,12 @@ fn empty_state() -> AnyElement {
                 .path(icons::EYE)
                 .w(px(22.))
                 .h(px(22.))
-                .text_color(theme::TEXT_FAINT),
+                .text_color(theme::text_faint()),
         )
         .child(
             div()
                 .text_xs()
-                .text_color(theme::TEXT_FAINT)
+                .text_color(theme::text_faint())
                 .child("Select a file and press Space"),
         )
         .child(
@@ -462,16 +462,16 @@ fn shortcut_row(key: &str, label: &str) -> AnyElement {
             div()
                 .px_1()
                 .rounded_sm()
-                .bg(theme::BG_RAISED)
+                .bg(theme::bg_raised())
                 .text_xs()
-                .text_color(theme::TEXT_MUTED)
+                .text_color(theme::text_muted())
                 .font_family(theme::MONO_FAMILY)
                 .child(key.to_string()),
         )
         .child(
             div()
                 .text_xs()
-                .text_color(theme::TEXT_FAINT)
+                .text_color(theme::text_faint())
                 .child(label.to_string()),
         )
         .into_any_element()
@@ -487,7 +487,7 @@ fn loading_state(name: &str) -> AnyElement {
         .child(
             div()
                 .text_xs()
-                .text_color(theme::TEXT_FAINT)
+                .text_color(theme::text_faint())
                 .child(format!("Loading {name}…")),
         )
         .into_any_element()
@@ -521,7 +521,7 @@ fn text_state(lines: &[String], truncated: bool) -> AnyElement {
                                 .pr_2()
                                 .flex()
                                 .justify_end()
-                                .text_color(theme::TEXT_FAINT)
+                                .text_color(theme::text_faint())
                                 .child(number.to_string()),
                         )
                         .child(
@@ -529,7 +529,7 @@ fn text_state(lines: &[String], truncated: bool) -> AnyElement {
                                 .flex_1()
                                 .min_w_0()
                                 .whitespace_nowrap()
-                                .text_color(theme::TEXT)
+                                .text_color(theme::text())
                                 .child(line.clone()),
                         )
                 }))
@@ -538,7 +538,7 @@ fn text_state(lines: &[String], truncated: bool) -> AnyElement {
                         div()
                             .mt_2()
                             .text_xs()
-                            .text_color(theme::TEXT_FAINT)
+                            .text_color(theme::text_faint())
                             .child("… truncated preview"),
                     )
                 }),
@@ -568,7 +568,7 @@ fn binary_state(size: u64) -> AnyElement {
         icons::FILE,
         "Binary file",
         &format!("{} · no text preview", format_size(size)),
-        theme::TEXT_FAINT,
+        theme::text_faint(),
     )
 }
 
@@ -577,12 +577,12 @@ fn directory_state(children: usize) -> AnyElement {
         icons::FOLDER,
         "Folder",
         &format!("{children} items inside"),
-        theme::BLUE,
+        theme::blue(),
     )
 }
 
 fn error_state(message: &str) -> AnyElement {
-    centered_hint(icons::CLOSE, "Cannot preview", message, theme::RED)
+    centered_hint(icons::CLOSE, "Cannot preview", message, theme::red())
 }
 
 fn centered_hint(icon: &'static str, title: &str, detail: &str, tint: Hsla) -> AnyElement {
@@ -599,14 +599,14 @@ fn centered_hint(icon: &'static str, title: &str, detail: &str, tint: Hsla) -> A
         .child(
             div()
                 .text_sm()
-                .text_color(theme::TEXT_MUTED)
+                .text_color(theme::text_muted())
                 .child(title.to_string()),
         )
         .child(
             div()
                 .text_xs()
                 .max_w(px(260.))
-                .text_color(theme::TEXT_FAINT)
+                .text_color(theme::text_faint())
                 .child(detail.to_string()),
         )
         .into_any_element()

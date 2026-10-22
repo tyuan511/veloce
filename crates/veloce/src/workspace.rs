@@ -15,12 +15,12 @@ use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent,
     MouseButton, Render, Subscription, Window, div, prelude::*, px, svg,
 };
-use vfs_core::{FsWatcher, VfsUri, WatchEvent, ops::TaskManager};
+use vfs_core::{FsWatcher, VfsUri, WatchEvent};
 
 use crate::{
     actions::*,
     icons,
-    listing::expand_home,
+    listing::{Place, expand_home, favorite_places, place_is_current},
     palette::{Palette, PaletteChoice, PaletteEvent, PaletteMode},
     pane::{Pane, PaneEvent, PaneSide, Services},
     preview::PreviewView,
@@ -44,6 +44,8 @@ pub struct Workspace {
     pub tasks: Entity<TaskPanel>,
     pub palette: Entity<Palette>,
     pub tasks_open: bool,
+    /// Finder-style shortcuts down the left edge.
+    places: Vec<Place>,
     /// Inline name prompt shown over the list (new folder / rename).
     pub(crate) prompt: Option<(InlinePrompt, Entity<TextInput>)>,
     focus_handle: FocusHandle,
@@ -52,7 +54,6 @@ pub struct Workspace {
     subscriptions: Vec<Subscription>,
     /// Last error surfaced to the user (transient banner).
     banner: Option<(String, std::time::Instant)>,
-    pub(crate) task_manager: Arc<TaskManager>,
 }
 
 impl EventEmitter<()> for Workspace {}
@@ -66,11 +67,11 @@ impl Focusable for Workspace {
 impl Workspace {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let services = Services::new();
-        let task_manager = services.tasks.clone();
 
-        let home = std::env::var_os("HOME")
+        let home_dir = std::env::var_os("HOME")
             .map(PathBuf::from)
             .unwrap_or_else(|| PathBuf::from("/"));
+        let home = home_dir.clone();
         let start = std::env::args()
             .nth(1)
             .map(|arg| expand_home(&arg))
@@ -83,7 +84,7 @@ impl Workspace {
             cx.new(|cx| Pane::new(PaneSide::Right, VfsUri::local(&start), services.clone(), cx));
 
         let preview = cx.new(PreviewView::new);
-        let tasks = cx.new(|cx| TaskPanel::new(task_manager.clone(), cx));
+        let tasks = cx.new(|cx| TaskPanel::new(services.tasks.clone(), cx));
         let palette = cx.new(Palette::new);
 
         let mut workspace = Self {
@@ -94,13 +95,13 @@ impl Workspace {
             tasks,
             palette: palette.clone(),
             tasks_open: false,
+            places: favorite_places(&home_dir),
             prompt: None,
             focus_handle: cx.focus_handle(),
             watcher: None,
             watched_dir: None,
             subscriptions: Vec::new(),
             banner: None,
-            task_manager,
         };
 
         workspace.subscriptions = workspace.wire(cx);
@@ -109,6 +110,14 @@ impl Workspace {
 
     /// Load both panes and start watching the focused one.
     pub fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Follow the OS light/dark setting, now and whenever it flips.
+        theme::set_appearance(window.appearance());
+        self.subscriptions
+            .push(window.observe_window_appearance(|window, _cx| {
+                if theme::set_appearance(window.appearance()) {
+                    window.refresh();
+                }
+            }));
         self.left.update(cx, |pane, cx| pane.reload(cx));
         self.right.update(cx, |pane, cx| pane.reload(cx));
         self.sync_preview(cx);
@@ -693,9 +702,7 @@ impl Render for Workspace {
         let tasks = self.tasks.clone();
         let tasks_open = self.tasks_open;
         let palette = self.palette.clone();
-        let active_tasks = self.tasks.read(cx).active_count();
-
-        let status = self.render_status_bar(active_tasks, cx);
+        let sidebar = self.render_sidebar(cx);
 
         div()
             .key_context("Workspace")
@@ -738,8 +745,8 @@ impl Render for Workspace {
             .flex()
             .flex_col()
             .size_full()
-            .bg(theme::BG)
-            .text_color(theme::TEXT)
+            .bg(theme::bg())
+            .text_color(theme::text())
             .child(self.render_title_bar(cx))
             .child(
                 div()
@@ -747,15 +754,15 @@ impl Render for Workspace {
                     .flex_row()
                     .flex_1()
                     .min_h_0()
+                    .child(sidebar)
                     .child(left)
-                    .child(div().w(px(1.)).flex_shrink_0().bg(theme::BORDER))
+                    .child(div().w(px(1.)).flex_shrink_0().bg(theme::border()))
                     .child(right)
                     .children(preview.map(|preview| preview.into_any_element())),
             )
             .when(tasks_open, |this| {
-                this.child(div().h(px(1.)).bg(theme::BORDER)).child(tasks)
+                this.child(div().h(px(1.)).bg(theme::border())).child(tasks)
             })
-            .child(status)
             .when_some(prompt, |this, (title, input)| {
                 this.child(render_prompt(title, input, cx))
             })
@@ -765,164 +772,211 @@ impl Render for Workspace {
 }
 
 impl Workspace {
+    /// Unified toolbar, as in Finder: window controls on the left, one search
+    /// field in the middle, view toggles on the right. The path lives in the
+    /// panes' breadcrumbs, so it is not repeated here.
     fn render_title_bar(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let focused_pane = self.focused_pane();
-        let path = focused_pane.read(cx).current_uri().path.clone();
         let active_tasks = self.tasks.read(cx).active_count();
         let tasks_open = self.tasks_open;
+        let preview_open = self.focused_pane().read(cx).preview_open;
         let entity = cx.entity();
 
-        let tasks_button = {
-            let entity = entity.clone();
-            div()
-                .id("titlebar-tasks")
-                .flex()
-                .flex_row()
-                .items_center()
-                .gap_1()
-                .h(px(20.))
-                .px_2()
-                .rounded_sm()
-                .when(tasks_open, |this| this.bg(theme::BG_RAISED))
-                .text_color(if active_tasks > 0 {
-                    theme::ACCENT
-                } else {
-                    theme::TEXT_FAINT
-                })
-                .hover(|this| this.bg(theme::BG_HOVER).text_color(theme::TEXT))
-                .on_click(move |_, _, cx| {
-                    entity.update(cx, |workspace, cx| {
-                        workspace.tasks_open = !workspace.tasks_open;
-                        let tasks = workspace.tasks.clone();
-                        tasks.update(cx, |panel, cx| panel.toggle(cx));
-                        cx.notify();
-                    });
-                })
-                .child(svg().path(icons::TASKS).w(px(11.)).h(px(11.)))
-                .when(active_tasks > 0, |this| {
-                    this.child(
-                        div()
-                            .text_xs()
-                            .text_color(theme::ACCENT)
-                            .child(active_tasks.to_string()),
-                    )
-                })
-        };
-
-        let palette_button = {
+        let search = {
             let entity = entity.clone();
             div()
                 .id("titlebar-palette")
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap_1()
-                .h(px(20.))
+                .gap_2()
+                .w(px(300.))
+                .h(px(24.))
                 .px_2()
-                .rounded_sm()
-                .text_color(theme::TEXT_FAINT)
-                .hover(|this| this.bg(theme::BG_HOVER).text_color(theme::TEXT))
+                .rounded_md()
+                .bg(theme::bg_raised())
+                .text_color(theme::text_faint())
+                .hover(|this| this.bg(theme::bg_hover()).text_color(theme::text_muted()))
                 .on_click(move |_, window, cx| {
                     entity.update(cx, |workspace, cx| {
                         workspace.open_palette(PaletteMode::Files, window, cx);
                     });
                 })
-                .child(svg().path(icons::SEARCH).w(px(11.)).h(px(11.)))
+                .child(svg().path(icons::SEARCH).w(px(12.)).h(px(12.)))
+                .child(div().flex_1().text_sm().child("Search"))
                 .child(div().text_xs().child("⌘P"))
+        };
+
+        let preview_button = {
+            let entity = entity.clone();
+            toolbar_button("titlebar-preview", icons::EYE, preview_open, theme::accent()).on_click(
+                move |_, _, cx| {
+                    entity.update(cx, |workspace, cx| {
+                        let pane = workspace.focused_pane();
+                        pane.update(cx, |pane, cx| pane.toggle_preview(cx));
+                        cx.notify();
+                    });
+                },
+            )
+        };
+
+        let tasks_button = {
+            let entity = entity.clone();
+            toolbar_button(
+                "titlebar-tasks",
+                icons::TASKS,
+                tasks_open || active_tasks > 0,
+                theme::accent(),
+            )
+            .on_click(move |_, _, cx| {
+                entity.update(cx, |workspace, cx| {
+                    workspace.tasks_open = !workspace.tasks_open;
+                    let tasks = workspace.tasks.clone();
+                    tasks.update(cx, |panel, cx| panel.toggle(cx));
+                    cx.notify();
+                });
+            })
+            .when(active_tasks > 0, |this| {
+                this.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::accent())
+                        .child(active_tasks.to_string()),
+                )
+            })
         };
 
         div()
             .flex()
             .flex_row()
             .items_center()
-            .justify_between()
-            .h(px(34.0))
+            .h(px(38.0))
             .flex_shrink_0()
             .pl(px(84.0))
             .pr_3()
-            .bg(theme::BG)
+            .bg(theme::bg())
             .border_b_1()
-            .border_color(theme::BORDER_SOFT)
+            .border_color(theme::border_soft())
+            .child(div().flex_1())
+            .child(search)
             .child(
                 div()
+                    .flex_1()
                     .flex()
                     .flex_row()
                     .items_center()
-                    .gap_2()
-                    .min_w_0()
-                    .child(div().text_sm().text_color(theme::TEXT).child("Veloce"))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme::TEXT_FAINT)
-                            .font_family(theme::MONO_FAMILY)
-                            .truncate()
-                            .min_w_0()
-                            .child(path),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
+                    .justify_end()
                     .gap_1()
-                    .child(palette_button)
+                    .child(preview_button)
                     .child(tasks_button),
             )
             .into_any_element()
     }
 
-    fn render_status_bar(&mut self, active_tasks: usize, cx: &mut Context<Self>) -> AnyElement {
-        let _ = cx;
-        let focused = self.focused;
-        let pane_label = match focused {
-            PaneSide::Left => "left",
-            PaneSide::Right => "right",
-        };
-        let manager = self.task_manager.clone();
-        let _ = manager;
+    /// Favorites list. Clicking navigates whichever pane has focus, which is
+    /// the dual-pane analogue of Finder's single content area.
+    fn render_sidebar(&mut self, cx: &mut Context<Self>) -> AnyElement {
+        let current = self.focused_pane().read(cx).current_uri().path.clone();
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .px_2()
+            .child(
+                div()
+                    .px_2()
+                    .pb_1()
+                    .text_xs()
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .text_color(theme::text_faint())
+                    .child("Favorites"),
+            );
+
+        for (index, place) in self.places.iter().enumerate() {
+            let active = place_is_current(place, &current);
+            let target = place.path.clone();
+            let entity = cx.entity();
+            list = list.child(
+                div()
+                    .id(gpui::ElementId::Name(format!("place-{index}").into()))
+                    .flex()
+                    .flex_row()
+                    .items_center()
+                    .gap_2()
+                    .h(px(26.))
+                    .px_2()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .text_sm()
+                    .when(active, |this| {
+                        this.bg(theme::bg_hover()).text_color(theme::text())
+                    })
+                    .when(!active, |this| {
+                        this.text_color(theme::text_muted())
+                            .hover(|this| this.bg(theme::bg_raised()).text_color(theme::text()))
+                    })
+                    .on_click(move |_, window, cx| {
+                        let target = target.clone();
+                        entity.update(cx, |workspace, cx| {
+                            let side = workspace.focused;
+                            workspace.pane(side).update(cx, |pane, cx| {
+                                pane.navigate_to(VfsUri::local(&target), cx)
+                            });
+                            workspace.focus_pane(side, window, cx);
+                        });
+                    })
+                    .child(
+                        svg()
+                            .path(place.icon)
+                            .w(px(15.))
+                            .h(px(15.))
+                            .flex_shrink_0()
+                            .text_color(if active {
+                                theme::accent()
+                            } else {
+                                theme::text_faint()
+                            }),
+                    )
+                    .child(div().truncate().min_w_0().child(place.label)),
+            );
+        }
 
         div()
             .flex()
-            .flex_row()
-            .items_center()
-            .justify_between()
-            .h(px(theme::STATUS_HEIGHT))
+            .flex_col()
+            .w(px(theme::SIDEBAR_WIDTH))
+            .h_full()
             .flex_shrink_0()
-            .px_3()
-            .bg(theme::BG)
-            .border_t_1()
-            .border_color(theme::BORDER_SOFT)
-            .text_xs()
-            .text_color(theme::TEXT_FAINT)
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .child(format!("focus: {pane_label}"))
-                    .child("·")
-                    .child("j/k move · h/l up/open · / filter · ⌘P jump · space preview"),
-            )
-            .child(
-                div()
-                    .flex()
-                    .flex_row()
-                    .items_center()
-                    .gap_2()
-                    .when(active_tasks > 0, |this| {
-                        this.child(
-                            div()
-                                .text_color(theme::ACCENT)
-                                .child(format!("{active_tasks} task(s)")),
-                        )
-                    })
-                    .child("local"),
-            )
+            .pt_3()
+            .bg(theme::bg())
+            .border_r_1()
+            .border_color(theme::border_soft())
+            .child(list)
             .into_any_element()
     }
+}
+
+/// A square icon button for the toolbar; the caller attaches `on_click`.
+fn toolbar_button(
+    id: &'static str,
+    icon: &'static str,
+    active: bool,
+    active_color: gpui::Hsla,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap_1()
+        .h(px(24.))
+        .min_w(px(28.))
+        .px_1()
+        .rounded_md()
+        .when(active, |this| this.bg(theme::bg_raised()))
+        .text_color(if active { active_color } else { theme::text_muted() })
+        .hover(|this| this.bg(theme::bg_hover()).text_color(theme::text()))
+        .child(svg().path(icon).w(px(14.)).h(px(14.)))
 }
 
 fn render_prompt(
@@ -948,14 +1002,14 @@ fn render_prompt(
                 .gap_2()
                 .p_3()
                 .rounded_lg()
-                .bg(theme::BG_RAISED)
+                .bg(theme::bg_raised())
                 .border_1()
-                .border_color(theme::BORDER)
+                .border_color(theme::border())
                 .shadow_lg()
                 .child(
                     div()
                         .text_xs()
-                        .text_color(theme::TEXT_MUTED)
+                        .text_color(theme::text_muted())
                         .child(title.to_string()),
                 )
                 .child(
@@ -965,15 +1019,15 @@ fn render_prompt(
                         .h(px(26.))
                         .px_2()
                         .rounded_sm()
-                        .bg(theme::BG)
+                        .bg(theme::bg())
                         .border_1()
-                        .border_color(theme::ACCENT_DIM)
+                        .border_color(theme::accent_dim())
                         .child(input),
                 )
                 .child(
                     div()
                         .text_xs()
-                        .text_color(theme::TEXT_FAINT)
+                        .text_color(theme::text_faint())
                         .child("enter to confirm · esc to cancel"),
                 ),
         )
@@ -994,7 +1048,7 @@ fn render_banner(message: &str) -> AnyElement {
                 .px_3()
                 .py_2()
                 .rounded_md()
-                .bg(theme::RED)
+                .bg(theme::red())
                 .text_color(gpui::white())
                 .text_xs()
                 .child(message.to_string()),

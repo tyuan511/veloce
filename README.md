@@ -33,13 +33,13 @@ crates/
     ops.rs           TaskManager: background copy/move/trash with progress
   veloce/            GPUI front-end
     listing.rs       pure list logic: sort/filter/cursor/selection/path parsing
-    workspace.rs     two panes + inspector + task panel + palette, all actions
+    workspace.rs     sidebar + two panes + inspector + task panel + palette, all actions
     pane.rs          one pane: tabs, virtual list, path bar, file ops
     preview.rs       Space-to-preview: bounded head read, images, folders
     palette.rs       ⌘P fuzzy jump / ⌘⇧P commands
     tasks_panel.rs   transfer progress, cancellation
     text_input.rs    IME-correct single-line field (EntityInputHandler)
-    theme.rs         one dark palette, one accent
+    theme.rs         light/dark palettes following the OS, one accent
 ```
 
 The split is deliberate: `vfs-core` never imports `gpui`, so the same core can back a
@@ -57,6 +57,7 @@ directly, and OpenDAL will back only the remote schemes (milestone 3).
 Requires macOS or Linux, Rust 1.90+, and Xcode command line tools.
 
 ```sh
+cargo dev [dir]                    # debug build + launch the GUI
 cargo build --release
 ./target/release/veloce ~/code     # opens both panes in that directory
 ```
@@ -107,7 +108,7 @@ compile once at first launch.
 ## Tests
 
 ```sh
-cargo test              # 193 tests, no GPU or window server needed
+cargo test              # 203 tests, no GPU or window server needed
 cargo test -p vfs-core  # 136 core tests
 ```
 
@@ -130,3 +131,8 @@ and the theme's contrast and layout invariants (asserted at compile time).
 - **M4** — multi-rename with regex preview, directory diff & sync, embedded SSH terminal.
 
 See `docs/research.md` for the full product and engineering analysis.
+
+## Credits
+
+Icons are from [Lucide](https://lucide.dev) (ISC); the license is kept in
+`crates/veloce/assets/icons/LICENSE-lucide.txt`.

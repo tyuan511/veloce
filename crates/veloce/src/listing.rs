@@ -304,10 +304,163 @@ pub fn parse_path_input(value: &str, current: &VfsUri) -> Option<VfsUri> {
     Some(VfsUri::local(resolved))
 }
 
+/// One clickable segment of the breadcrumb: what to show and where it leads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Crumb {
+    pub label: String,
+    pub path: String,
+}
+
+/// Split an absolute path into breadcrumb segments, root first.
+///
+/// The root is labelled `/` so the trail never starts empty; `trailing` and
+/// duplicate slashes are ignored because they carry no navigation meaning.
+pub fn breadcrumbs(path: &str) -> Vec<Crumb> {
+    let mut crumbs = vec![Crumb {
+        label: "/".to_string(),
+        path: "/".to_string(),
+    }];
+    let mut accumulated = String::new();
+    for part in path.split('/').filter(|part| !part.is_empty()) {
+        accumulated.push('/');
+        accumulated.push_str(part);
+        crumbs.push(Crumb {
+            label: part.to_string(),
+            path: accumulated.clone(),
+        });
+    }
+    crumbs
+}
+
+/// Keep only the trailing `max` crumbs so a deep path still fits the toolbar.
+/// Returns the visible slice and whether anything was cut off on the left.
+pub fn visible_crumbs(crumbs: &[Crumb], max: usize) -> (&[Crumb], bool) {
+    let max = max.max(1);
+    if crumbs.len() <= max {
+        (crumbs, false)
+    } else {
+        (&crumbs[crumbs.len() - max..], true)
+    }
+}
+
+/// A fixed shortcut in the sidebar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Place {
+    pub label: &'static str,
+    pub path: PathBuf,
+    pub icon: &'static str,
+}
+
+/// The Finder-style "Favorites" list rooted at the user's home directory.
+///
+/// Existence is deliberately not probed here (that would be file I/O on the UI
+/// thread); a missing folder just shows the pane's normal load error.
+pub fn favorite_places(home: &std::path::Path) -> Vec<Place> {
+    use crate::icons;
+    vec![
+        Place {
+            label: "Home",
+            path: home.to_path_buf(),
+            icon: icons::HOME,
+        },
+        Place {
+            label: "Desktop",
+            path: home.join("Desktop"),
+            icon: icons::DESKTOP,
+        },
+        Place {
+            label: "Documents",
+            path: home.join("Documents"),
+            icon: icons::FILE,
+        },
+        Place {
+            label: "Downloads",
+            path: home.join("Downloads"),
+            icon: icons::DOWNLOAD,
+        },
+        Place {
+            label: "Macintosh HD",
+            path: PathBuf::from("/"),
+            icon: icons::DISK,
+        },
+    ]
+}
+
+/// Whether `place` is the sidebar entry that matches `current` exactly.
+pub fn place_is_current(place: &Place, current: &str) -> bool {
+    let current = current.trim_end_matches('/');
+    let place_path = place.path.to_string_lossy();
+    let place_path = place_path.trim_end_matches('/');
+    place_path == current
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use vfs_core::{FileKind, SortKey, filter::FilterMode};
+
+    #[test]
+    fn breadcrumbs_start_at_root_and_accumulate_paths() {
+        let crumbs = breadcrumbs("/Users/me/code");
+        let labels: Vec<&str> = crumbs.iter().map(|c| c.label.as_str()).collect();
+        assert_eq!(labels, ["/", "Users", "me", "code"]);
+        assert_eq!(crumbs[3].path, "/Users/me/code");
+        assert_eq!(crumbs[1].path, "/Users");
+    }
+
+    #[test]
+    fn breadcrumbs_of_root_is_just_root() {
+        assert_eq!(breadcrumbs("/").len(), 1);
+        assert_eq!(breadcrumbs("").len(), 1);
+    }
+
+    #[test]
+    fn breadcrumbs_ignore_duplicate_and_trailing_slashes() {
+        let crumbs = breadcrumbs("//a///b/");
+        let paths: Vec<&str> = crumbs.iter().map(|c| c.path.as_str()).collect();
+        assert_eq!(paths, ["/", "/a", "/a/b"]);
+    }
+
+    #[test]
+    fn visible_crumbs_keeps_the_tail_and_reports_truncation() {
+        let crumbs = breadcrumbs("/a/b/c/d");
+        let (tail, cut) = visible_crumbs(&crumbs, 2);
+        assert!(cut);
+        assert_eq!(tail.len(), 2);
+        assert_eq!(tail[1].label, "d");
+
+        let (all, cut) = visible_crumbs(&crumbs, 10);
+        assert!(!cut);
+        assert_eq!(all.len(), crumbs.len());
+    }
+
+    #[test]
+    fn visible_crumbs_never_returns_nothing() {
+        let crumbs = breadcrumbs("/a/b");
+        let (tail, _) = visible_crumbs(&crumbs, 0);
+        assert_eq!(tail.len(), 1);
+    }
+
+    #[test]
+    fn favorite_places_hang_off_home_and_end_with_root() {
+        let places = favorite_places(std::path::Path::new("/Users/me"));
+        assert_eq!(places[0].path, PathBuf::from("/Users/me"));
+        assert!(
+            places
+                .iter()
+                .any(|p| p.path == std::path::Path::new("/Users/me/Downloads"))
+        );
+        assert_eq!(places.last().unwrap().path, PathBuf::from("/"));
+    }
+
+    #[test]
+    fn place_matches_current_ignoring_trailing_slash() {
+        let places = favorite_places(std::path::Path::new("/Users/me"));
+        assert!(place_is_current(&places[0], "/Users/me/"));
+        assert!(!place_is_current(&places[0], "/Users/me/Desktop"));
+        let root = places.last().unwrap();
+        assert!(place_is_current(root, "/"));
+    }
 
     fn entry(name: &str, size: u64, dir: bool) -> FileEntry {
         let mut entry = FileEntry::new(

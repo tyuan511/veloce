@@ -19,14 +19,16 @@ use gpui::{
     Subscription, UniformListScrollHandle, Window, div, prelude::*, px, svg, uniform_list,
 };
 use vfs_core::{
-    FileEntry, FileKind, Filter, LocalProvider, SortKey, SortSpec, VfsProvider, VfsUri,
+    FileEntry, Filter, LocalProvider, SortKey, SortSpec, VfsProvider, VfsUri,
     entry::{format_relative, format_size},
     ops::{ConflictPolicy, TaskManager},
 };
 
 use crate::{
     icons,
-    listing::{Listing, cycle_index, index_after_close, parse_path_input},
+    listing::{
+        Listing, breadcrumbs, cycle_index, index_after_close, parse_path_input, visible_crumbs,
+    },
     text_input::{TextInput, TextInputEvent},
     theme::{self, ROW_HEIGHT},
 };
@@ -34,8 +36,8 @@ use crate::{
 /// Icon / size / time column widths, shared by the header and every row so they
 /// cannot drift apart.
 pub const ICON_WIDTH: f32 = 22.0;
-pub const SIZE_WIDTH: f32 = 92.0;
-pub const TIME_WIDTH: f32 = 132.0;
+pub const SIZE_WIDTH: f32 = 84.0;
+pub const TIME_WIDTH: f32 = 128.0;
 
 /// Rows moved by a page-down / page-up.
 const PAGE_ROWS: isize = 15;
@@ -668,7 +670,8 @@ impl Pane {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let tabs = self.render_tabs(focused, cx);
+        // Finder only shows the tab strip once there is more than one tab.
+        let tabs = (self.tabs.len() > 1).then(|| self.render_tabs(focused, cx));
         let path_bar = self.render_path_bar(focused, window, cx);
         let filter_bar = self.filter_active.then(|| self.render_filter_bar(cx));
         let header = self.render_header(cx);
@@ -681,11 +684,15 @@ impl Pane {
             .flex_1()
             .min_w_0()
             .h_full()
-            .bg(theme::BG_PANE)
-            .when(focused, |this| {
-                this.border_t_1().border_color(theme::ACCENT_DIM)
+            .bg(theme::bg_pane())
+            // Always reserve the 2px so focus changes never shift the layout.
+            .border_t_2()
+            .border_color(if focused {
+                theme::accent_dim()
+            } else {
+                Hsla::transparent_black()
             })
-            .child(tabs)
+            .children(tabs)
             .child(path_bar)
             .children(filter_bar)
             .child(header)
@@ -702,9 +709,9 @@ impl Pane {
             .items_center()
             .h(px(30.0))
             .flex_shrink_0()
-            .bg(theme::BG)
+            .bg(theme::bg())
             .border_b_1()
-            .border_color(theme::BORDER_SOFT)
+            .border_color(theme::border_soft())
             .pl_1();
 
         for (index, tab) in self.tabs.iter().enumerate() {
@@ -724,14 +731,14 @@ impl Pane {
                 .max_w(px(180.0))
                 .rounded_md()
                 .when(active, |this| {
-                    this.bg(theme::BG_PANE)
-                        .text_color(theme::TEXT)
+                    this.bg(theme::bg_pane())
+                        .text_color(theme::text())
                         .when(focused, |this| {
-                            this.border_b_1().border_color(theme::ACCENT)
+                            this.border_b_1().border_color(theme::accent())
                         })
                 })
-                .when(!active, |this| this.text_color(theme::TEXT_MUTED))
-                .hover(|this| this.bg(theme::BG_HOVER))
+                .when(!active, |this| this.text_color(theme::text_muted()))
+                .hover(|this| this.bg(theme::bg_hover()))
                 .on_click(move |_, _, cx| {
                     entity.update(cx, |pane, cx| pane.select_tab(index, cx));
                 })
@@ -742,9 +749,9 @@ impl Pane {
                         .h(px(12.))
                         .flex_shrink_0()
                         .text_color(if active {
-                            theme::BLUE
+                            theme::blue()
                         } else {
-                            theme::TEXT_FAINT
+                            theme::text_faint()
                         }),
                 )
                 .child(div().text_xs().truncate().min_w_0().child(title));
@@ -762,8 +769,8 @@ impl Pane {
                         .w(px(14.))
                         .h(px(14.))
                         .rounded_sm()
-                        .text_color(theme::TEXT_FAINT)
-                        .hover(|this| this.bg(theme::BG_RAISED).text_color(theme::TEXT))
+                        .text_color(theme::text_faint())
+                        .hover(|this| this.bg(theme::bg_raised()).text_color(theme::text()))
                         .on_click(move |_, _, cx| {
                             cx.stop_propagation();
                             entity.update(cx, |pane, cx| pane.close_tab(index, cx));
@@ -786,8 +793,8 @@ impl Pane {
                 .w(px(22.))
                 .h(px(20.))
                 .rounded_sm()
-                .text_color(theme::TEXT_FAINT)
-                .hover(|this| this.bg(theme::BG_HOVER).text_color(theme::TEXT))
+                .text_color(theme::text_faint())
+                .hover(|this| this.bg(theme::bg_hover()).text_color(theme::text()))
                 .on_click(move |_, _, cx| {
                     entity.update(cx, |pane, cx| pane.new_tab(cx));
                 })
@@ -817,12 +824,12 @@ impl Pane {
                 .h(px(20.))
                 .rounded_sm()
                 .text_color(if can_go_up {
-                    theme::TEXT_MUTED
+                    theme::text_muted()
                 } else {
-                    theme::TEXT_FAINT
+                    theme::text_faint()
                 })
                 .when(can_go_up, |this| {
-                    this.hover(|this| this.bg(theme::BG_HOVER).text_color(theme::TEXT))
+                    this.hover(|this| this.bg(theme::bg_hover()).text_color(theme::text()))
                         .on_click(move |_, _, cx| {
                             entity.update(cx, |pane, cx| pane.go_parent(cx));
                         })
@@ -839,49 +846,91 @@ impl Pane {
                 .px_2()
                 .h(px(21.))
                 .rounded_sm()
-                .bg(theme::BG)
+                .bg(theme::bg())
                 .border_1()
-                .border_color(theme::ACCENT_DIM)
-                .text_color(theme::TEXT)
+                .border_color(theme::accent_dim())
+                .text_color(theme::text())
                 .child(self.path_input.clone())
                 .into_any_element()
         } else {
             let path_text = self.current_uri().path.clone();
+            let crumbs = breadcrumbs(&path_text);
+            let (shown, cut) = visible_crumbs(&crumbs, 4);
+            let last = shown.len() - 1;
+            let side = self.side.index();
+
+            let mut trail = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .gap_0p5()
+                .min_w_0()
+                .overflow_hidden();
+            if cut {
+                trail = trail.child(
+                    div()
+                        .text_xs()
+                        .text_color(theme::text_faint())
+                        .child("… ›"),
+                );
+            }
+            for (index, crumb) in shown.iter().enumerate() {
+                let entity = cx.entity();
+                let target = crumb.path.clone();
+                let is_last = index == last;
+                if index > 0 {
+                    trail = trail.child(
+                        svg()
+                            .path(icons::CHEVRON_RIGHT)
+                            .w(px(9.))
+                            .h(px(9.))
+                            .flex_shrink_0()
+                            .text_color(theme::text_faint()),
+                    );
+                }
+                trail = trail.child(
+                    div()
+                        .id(gpui::ElementId::Name(
+                            format!("pane{side}-crumb{index}").into(),
+                        ))
+                        .px_1()
+                        .h(px(20.))
+                        .flex()
+                        .items_center()
+                        .flex_shrink_0()
+                        .rounded_sm()
+                        .text_sm()
+                        .text_color(if is_last {
+                            theme::text()
+                        } else {
+                            theme::text_muted()
+                        })
+                        .when(is_last, |this| this.font_weight(gpui::FontWeight::MEDIUM))
+                        .hover(|this| this.bg(theme::bg_hover()).text_color(theme::text()))
+                        .on_click(move |_, _, cx| {
+                            entity.update(cx, |pane, cx| {
+                                pane.navigate_to(VfsUri::local(&target), cx)
+                            });
+                        })
+                        .child(crumb.label.clone()),
+                );
+            }
+
+            // The empty space after the trail opens the editable path, like
+            // clicking beside the breadcrumb in Nautilus / Explorer.
             let entity = cx.entity();
             div()
-                .id(gpui::ElementId::Name(
-                    format!("pane{}-path", self.side.index()).into(),
-                ))
+                .id(gpui::ElementId::Name(format!("pane{side}-path").into()))
                 .flex_1()
                 .min_w_0()
                 .flex()
                 .flex_row()
                 .items_center()
-                .gap_1()
-                .h(px(21.))
-                .px_2()
-                .rounded_sm()
-                .text_color(theme::TEXT_MUTED)
-                .hover(|this| this.bg(theme::BG_HOVER).text_color(theme::TEXT))
+                .h(px(24.))
                 .on_click(move |_, window, cx| {
                     entity.update(cx, |pane, cx| pane.begin_path_edit(window, cx));
                 })
-                .child(
-                    svg()
-                        .path(icons::FOLDER)
-                        .w(px(11.))
-                        .h(px(11.))
-                        .flex_shrink_0()
-                        .text_color(theme::TEXT_FAINT),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .truncate()
-                        .min_w_0()
-                        .font_family(theme::MONO_FAMILY)
-                        .child(path_text),
-                )
+                .child(trail)
                 .into_any_element()
         };
 
@@ -899,11 +948,11 @@ impl Pane {
                 .h(px(20.))
                 .rounded_sm()
                 .text_color(if active {
-                    theme::ACCENT
+                    theme::accent()
                 } else {
-                    theme::TEXT_FAINT
+                    theme::text_faint()
                 })
-                .hover(|this| this.bg(theme::BG_HOVER).text_color(theme::TEXT))
+                .hover(|this| this.bg(theme::bg_hover()).text_color(theme::text()))
                 .on_click(move |_, window, cx| {
                     entity.update(cx, |pane, cx| {
                         if pane.filter_active {
@@ -916,47 +965,21 @@ impl Pane {
                 .child(svg().path(icons::SEARCH).w(px(11.)).h(px(11.)))
         };
 
-        let preview_button = {
-            let entity = cx.entity();
-            let open = self.preview_open;
-            div()
-                .id(gpui::ElementId::Name(
-                    format!("pane{}-preview", self.side.index()).into(),
-                ))
-                .flex()
-                .items_center()
-                .justify_center()
-                .w(px(21.))
-                .h(px(20.))
-                .rounded_sm()
-                .text_color(if open {
-                    theme::ACCENT
-                } else {
-                    theme::TEXT_FAINT
-                })
-                .hover(|this| this.bg(theme::BG_HOVER).text_color(theme::TEXT))
-                .on_click(move |_, _, cx| {
-                    entity.update(cx, |pane, cx| pane.toggle_preview(cx));
-                })
-                .child(svg().path(icons::EYE).w(px(12.)).h(px(12.)))
-        };
-
         let _ = (focused, window);
         div()
             .flex()
             .flex_row()
             .items_center()
             .gap_1()
-            .h(px(31.0))
+            .h(px(34.0))
             .flex_shrink_0()
             .px_2()
-            .bg(theme::BG)
+            .bg(theme::bg_pane())
             .border_b_1()
-            .border_color(theme::BORDER_SOFT)
+            .border_color(theme::border_soft())
             .child(up)
             .child(path_area)
             .child(filter_button)
-            .child(preview_button)
             .into_any_element()
     }
 
@@ -973,23 +996,23 @@ impl Pane {
             .h(px(29.0))
             .flex_shrink_0()
             .px_2()
-            .bg(theme::BG_RAISED)
+            .bg(theme::bg_raised())
             .border_b_1()
-            .border_color(theme::BORDER_SOFT)
+            .border_color(theme::border_soft())
             .child(
                 svg()
                     .path(icons::SEARCH)
                     .w(px(10.))
                     .h(px(10.))
                     .flex_shrink_0()
-                    .text_color(theme::ACCENT),
+                    .text_color(theme::accent()),
             )
             .child(div().flex_1().min_w_0().child(input))
             .child(
                 div()
                     .text_xs()
                     .flex_shrink_0()
-                    .text_color(theme::TEXT_FAINT)
+                    .text_color(theme::text_faint())
                     .child(format!("{matched}/{total}")),
             )
             .into_any_element()
@@ -1001,17 +1024,18 @@ impl Pane {
             .flex()
             .flex_row()
             .items_center()
-            .h(px(21.0))
+            .h(px(22.0))
             .flex_shrink_0()
-            .bg(theme::BG_PANE)
+            .px_1()
+            .bg(theme::bg_pane())
             .border_b_1()
-            .border_color(theme::BORDER_SOFT)
-            .child(div().w(px(ICON_WIDTH + 8.0)).flex_shrink_0());
+            .border_color(theme::border_soft())
+            .child(div().w(px(ICON_WIDTH + 4.0)).flex_shrink_0());
 
         for (key, label, width) in [
             (SortKey::Name, "Name", None),
+            (SortKey::Modified, "Date Modified", Some(TIME_WIDTH)),
             (SortKey::Size, "Size", Some(SIZE_WIDTH)),
-            (SortKey::Modified, "Modified", Some(TIME_WIDTH)),
         ] {
             let active = sort.key == key;
             let arrow = if active {
@@ -1031,14 +1055,14 @@ impl Pane {
                     .px_2()
                     .text_xs()
                     .flex_shrink_0()
-                    .when_some(width, |this, width| this.w(px(width)).justify_end())
+                    .when_some(width, |this, width| this.w(px(width)).justify_start())
                     .when(width.is_none(), |this| this.flex_1().min_w_0())
                     .text_color(if active {
-                        theme::TEXT
+                        theme::text()
                     } else {
-                        theme::TEXT_FAINT
+                        theme::text_faint()
                     })
-                    .hover(|this| this.text_color(theme::TEXT_MUTED))
+                    .hover(|this| this.text_color(theme::text_muted()))
                     .on_click(move |_, _, cx| {
                         entity.update(cx, |pane, cx| pane.sort_by(key, cx));
                     })
@@ -1050,10 +1074,10 @@ impl Pane {
 
     fn render_body(&mut self, focused: bool, cx: &mut Context<Self>) -> AnyElement {
         if let Some(error) = self.error.clone() {
-            return render_message(icons::CLOSE, "Cannot open this folder", &error, theme::RED);
+            return render_message(icons::CLOSE, "Cannot open this folder", &error, theme::red());
         }
         if self.loading && self.listing.entries.is_empty() {
-            return render_message(icons::FOLDER, "Loading…", "", theme::TEXT_MUTED);
+            return render_message(icons::FOLDER, "Loading…", "", theme::text_muted());
         }
         if self.listing.is_empty() {
             let (title, detail) = if self.filter.is_active() {
@@ -1064,7 +1088,7 @@ impl Pane {
             } else {
                 ("This folder is empty".to_string(), String::new())
             };
-            return render_message(icons::FOLDER, &title, &detail, theme::TEXT_FAINT);
+            return render_message(icons::FOLDER, &title, &detail, theme::text_faint());
         }
 
         let count = self.listing.len();
@@ -1096,13 +1120,13 @@ impl Pane {
                                 .visible
                                 .get(position)
                                 .is_some_and(|index| selected.contains(index));
-                            let is_cursor = position == cursor && focused;
+                            let is_cursor = position == cursor;
                             rows.push(render_row(
                                 pane.side.index(),
                                 position,
                                 entry,
-                                is_selected,
-                                is_cursor,
+                                is_selected || is_cursor,
+                                focused,
                                 entity.clone(),
                             ));
                         }
@@ -1116,43 +1140,29 @@ impl Pane {
     }
 
     fn render_status(&self) -> AnyElement {
-        let uri = self.current_uri();
-        let scheme = uri.scheme.to_string();
         div()
             .flex()
             .flex_row()
             .items_center()
-            .justify_between()
+            .justify_center()
+            .gap_2()
             .h(px(theme::STATUS_HEIGHT))
             .flex_shrink_0()
             .px_2()
-            .bg(theme::BG)
+            .bg(theme::bg_pane())
             .border_t_1()
-            .border_color(theme::BORDER_SOFT)
+            .border_color(theme::border_soft())
             .text_xs()
-            .text_color(theme::TEXT_FAINT)
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .child(self.status.clone()),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .flex_shrink_0()
-                    .child(format!("{} · {}", scheme, self.sort.key.label()))
-                    .when(self.filter.is_active(), |this| {
-                        this.child(
-                            div()
-                                .text_color(theme::ACCENT)
-                                .child(format!("filter: {}", self.filter.query())),
-                        )
-                    }),
-            )
+            .text_color(theme::text_faint())
+            .child(div().truncate().min_w_0().child(self.status.clone()))
+            .when(self.filter.is_active(), |this| {
+                this.child(
+                    div()
+                        .flex_shrink_0()
+                        .text_color(theme::accent())
+                        .child(format!("filter: {}", self.filter.query())),
+                )
+            })
             .into_any_element()
     }
 }
@@ -1167,109 +1177,118 @@ fn render_row(
     side: u8,
     position: usize,
     entry: &FileEntry,
-    selected: bool,
-    cursor: bool,
+    highlighted: bool,
+    pane_focused: bool,
     entity: Entity<Pane>,
 ) -> AnyElement {
     let color = theme::kind_color(entry);
     let is_dir = entry.is_dir();
     let name = entry.name.clone();
     let size = if is_dir {
-        "—".to_string()
+        "--".to_string()
     } else {
         format_size(entry.size)
     };
     let modified = format_relative(entry.modified);
-    let icon = if is_dir {
-        icons::FOLDER
-    } else if entry.kind == FileKind::Symlink {
-        icons::LINK
+    let icon = icons::file_icon(entry);
+
+    // Finder semantics: blue highlight in the active pane, grey in the other.
+    let on_accent = highlighted && pane_focused;
+    let highlight = if pane_focused {
+        theme::bg_selected()
     } else {
-        icons::FILE
+        theme::bg_selected_inactive()
     };
 
     let click_entity = entity.clone();
     let right_entity = entity;
 
+    // The outer wrapper provides the 4px gutter so the highlight reads as an
+    // inset rounded bar rather than a full-bleed stripe.
     div()
-        .id(gpui::ElementId::Name(
-            format!("{side}-row-{position}").into(),
-        ))
-        .flex()
-        .flex_row()
-        .items_center()
-        .h(px(ROW_HEIGHT))
         .w_full()
-        .cursor_pointer()
-        .border_l_2()
-        .border_color(if cursor {
-            theme::ACCENT
-        } else {
-            Hsla::transparent_black()
-        })
-        .when(selected, |this| {
-            this.bg(theme::BG_SELECTED).text_color(gpui::white())
-        })
-        .when(!selected, |this| this.text_color(theme::TEXT))
-        .hover(|this| {
-            if selected {
-                this.bg(theme::BG_SELECTED)
-            } else {
-                this.bg(theme::BG_HOVER)
-            }
-        })
-        .on_click(move |event, _, cx| {
-            let shift = event.modifiers().shift;
-            let double = event.click_count() >= 2;
-            click_entity.update(cx, |pane, cx| {
-                pane.set_cursor_position(position, shift, cx);
-                if double {
-                    pane.activate_cursor(cx);
-                }
-            });
-        })
-        .on_mouse_down(MouseButton::Right, move |_, _, cx| {
-            right_entity.update(cx, |pane, cx| {
-                pane.set_cursor_position(position, false, cx);
-            });
-        })
+        .h(px(ROW_HEIGHT))
+        .px_1()
         .child(
             div()
-                .w(px(ICON_WIDTH))
+                .id(gpui::ElementId::Name(
+                    format!("{side}-row-{position}").into(),
+                ))
                 .flex()
+                .flex_row()
                 .items_center()
-                .justify_center()
-                .flex_shrink_0()
+                .size_full()
+                .rounded_md()
+                .cursor_pointer()
+                .when(highlighted, |this| this.bg(highlight))
+                .when(on_accent, |this| this.text_color(gpui::white()))
+                .when(!on_accent, |this| this.text_color(theme::text()))
+                .hover(|this| {
+                    if highlighted {
+                        this
+                    } else {
+                        this.bg(theme::bg_raised())
+                    }
+                })
+                .on_click(move |event, _, cx| {
+                    let shift = event.modifiers().shift;
+                    let double = event.click_count() >= 2;
+                    click_entity.update(cx, |pane, cx| {
+                        pane.set_cursor_position(position, shift, cx);
+                        if double {
+                            pane.activate_cursor(cx);
+                        }
+                    });
+                })
+                .on_mouse_down(MouseButton::Right, move |_, _, cx| {
+                    right_entity.update(cx, |pane, cx| {
+                        pane.set_cursor_position(position, false, cx);
+                    });
+                })
                 .child(
-                    svg()
-                        .path(icon)
-                        .w(px(13.))
-                        .h(px(13.))
-                        .text_color(if selected { gpui::white() } else { color }),
+                    div()
+                        .w(px(ICON_WIDTH))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .flex_shrink_0()
+                        .child(
+                            svg()
+                                .path(icon)
+                                .w(px(15.))
+                                .h(px(15.))
+                                .text_color(if on_accent { gpui::white() } else { color }),
+                        ),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .pl_1()
+                        .text_sm()
+                        .truncate()
+                        .child(name),
+                )
+                .child(
+                    div()
+                        .w(px(TIME_WIDTH))
+                        .px_2()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .when(!on_accent, |this| this.text_color(theme::text_muted()))
+                        .when(on_accent, |this| this.text_color(gpui::white()))
+                        .child(modified),
+                )
+                .child(
+                    div()
+                        .w(px(SIZE_WIDTH))
+                        .px_2()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .when(!on_accent, |this| this.text_color(theme::text_muted()))
+                        .when(on_accent, |this| this.text_color(gpui::white()))
+                        .child(size),
                 ),
-        )
-        .child(div().flex_1().min_w_0().text_sm().truncate().child(name))
-        .child(
-            div()
-                .w(px(SIZE_WIDTH))
-                .px_2()
-                .flex_shrink_0()
-                .flex()
-                .justify_end()
-                .text_xs()
-                .when(!selected, |this| this.text_color(theme::TEXT_MUTED))
-                .child(size),
-        )
-        .child(
-            div()
-                .w(px(TIME_WIDTH))
-                .px_2()
-                .flex_shrink_0()
-                .flex()
-                .justify_end()
-                .text_xs()
-                .when(!selected, |this| this.text_color(theme::TEXT_FAINT))
-                .child(modified),
         )
         .into_any_element()
 }
@@ -1289,7 +1308,7 @@ fn render_message(icon: &'static str, title: &str, detail: &str, tint: Hsla) -> 
         .child(
             div()
                 .text_sm()
-                .text_color(theme::TEXT_MUTED)
+                .text_color(theme::text_muted())
                 .child(title.to_string()),
         )
         .when(!detail.is_empty(), |this| {
@@ -1297,7 +1316,7 @@ fn render_message(icon: &'static str, title: &str, detail: &str, tint: Hsla) -> 
                 div()
                     .text_xs()
                     .max_w(px(300.))
-                    .text_color(theme::TEXT_FAINT)
+                    .text_color(theme::text_faint())
                     .child(detail.to_string()),
             )
         })

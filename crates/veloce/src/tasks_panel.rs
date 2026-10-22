@@ -130,9 +130,9 @@ fn render_panel(panel: &mut TaskPanel, cx: &mut Context<TaskPanel>) -> AnyElemen
             .h(px(28.0))
             .flex_shrink_0()
             .px_2()
-            .bg(theme::BG)
+            .bg(theme::bg())
             .border_b_1()
-            .border_color(theme::BORDER_SOFT)
+            .border_color(theme::border_soft())
             .child(
                 div()
                     .flex()
@@ -141,15 +141,15 @@ fn render_panel(panel: &mut TaskPanel, cx: &mut Context<TaskPanel>) -> AnyElemen
                     .gap_2()
                     .child(svg().path(icons::TASKS).w(px(12.)).h(px(12.)).text_color(
                         if active > 0 {
-                            theme::ACCENT
+                            theme::accent()
                         } else {
-                            theme::TEXT_FAINT
+                            theme::text_faint()
                         },
                     ))
                     .child(
                         div()
                             .text_xs()
-                            .text_color(theme::TEXT_MUTED)
+                            .text_color(theme::text_muted())
                             .child(if active > 0 {
                                 format!("Tasks · {active} running")
                             } else {
@@ -167,8 +167,8 @@ fn render_panel(panel: &mut TaskPanel, cx: &mut Context<TaskPanel>) -> AnyElemen
                     .items_center()
                     .rounded_sm()
                     .text_xs()
-                    .text_color(theme::TEXT_FAINT)
-                    .hover(|this| this.bg(theme::BG_HOVER).text_color(theme::TEXT))
+                    .text_color(theme::text_faint())
+                    .hover(|this| this.bg(theme::bg_hover()).text_color(theme::text()))
                     .on_click(move |_, _, cx| {
                         entity.update(cx, |panel, cx| panel.clear_finished(cx));
                     })
@@ -185,7 +185,7 @@ fn render_panel(panel: &mut TaskPanel, cx: &mut Context<TaskPanel>) -> AnyElemen
             .child(
                 div()
                     .text_xs()
-                    .text_color(theme::TEXT_FAINT)
+                    .text_color(theme::text_faint())
                     .child("No transfers yet"),
             )
             .into_any_element()
@@ -208,9 +208,9 @@ fn render_panel(panel: &mut TaskPanel, cx: &mut Context<TaskPanel>) -> AnyElemen
         .w(px(360.0))
         .flex_shrink_0()
         .h(px(200.0))
-        .bg(theme::BG_PANE)
+        .bg(theme::bg_pane())
         .border_t_1()
-        .border_color(theme::BORDER)
+        .border_color(theme::border())
         .child(header)
         .child(body)
         .into_any_element()
@@ -218,11 +218,11 @@ fn render_panel(panel: &mut TaskPanel, cx: &mut Context<TaskPanel>) -> AnyElemen
 
 fn render_task(task: &TaskSnapshot, entity: gpui::Entity<TaskPanel>) -> AnyElement {
     let (state_color, state_label) = match &task.state {
-        TaskState::Queued => (theme::TEXT_FAINT, "queued".to_string()),
-        TaskState::Running => (theme::ACCENT, "running".to_string()),
-        TaskState::Done => (theme::GREEN, "done".to_string()),
-        TaskState::Cancelled => (theme::TEXT_FAINT, "cancelled".to_string()),
-        TaskState::Failed(message) => (theme::RED, message.clone()),
+        TaskState::Queued => (theme::text_faint(), "queued".to_string()),
+        TaskState::Running => (theme::accent(), "running".to_string()),
+        TaskState::Done => (theme::green(), "done".to_string()),
+        TaskState::Cancelled => (theme::text_faint(), "cancelled".to_string()),
+        TaskState::Failed(message) => (theme::red(), message.clone()),
     };
 
     let detail = match task.progress() {
@@ -259,8 +259,8 @@ fn render_task(task: &TaskSnapshot, entity: gpui::Entity<TaskPanel>) -> AnyEleme
             .w(px(16.))
             .h(px(16.))
             .rounded_sm()
-            .text_color(theme::TEXT_FAINT)
-            .hover(|this| this.bg(theme::BG_HOVER).text_color(theme::RED))
+            .text_color(theme::text_faint())
+            .hover(|this| this.bg(theme::bg_hover()).text_color(theme::red()))
             .on_click(move |_, _, cx| {
                 entity.update(cx, |panel, cx| panel.cancel(task_id, cx));
             })
@@ -276,7 +276,7 @@ fn render_task(task: &TaskSnapshot, entity: gpui::Entity<TaskPanel>) -> AnyEleme
         .px_2()
         .py_1()
         .border_b_1()
-        .border_color(theme::BORDER_SOFT)
+        .border_color(theme::border_soft())
         .child(
             div()
                 .flex()
@@ -286,7 +286,7 @@ fn render_task(task: &TaskSnapshot, entity: gpui::Entity<TaskPanel>) -> AnyEleme
                 .child(
                     div()
                         .text_xs()
-                        .text_color(theme::TEXT)
+                        .text_color(theme::text())
                         .truncate()
                         .min_w_0()
                         .flex_1()
@@ -306,12 +306,12 @@ fn render_task(task: &TaskSnapshot, entity: gpui::Entity<TaskPanel>) -> AnyEleme
                         .flex_1()
                         .h(px(3.))
                         .rounded_full()
-                        .bg(theme::BG_RAISED)
+                        .bg(theme::bg_raised())
                         .child(div().h_full().w(gpui::relative(ratio)).rounded_full().bg(
                             if task.state == TaskState::Done {
-                                theme::GREEN
+                                theme::green()
                             } else {
-                                theme::ACCENT
+                                theme::accent()
                             },
                         )),
                 )

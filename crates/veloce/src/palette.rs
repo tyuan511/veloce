@@ -346,7 +346,7 @@ fn render_palette(palette: &mut Palette, cx: &mut Context<Palette>) -> AnyElemen
                 div()
                     .p_3()
                     .text_xs()
-                    .text_color(theme::TEXT_FAINT)
+                    .text_color(theme::text_faint())
                     .child(if palette.searching {
                         "Searching…".to_string()
                     } else if palette.query.is_empty() {
@@ -379,9 +379,9 @@ fn render_palette(palette: &mut Palette, cx: &mut Context<Palette>) -> AnyElemen
                             .h(px(26.))
                             .px_2()
                             .when(selected, |this| {
-                                this.bg(theme::BG_SELECTED).text_color(gpui::white())
+                                this.bg(theme::bg_selected()).text_color(gpui::white())
                             })
-                            .hover(|this| this.bg(theme::BG_HOVER))
+                            .hover(|this| this.bg(theme::bg_hover()))
                             .on_click(move |_, _, cx| {
                                 entity.update(cx, |palette, cx| {
                                     palette.cursor = index;
@@ -399,9 +399,9 @@ fn render_palette(palette: &mut Palette, cx: &mut Context<Palette>) -> AnyElemen
                                     .h(px(12.))
                                     .flex_shrink_0()
                                     .text_color(if hit.is_dir {
-                                        theme::BLUE
+                                        theme::blue()
                                     } else {
-                                        theme::TEXT_MUTED
+                                        theme::text_muted()
                                     }),
                             )
                             .child(div().text_xs().flex_shrink_0().child(hit.name.clone()))
@@ -411,7 +411,7 @@ fn render_palette(palette: &mut Palette, cx: &mut Context<Palette>) -> AnyElemen
                                     .flex_1()
                                     .min_w_0()
                                     .truncate()
-                                    .when(!selected, |this| this.text_color(theme::TEXT_FAINT))
+                                    .when(!selected, |this| this.text_color(theme::text_faint()))
                                     .child(parent),
                             )
                     }))
@@ -436,9 +436,9 @@ fn render_palette(palette: &mut Palette, cx: &mut Context<Palette>) -> AnyElemen
                     .h(px(26.))
                     .px_2()
                     .when(selected, |this| {
-                        this.bg(theme::BG_SELECTED).text_color(gpui::white())
+                        this.bg(theme::bg_selected()).text_color(gpui::white())
                     })
-                    .hover(|this| this.bg(theme::BG_HOVER))
+                    .hover(|this| this.bg(theme::bg_hover()))
                     .on_click(move |_, _, cx| {
                         entity.update(cx, |palette, cx| {
                             palette.cursor = index;
@@ -450,7 +450,7 @@ fn render_palette(palette: &mut Palette, cx: &mut Context<Palette>) -> AnyElemen
                         div()
                             .text_xs()
                             .font_family(theme::MONO_FAMILY)
-                            .when(!selected, |this| this.text_color(theme::TEXT_FAINT))
+                            .when(!selected, |this| this.text_color(theme::text_faint()))
                             .child(command.hint),
                     )
             }))
@@ -470,9 +470,9 @@ fn render_palette(palette: &mut Palette, cx: &mut Context<Palette>) -> AnyElemen
                 .flex()
                 .flex_col()
                 .rounded_lg()
-                .bg(theme::BG_RAISED)
+                .bg(theme::bg_raised())
                 .border_1()
-                .border_color(theme::BORDER)
+                .border_color(theme::border())
                 .shadow_lg()
                 .overflow_hidden()
                 .child(
@@ -484,7 +484,7 @@ fn render_palette(palette: &mut Palette, cx: &mut Context<Palette>) -> AnyElemen
                         .h(px(38.))
                         .px_3()
                         .border_b_1()
-                        .border_color(theme::BORDER_SOFT)
+                        .border_color(theme::border_soft())
                         .child(
                             svg()
                                 .path(if palette.mode == PaletteMode::Files {
@@ -494,11 +494,11 @@ fn render_palette(palette: &mut Palette, cx: &mut Context<Palette>) -> AnyElemen
                                 })
                                 .w(px(13.))
                                 .h(px(13.))
-                                .text_color(theme::ACCENT)
+                                .text_color(theme::accent())
                                 .flex_shrink_0(),
                         )
                         .child(div().flex_1().min_w_0().child(palette.input.clone()))
-                        .child(div().text_xs().text_color(theme::TEXT_FAINT).child(title)),
+                        .child(div().text_xs().text_color(theme::text_faint()).child(title)),
                 )
                 .child(rows),
         )

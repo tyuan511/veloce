@@ -515,7 +515,7 @@ impl Element for FieldElement {
         let style = window.text_style();
 
         let (display_text, text_color) = if content.is_empty() {
-            (input.placeholder.clone(), crate::theme::TEXT_FAINT)
+            (input.placeholder.clone(), crate::theme::text_faint())
         } else {
             (content, style.color)
         };
@@ -569,7 +569,7 @@ impl Element for FieldElement {
                         point(bounds.left() + cursor_pos, bounds.top() + px(2.)),
                         size(px(1.5), bounds.bottom() - bounds.top() - px(4.)),
                     ),
-                    crate::theme::ACCENT,
+                    crate::theme::accent(),
                 )),
             )
         } else {
