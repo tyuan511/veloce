@@ -29,11 +29,11 @@ pub struct TreeState {
 
 impl TreeState {
     pub fn new(root: PathBuf) -> Self {
-        let mut expanded = HashSet::new();
-        expanded.insert(root.clone());
+        // Collapsed: listing everything under home up front is noise; the tree
+        // opens only along the path the user actually visits.
         Self {
             root,
-            expanded,
+            expanded: HashSet::new(),
             children: HashMap::new(),
         }
     }
@@ -80,10 +80,22 @@ impl TreeState {
         to_load
     }
 
-    /// The rows to draw, depth-first. The root itself is not a row.
+    /// The rows to draw, depth-first, starting with the root itself.
     pub fn rows(&self) -> Vec<TreeRow> {
-        let mut rows = Vec::new();
-        self.push_children(&self.root, 0, &mut rows);
+        let expanded = self.expanded.contains(&self.root);
+        let mut rows = vec![TreeRow {
+            path: self.root.clone(),
+            name: self
+                .root
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "/".to_string()),
+            depth: 0,
+            expanded,
+        }];
+        if expanded {
+            self.push_children(&self.root, 1, &mut rows);
+        }
         rows
     }
 
@@ -171,9 +183,11 @@ mod tests {
     }
 
     #[test]
-    fn rows_are_empty_until_the_root_is_loaded() {
+    fn starts_collapsed_showing_only_the_root() {
         let state = TreeState::new(PathBuf::from("/r"));
-        assert!(state.rows().is_empty());
+        let rows = state.rows();
+        assert_eq!(rows.len(), 1);
+        assert!(!rows[0].expanded);
     }
 
     #[test]
@@ -182,13 +196,20 @@ mod tests {
         let mut state = TreeState::new(root.clone());
         state.set_children(root.clone(), vec![root.join("a"), root.join("b")]);
         state.set_children(root.join("a"), vec![root.join("a/x")]);
-        assert_eq!(state.rows().len(), 2);
+        assert_eq!(
+            state.rows().len(),
+            1,
+            "children stay hidden while collapsed"
+        );
+
+        state.toggle(&root);
+        assert_eq!(state.rows().len(), 3);
 
         assert!(!state.toggle(&root.join("a")), "already loaded");
         let rows = state.rows();
-        assert_eq!(rows.len(), 3);
-        assert_eq!((rows[1].name.as_str(), rows[1].depth), ("x", 1));
-        assert!(rows[0].expanded);
+        assert_eq!(rows.len(), 4);
+        assert_eq!((rows[2].name.as_str(), rows[2].depth), ("x", 2));
+        assert!(rows[1].expanded);
     }
 
     #[test]
@@ -203,10 +224,18 @@ mod tests {
         let root = PathBuf::from("/r");
         let mut state = tree_with(Path::new("/r"), &[("a", &["x"])]);
         state.set_children(root.clone(), vec![root.join("a")]);
+        state.expanded.insert(root.clone());
         state.expanded.insert(root.join("a"));
-        assert_eq!(state.rows().len(), 2);
+        assert_eq!(state.rows().len(), 3);
         state.toggle(&root.join("a"));
-        assert_eq!(state.rows().len(), 1);
+        assert_eq!(state.rows().len(), 2);
+    }
+
+    #[test]
+    fn revealing_the_root_itself_expands_nothing() {
+        let mut state = TreeState::new(PathBuf::from("/r"));
+        assert!(state.reveal(Path::new("/r")).is_empty());
+        assert!(state.expanded.is_empty());
     }
 
     #[test]
@@ -230,6 +259,6 @@ mod tests {
     fn reveal_ignores_paths_outside_the_root() {
         let mut state = TreeState::new(PathBuf::from("/r"));
         assert!(state.reveal(Path::new("/elsewhere/x")).is_empty());
-        assert_eq!(state.expanded.len(), 1);
+        assert!(state.expanded.is_empty());
     }
 }

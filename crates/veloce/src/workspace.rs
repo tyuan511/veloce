@@ -51,6 +51,9 @@ pub struct Workspace {
     places: Vec<Place>,
     /// Lazy folder tree under the favorites, rooted at home.
     tree: TreeState,
+    /// Folder the tree was last opened down to, so a refresh of the same
+    /// folder does not re-expand what the user collapsed.
+    revealed: Option<PathBuf>,
     /// Inline name prompt shown over the list (new folder / rename).
     pub(crate) prompt: Option<(InlinePrompt, Entity<TextInput>)>,
     focus_handle: FocusHandle,
@@ -103,6 +106,7 @@ impl Workspace {
             split: false,
             places: favorite_places(&home_dir),
             tree: TreeState::new(home_dir.clone()),
+            revealed: None,
             prompt: None,
             focus_handle: cx.focus_handle(),
             watcher: None,
@@ -129,8 +133,6 @@ impl Workspace {
         self.right.update(cx, |pane, cx| pane.reload(cx));
         self.sync_preview(cx);
         self.retarget_watcher(cx);
-        let root = self.tree.root.clone();
-        self.load_tree_dir(root, cx);
         self.reveal_in_tree(cx);
         let handle = self.focus_handle.clone();
         window.focus(&handle);
@@ -200,6 +202,10 @@ impl Workspace {
         let Some(path) = self.focused_pane().read(cx).current_uri().as_local_path() else {
             return;
         };
+        if self.revealed.as_ref() == Some(&path) {
+            return;
+        }
+        self.revealed = Some(path.clone());
         for dir in self.tree.reveal(&path) {
             self.load_tree_dir(dir, cx);
         }
