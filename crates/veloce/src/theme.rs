@@ -339,7 +339,6 @@ pub fn purple() -> Hsla {
 /// Row height for the file list. Fixed so `uniform_list` can virtualize on it.
 pub const ROW_HEIGHT: f32 = 28.0;
 pub const STATUS_HEIGHT: f32 = 24.0;
-pub const SIDEBAR_WIDTH: f32 = 176.0;
 
 pub const MONO_FAMILY: &str = "Menlo";
 

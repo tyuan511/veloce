@@ -663,10 +663,18 @@ pub struct PreviewView {
     pub entry: Option<FileEntry>,
     /// Panel width: the inspector is narrow. Ignored when `embedded`.
     pub width: f32,
-    /// Hosted inside another surface (Quick Look): no border, background or
-    /// header of its own, so nothing opaque can poke out of a rounded parent.
-    pub embedded: bool,
 }
+
+/// What the inspector asks of the workspace.
+#[derive(Debug, Clone, Copy)]
+pub enum PreviewEvent {
+    /// Open the entry with its default application.
+    Open,
+    /// Show the application list below this point.
+    OpenWith(gpui::Point<gpui::Pixels>),
+}
+
+impl gpui::EventEmitter<PreviewEvent> for PreviewView {}
 
 impl gpui::Focusable for PreviewView {
     fn focus_handle(&self, _cx: &gpui::App) -> gpui::FocusHandle {
@@ -681,15 +689,6 @@ impl PreviewView {
             focus_handle: cx.focus_handle(),
             entry: None,
             width: 340.0,
-            embedded: false,
-        }
-    }
-
-    /// The content area of the Quick Look window.
-    pub fn quick_look(cx: &mut Context<Self>) -> Self {
-        Self {
-            embedded: true,
-            ..Self::new(cx)
         }
     }
 
@@ -706,14 +705,7 @@ impl gpui::Render for PreviewView {
         _window: &mut gpui::Window,
         cx: &mut Context<Self>,
     ) -> impl gpui::IntoElement {
-        render_preview(
-            &self.preview,
-            self.entry.as_ref(),
-            self.width,
-            self.embedded,
-            cx,
-        )
-        .into_any_element()
+        render_preview(&self.preview, self.entry.as_ref(), self.width, cx).into_any_element()
     }
 }
 
@@ -722,10 +714,9 @@ pub fn render_preview(
     preview: &Preview,
     entry: Option<&FileEntry>,
     width: f32,
-    embedded: bool,
-    _cx: &mut Context<PreviewView>,
+    cx: &mut Context<PreviewView>,
 ) -> AnyElement {
-    let header = (!embedded).then(|| render_header(entry));
+    let header = render_header(entry, cx);
     let body = match &preview.content {
         PreviewContent::Empty => empty_state(),
         PreviewContent::Loading { name } => loading_state(name),
@@ -740,17 +731,6 @@ pub fn render_preview(
         PreviewContent::Error { message } => error_state(message),
     };
 
-    if embedded {
-        // Transparent and unbordered: the Quick Look card draws its own rounded
-        // background and this must not paint over its corners.
-        return div()
-            .flex()
-            .flex_col()
-            .size_full()
-            .min_h_0()
-            .child(body)
-            .into_any_element();
-    }
     div()
         .flex()
         .flex_col()
@@ -758,16 +738,14 @@ pub fn render_preview(
         .flex_shrink_0()
         .h_full()
         .bg(theme::bg())
-        .border_l_1()
-        .border_color(theme::border())
-        .children(header)
+        .child(header)
         .child(body)
         .into_any_element()
 }
 
 /// The inspector's header: a large icon with the name and "kind · size", then a
 /// quiet grid of dates and permissions, like Finder's preview pane.
-fn render_header(entry: Option<&FileEntry>) -> AnyElement {
+fn render_header(entry: Option<&FileEntry>, cx: &mut Context<PreviewView>) -> AnyElement {
     let Some(entry) = entry else {
         return div().into_any_element();
     };
@@ -819,7 +797,8 @@ fn render_header(entry: Option<&FileEntry>) -> AnyElement {
                                 .truncate()
                                 .child(subtitle),
                         ),
-                ),
+                )
+                .child(open_button(cx)),
         )
         .when(!facts.is_empty(), |this| {
             this.child(
@@ -850,6 +829,58 @@ fn render_header(entry: Option<&FileEntry>) -> AnyElement {
                     })),
             )
         })
+        .into_any_element()
+}
+
+/// A split button: the label opens with the default application, the arrow lists
+/// every application that can open the file (the same list as "Open With").
+fn open_button(cx: &mut Context<PreviewView>) -> AnyElement {
+    div()
+        .flex()
+        .flex_row()
+        .items_center()
+        .flex_shrink_0()
+        .h(px(24.))
+        .rounded_md()
+        .bg(theme::bg_hover())
+        .text_xs()
+        .text_color(theme::text())
+        .child(
+            div()
+                .id("inspector-open")
+                .h_full()
+                .px_2()
+                .flex()
+                .items_center()
+                .rounded_l_md()
+                .cursor_pointer()
+                .hover(|this| this.bg(theme::border()))
+                .on_click(cx.listener(|_, _, _, cx| cx.emit(PreviewEvent::Open)))
+                .child("Open"),
+        )
+        .child(div().w(px(1.)).h(px(12.)).bg(theme::border()))
+        .child(
+            div()
+                .id("inspector-open-with")
+                .h_full()
+                .w(px(20.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_r_md()
+                .cursor_pointer()
+                .hover(|this| this.bg(theme::border()))
+                .on_click(cx.listener(|_, event: &gpui::ClickEvent, _, cx| {
+                    cx.emit(PreviewEvent::OpenWith(event.position()));
+                }))
+                .child(
+                    svg()
+                        .path(icons::CHEVRON_DOWN)
+                        .w(px(10.))
+                        .h(px(10.))
+                        .text_color(theme::text_muted()),
+                ),
+        )
         .into_any_element()
 }
 

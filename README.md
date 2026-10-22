@@ -77,10 +77,10 @@ compile once at first launch.
 | `gg` / `G` | first / last |
 | `shift-j` | extend selection |
 | `⌘A` / `esc` | select all / clear |
-| `space` | Quick Look: large preview of the selected file (`space` / `esc` to close, arrows keep moving) |
+| `space` | show / hide the preview panel on the right (follows the cursor; its Open button picks an application) |
 | `⇧⌘.` | show / hide dot-files (hidden by default, per pane) |
 | `⌘1` / `⌘2` / `⌘3` | view as icons / list / columns |
-| `⌥⌘I` | toggle the inspector panel |
+| `⌥⌘I` | toggle the preview panel (same as `space`) |
 | `⌃1` / `⌃2` | focus left / right pane |
 | `/` | filter this folder (fuzzy, live) |
 | `⌘P` | fuzzy jump to any file in the tree |
@@ -99,6 +99,10 @@ compile once at first launch.
 | `⌘J` | task panel |
 | `s` | cycle sort column (toolbar ⇅ menu: name, kind, date modified, date created, size; ascending/descending; folders on top) |
 | `⌘R` | refresh |
+
+## Layout
+
+Drag the dividers to resize the sidebar, the preview panel and, when split, the two panes.
 
 ## Design decisions worth knowing
 
@@ -124,7 +128,7 @@ compile once at first launch.
 ## Tests
 
 ```sh
-cargo test              # 370 tests, no GPU or window server needed
+cargo test              # 380 tests, no GPU or window server needed
 cargo test -p vfs-core  # 156 core tests
 ```
 

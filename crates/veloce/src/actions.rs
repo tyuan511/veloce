@@ -40,7 +40,6 @@ actions!(
         OpenCommands,
         // preview
         TogglePreview,
-        QuickLook,
         ViewIcons,
         ViewList,
         ViewColumns,
@@ -120,7 +119,7 @@ pub fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-p", OpenPalette, Some(CONTEXT)),
         KeyBinding::new("cmd-shift-p", OpenCommands, Some(CONTEXT)),
         // ---- preview ----
-        KeyBinding::new("space", QuickLook, Some(CONTEXT)),
+        KeyBinding::new("space", TogglePreview, Some(CONTEXT)),
         KeyBinding::new("cmd-alt-i", TogglePreview, Some(CONTEXT)),
         // ---- transfers ----
         KeyBinding::new("f5", CopyToOtherPane, Some(CONTEXT)),
@@ -151,7 +150,7 @@ pub fn bind_keys(cx: &mut App) {
 pub const SHORTCUTS: &[(&str, &str)] = &[
     ("j / k", "move down / up"),
     ("h / l", "parent / open"),
-    ("space", "quick look"),
+    ("space", "preview"),
     ("/", "filter this folder"),
     ("⌘P", "fuzzy jump"),
     ("⌘⇧P", "commands"),

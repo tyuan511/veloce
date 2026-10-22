@@ -13,7 +13,8 @@ use std::{
 
 use gpui::{
     AnyElement, App, Context, Entity, EventEmitter, FocusHandle, Focusable, KeyDownEvent,
-    MouseButton, Render, Subscription, Window, div, prelude::*, px, svg,
+    MouseButton, MouseMoveEvent, MouseUpEvent, Render, Subscription, Window, div, prelude::*, px,
+    svg,
 };
 mod menu_view;
 
@@ -32,11 +33,14 @@ use crate::{
     open_with::{self, AppInfo},
     palette::{Palette, PaletteChoice, PaletteEvent, PaletteMode},
     pane::{Pane, PaneEvent, PaneSide, Services},
-    preview::PreviewView,
+    preview::{PreviewEvent, PreviewView},
     tasks_panel::TaskPanel,
     text_input::{TextInput, TextInputEvent},
     theme,
-    view::{ViewMode, pane_width},
+    view::{
+        Divider, HANDLE_WIDTH, INSPECTOR_DEFAULT, SIDEBAR_DEFAULT, ViewMode,
+        inspector_from_pointer, pane_widths, panes_area, ratio_from_pointer, sidebar_from_pointer,
+    },
 };
 
 /// Files created by the inline "new folder / rename" prompt.
@@ -58,7 +62,7 @@ pub(crate) struct OpenMenu {
     ctx: MenuContext,
     /// Applications behind the Open With rows, in menu order.
     apps: Vec<AppInfo>,
-    /// The menu is just the Open With list (Quick Look's Open button).
+    /// The menu is just the Open With list (the inspector's Open button).
     open_with_only: bool,
 }
 
@@ -74,14 +78,18 @@ pub struct Workspace {
     pub right: Entity<Pane>,
     pub focused: PaneSide,
     pub preview: Entity<PreviewView>,
-    /// Quick Look: a large preview opened with Space.
-    quick_look: Entity<PreviewView>,
-    quick_look_open: bool,
     pub tasks: Entity<TaskPanel>,
     pub palette: Entity<Palette>,
     pub tasks_open: bool,
     /// Second pane visible. Off by default, like Finder; ⌘\ turns it on.
     pub split: bool,
+    /// User-resizable layout: sidebar and inspector widths, and the left pane's
+    /// share when split.
+    sidebar_width: f32,
+    inspector_width: f32,
+    split_ratio: f32,
+    /// The divider being dragged, if any.
+    drag: Option<Divider>,
     /// Paths copied with Copy / "Copy Item", pasted by Paste Item.
     clipboard: FileClipboard,
     menu: Option<OpenMenu>,
@@ -130,7 +138,6 @@ impl Workspace {
             cx.new(|cx| Pane::new(PaneSide::Right, VfsUri::local(&start), services.clone(), cx));
 
         let preview = cx.new(PreviewView::new);
-        let quick_look = cx.new(PreviewView::quick_look);
         let tasks = cx.new(|cx| TaskPanel::new(services.tasks.clone(), cx));
         let palette = cx.new(Palette::new);
 
@@ -139,12 +146,14 @@ impl Workspace {
             right: right.clone(),
             focused: PaneSide::Left,
             preview,
-            quick_look,
-            quick_look_open: false,
             tasks,
             palette: palette.clone(),
             tasks_open: false,
             split: false,
+            sidebar_width: SIDEBAR_DEFAULT,
+            inspector_width: INSPECTOR_DEFAULT,
+            split_ratio: 0.5,
+            drag: None,
             clipboard: FileClipboard::default(),
             menu: None,
             menu_counter: 0,
@@ -214,6 +223,18 @@ impl Workspace {
                 }),
             );
         }
+
+        // Inspector → workspace: its Open button and application list.
+        subscriptions.push(cx.subscribe(
+            &self.preview,
+            |workspace, _, event: &PreviewEvent, cx| match event {
+                PreviewEvent::Open => {
+                    let pane = workspace.focused_pane();
+                    pane.update(cx, |pane, cx| pane.open_selection(cx));
+                }
+                PreviewEvent::OpenWith(at) => workspace.open_apps_menu(*at, cx),
+            },
+        ));
 
         // Palette → workspace: run the chosen row.
         subscriptions.push(cx.subscribe(
@@ -339,9 +360,9 @@ impl Workspace {
         cx.notify();
     }
 
-    /// Quick Look's Open button: the same application list as the context menu's
+    /// The inspector's Open button: the same application list as the context menu's
     /// "Open With", dropped under the button.
-    fn open_quick_look_apps(&mut self, at: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
+    fn open_apps_menu(&mut self, at: gpui::Point<gpui::Pixels>, cx: &mut Context<Self>) {
         let Some(entry) = self.focused_pane().read(cx).cursor_entry().cloned() else {
             return;
         };
@@ -534,11 +555,7 @@ impl Workspace {
                     Self::open_terminal_at(&dir);
                 }
             }
-            MenuAction::Preview => {
-                if !self.quick_look_open {
-                    self.toggle_quick_look(cx);
-                }
-            }
+            MenuAction::Preview => self.show_inspector(cx),
             MenuAction::Compress(format) => {
                 pane.update(cx, |pane, cx| pane.compress_selection(format, cx))
             }
@@ -669,29 +686,25 @@ impl Workspace {
         self.focus_pane(self.focused.other(), window, cx);
     }
 
-    /// Mirror the focused pane's cursor entry into the inspector.
+    /// Mirror the focused pane's cursor entry into the inspector. Nothing is
+    /// loaded while the inspector is closed: previews can spawn external tools.
     fn sync_preview(&mut self, cx: &mut Context<Self>) {
-        let entry = self.focused_pane().read(cx).cursor_entry().cloned();
-        if self.quick_look_open {
-            let entry = entry.clone();
-            self.quick_look
-                .update(cx, |preview, cx| preview.show(entry, cx));
+        if !self.focused_pane().read(cx).preview_open {
+            return;
         }
+        let entry = self.focused_pane().read(cx).cursor_entry().cloned();
         self.preview
             .update(cx, |preview, cx| preview.show(entry, cx));
     }
 
-    /// Space: open Quick Look on the cursor entry, or close it.
-    fn toggle_quick_look(&mut self, cx: &mut Context<Self>) {
-        if self.quick_look_open {
-            self.quick_look_open = false;
-            cx.notify();
-            return;
-        }
-        if self.focused_pane().read(cx).cursor_entry().is_none() {
-            return;
-        }
-        self.quick_look_open = true;
+    /// Open the inspector (never toggles) and load the cursor entry into it.
+    fn show_inspector(&mut self, cx: &mut Context<Self>) {
+        let pane = self.focused_pane();
+        pane.update(cx, |pane, cx| {
+            if !pane.preview_open {
+                pane.toggle_preview(cx);
+            }
+        });
         self.sync_preview(cx);
         cx.notify();
     }
@@ -893,11 +906,6 @@ impl Workspace {
             cx.notify();
             return;
         }
-        if self.quick_look_open {
-            self.quick_look_open = false;
-            cx.notify();
-            return;
-        }
         if self.palette.read(cx).open {
             self.palette.update(cx, |palette, cx| palette.close(cx));
             return;
@@ -985,10 +993,6 @@ impl Workspace {
         let pane = self.focused_pane();
         pane.update(cx, |pane, cx| pane.move_horizontal(true, cx));
         self.sync_preview(cx);
-    }
-
-    fn on_quick_look(&mut self, _: &QuickLook, _: &mut Window, cx: &mut Context<Self>) {
-        self.toggle_quick_look(cx);
     }
 
     fn set_view(&mut self, view: ViewMode, cx: &mut Context<Self>) {
@@ -1156,6 +1160,62 @@ impl Workspace {
     fn on_toggle_preview(&mut self, _: &TogglePreview, _: &mut Window, cx: &mut Context<Self>) {
         let pane = self.focused_pane();
         pane.update(cx, |pane, cx| pane.toggle_preview(cx));
+        // Opening it should show the current entry straight away.
+        self.sync_preview(cx);
+        cx.notify();
+    }
+
+    /// Drag a divider: the pointer's x position sets the width it controls.
+    fn on_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(divider) = self.drag else {
+            return;
+        };
+        // A button released outside the window never reaches `on_mouse_up`.
+        if event.pressed_button != Some(MouseButton::Left) {
+            self.drag = None;
+            cx.notify();
+            return;
+        }
+        let x = f32::from(event.position.x);
+        let window_width = f32::from(window.viewport_size().width);
+        let inspector_open = self.focused_pane().read(cx).preview_open;
+        match divider {
+            Divider::Sidebar => {
+                self.sidebar_width = sidebar_from_pointer(
+                    x,
+                    window_width,
+                    self.inspector_width,
+                    inspector_open,
+                    self.split,
+                );
+            }
+            Divider::Inspector => {
+                self.inspector_width =
+                    inspector_from_pointer(x, window_width, self.sidebar_width, self.split);
+            }
+            Divider::Panes => {
+                let area = panes_area(
+                    window_width,
+                    self.sidebar_width,
+                    self.inspector_width,
+                    inspector_open,
+                    true,
+                );
+                self.split_ratio = ratio_from_pointer(x, self.sidebar_width, area);
+            }
+        }
+        cx.notify();
+    }
+
+    fn on_mouse_up(&mut self, _: &MouseUpEvent, _: &mut Window, cx: &mut Context<Self>) {
+        if self.drag.take().is_some() {
+            cx.notify();
+        }
     }
 
     fn on_copy_to_other(&mut self, _: &CopyToOtherPane, _: &mut Window, cx: &mut Context<Self>) {
@@ -1215,7 +1275,6 @@ impl Workspace {
             || self.prompt.is_some()
             || self.menu.is_some()
             || self.info.is_some()
-            || self.quick_look_open
         {
             self.close_overlays(cx);
             return;
@@ -1282,29 +1341,42 @@ impl Render for Workspace {
         let left_focused = focused == PaneSide::Left;
         let right_focused = focused == PaneSide::Right;
 
-        let inspector = if self.focused_pane().read(cx).preview_open {
-            340.0
-        } else {
-            0.0
-        };
-        let width = pane_width(
-            f32::from(window.viewport_size().width),
-            theme::SIDEBAR_WIDTH,
-            inspector,
+        let preview_open = self.focused_pane().read(cx).preview_open;
+        let window_width = f32::from(window.viewport_size().width);
+        let (left_width, right_width) = pane_widths(
+            window_width,
+            self.sidebar_width,
+            self.inspector_width,
+            preview_open,
             self.split,
+            self.split_ratio,
         );
-        let left = self.left.update(cx, |pane, cx| {
-            pane.avail_width = width;
+        let inspector_width = self.inspector_width;
+        self.preview
+            .update(cx, |preview, _| preview.width = inspector_width);
+        let split = self.split;
+        let left_pane = self.left.update(cx, |pane, cx| {
+            pane.avail_width = left_width;
             pane.render_pane(left_focused, window, cx)
         });
-        let split = self.split;
+        // The left pane takes its share as a fixed width; the right one flexes.
+        let left = if split {
+            div()
+                .w(px(left_width))
+                .flex_shrink_0()
+                .h_full()
+                .flex()
+                .child(left_pane)
+                .into_any_element()
+        } else {
+            left_pane
+        };
         let right = split.then(|| {
             self.right.update(cx, |pane, cx| {
-                pane.avail_width = width;
+                pane.avail_width = right_width;
                 pane.render_pane(right_focused, window, cx)
             })
         });
-        let preview_open = self.focused_pane().read(cx).preview_open;
         let preview = preview_open.then(|| self.preview.clone());
         let palette_open = self.palette.read(cx).open;
         let prompt = self.prompt.as_ref().map(|(kind, input)| {
@@ -1325,7 +1397,6 @@ impl Render for Workspace {
         let sidebar = self.render_sidebar(cx);
         let menu = self.render_context_menu(window, cx);
         let info = self.render_info(cx);
-        let quick_look = self.render_quick_look(window, cx);
 
         div()
             .key_context("Workspace")
@@ -1334,7 +1405,8 @@ impl Render for Workspace {
             .on_action(cx.listener(Self::on_move_up))
             .on_action(cx.listener(Self::on_move_left))
             .on_action(cx.listener(Self::on_move_right))
-            .on_action(cx.listener(Self::on_quick_look))
+            .on_mouse_move(cx.listener(Self::on_mouse_move))
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_action(cx.listener(Self::on_view_icons))
             .on_action(cx.listener(Self::on_view_list))
             .on_action(cx.listener(Self::on_toggle_hidden))
@@ -1392,12 +1464,16 @@ impl Render for Workspace {
                     .flex_1()
                     .min_h_0()
                     .child(sidebar)
+                    .child(resize_handle("handle-sidebar", Divider::Sidebar, cx))
                     .child(left)
                     .when_some(right, |this, right| {
-                        this.child(div().w(px(1.)).flex_shrink_0().bg(theme::border()))
+                        this.child(resize_handle("handle-panes", Divider::Panes, cx))
                             .child(right)
                     })
-                    .children(preview.map(|preview| preview.into_any_element())),
+                    .when_some(preview, |this, preview| {
+                        this.child(resize_handle("handle-inspector", Divider::Inspector, cx))
+                            .child(preview)
+                    }),
             )
             .when(tasks_open, |this| {
                 this.child(div().h(px(1.)).bg(theme::border())).child(tasks)
@@ -1407,218 +1483,13 @@ impl Render for Workspace {
             })
             .when(palette_open, |this| this.child(palette))
             .when_some(info, |this, info| this.child(info))
-            .when_some(quick_look, |this, ql| this.child(ql))
-            // Last, so a menu opened from Quick Look is drawn above it.
+            // Last, so a menu opened over the inspector is drawn above it.
             .when_some(menu, |this, menu| this.child(menu))
             .when_some(banner, |this, message| this.child(render_banner(&message)))
     }
 }
 
 impl Workspace {
-    /// Quick Look: a floating window in Finder's style (title bar with a close
-    /// button, the file's name and kind, an Open button) over the dimmed list.
-    ///
-    /// Every child of the rounded card is transparent. GPUI clips overflow to a
-    /// rectangle, so any opaque child would poke out of the rounded corners.
-    fn render_quick_look(&mut self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if !self.quick_look_open {
-            return None;
-        }
-        let entry = self.focused_pane().read(cx).cursor_entry().cloned()?;
-        let viewport = window.viewport_size();
-        let width = (f32::from(viewport.width) * 0.7).clamp(420.0, 980.0);
-        let height = (f32::from(viewport.height) * 0.78).max(320.0);
-        let preview = self.quick_look.clone();
-        let close = cx.entity();
-        let backdrop = cx.entity();
-        let open = cx.entity();
-        let apps = cx.entity();
-        // Folders have no meaningful size here, so only files show one.
-        let size_label = (!entry.is_dir()).then(|| vfs_core::entry::format_size(entry.size));
-        let icon = crate::pane::entry_icon(&entry, 16.0);
-
-        Some(
-            div()
-                .absolute()
-                .top(px(0.))
-                .left(px(0.))
-                .right(px(0.))
-                .bottom(px(0.))
-                .occlude()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(gpui::hsla(0.0, 0.0, 0.0, 0.32))
-                .on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                    backdrop.update(cx, |workspace, cx| {
-                        workspace.quick_look_open = false;
-                        cx.notify();
-                    });
-                })
-                .child(
-                    div()
-                        .w(px(width))
-                        .h(px(height))
-                        .flex()
-                        .flex_col()
-                        .overflow_hidden()
-                        .rounded(px(12.))
-                        .border_1()
-                        .border_color(theme::border())
-                        .shadow_lg()
-                        .bg(theme::bg())
-                        .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
-                        .child(
-                            // Title bar: transparent, separated by a hairline. The
-                            // name sits in the middle; Open and close are on the right.
-                            div()
-                                .flex()
-                                .flex_row()
-                                .items_center()
-                                .h(px(46.))
-                                .flex_shrink_0()
-                                .px_3()
-                                .gap_3()
-                                .border_b_1()
-                                .border_color(theme::border_soft())
-                                .child(div().flex_1())
-                                .child(
-                                    // One line: icon, name, size.
-                                    div()
-                                        .min_w_0()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .justify_center()
-                                        .gap_2()
-                                        .child(icon)
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .text_sm()
-                                                .font_weight(gpui::FontWeight::MEDIUM)
-                                                .text_color(theme::text())
-                                                .truncate()
-                                                .child(entry.name.clone()),
-                                        )
-                                        // The size is a footnote to the name, not a
-                                        // second title: smaller, fainter, after a dot.
-                                        .when_some(size_label, |this, size| {
-                                            this.child(
-                                                div()
-                                                    .flex_shrink_0()
-                                                    .text_xs()
-                                                    .text_color(theme::text_faint())
-                                                    .child(format!("·  {size}")),
-                                            )
-                                        }),
-                                )
-                                .child(
-                                    div()
-                                        .flex_1()
-                                        .flex()
-                                        .flex_row()
-                                        .items_center()
-                                        .justify_end()
-                                        .gap_2()
-                                        // Split button: the label opens with the default
-                                        // app, the arrow lists every application.
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_row()
-                                                .items_center()
-                                                .h(px(24.))
-                                                .rounded_md()
-                                                .bg(theme::bg_hover())
-                                                .text_sm()
-                                                .text_color(theme::text())
-                                                .child(
-                                                    div()
-                                                        .id("quick-look-open")
-                                                        .h_full()
-                                                        .px_3()
-                                                        .flex()
-                                                        .items_center()
-                                                        .rounded_l_md()
-                                                        .cursor_pointer()
-                                                        .hover(|this| this.bg(theme::border()))
-                                                        .on_click(move |_, window, cx| {
-                                                            open.update(cx, |workspace, cx| {
-                                                                workspace.quick_look_open = false;
-                                                                workspace.run_menu_action(
-                                                                    MenuAction::Open,
-                                                                    window,
-                                                                    cx,
-                                                                );
-                                                            });
-                                                        })
-                                                        .child("Open"),
-                                                )
-                                                .child(
-                                                    div().w(px(1.)).h(px(14.)).bg(theme::border()),
-                                                )
-                                                .child(
-                                                    div()
-                                                        .id("quick-look-open-with")
-                                                        .h_full()
-                                                        .w(px(24.))
-                                                        .flex()
-                                                        .items_center()
-                                                        .justify_center()
-                                                        .rounded_r_md()
-                                                        .cursor_pointer()
-                                                        .hover(|this| this.bg(theme::border()))
-                                                        .on_click(move |event, _, cx| {
-                                                            let at = event.position();
-                                                            apps.update(cx, |workspace, cx| {
-                                                                workspace
-                                                                    .open_quick_look_apps(at, cx)
-                                                            });
-                                                        })
-                                                        .child(
-                                                            svg()
-                                                                .path(icons::CHEVRON_DOWN)
-                                                                .w(px(10.))
-                                                                .h(px(10.))
-                                                                .text_color(theme::text_muted()),
-                                                        ),
-                                                ),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("quick-look-close")
-                                                .flex()
-                                                .items_center()
-                                                .justify_center()
-                                                .w(px(24.))
-                                                .h(px(24.))
-                                                .flex_shrink_0()
-                                                .rounded_md()
-                                                .cursor_pointer()
-                                                .hover(|this| this.bg(theme::bg_hover()))
-                                                .on_click(move |_, _, cx| {
-                                                    close.update(cx, |workspace, cx| {
-                                                        workspace.quick_look_open = false;
-                                                        cx.notify();
-                                                    });
-                                                })
-                                                .child(
-                                                    svg()
-                                                        .path(icons::CLOSE)
-                                                        .w(px(12.))
-                                                        .h(px(12.))
-                                                        .text_color(theme::text_muted()),
-                                                ),
-                                        ),
-                                ),
-                        )
-                        .child(div().flex_1().min_h_0().child(preview)),
-                )
-                .into_any_element(),
-        )
-    }
-
     fn render_info(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let info = self.info.as_ref()?;
         let rows = info_rows(&info.entry, info.folder_bytes);
@@ -1952,15 +1823,37 @@ impl Workspace {
         div()
             .flex()
             .flex_col()
-            .w(px(theme::SIDEBAR_WIDTH))
+            .w(px(self.sidebar_width))
             .h_full()
             .flex_shrink_0()
             .bg(theme::bg())
-            .border_r_1()
-            .border_color(theme::border_soft())
             .child(column)
             .into_any_element()
     }
+}
+
+/// A draggable divider: a 1px line inside a wider hit area that tints on hover.
+fn resize_handle(id: &'static str, divider: Divider, cx: &mut Context<Workspace>) -> AnyElement {
+    let entity = cx.entity();
+    let mut hover = theme::accent();
+    hover.a = 0.35;
+    div()
+        .id(id)
+        .w(px(HANDLE_WIDTH))
+        .h_full()
+        .flex_shrink_0()
+        .flex()
+        .justify_center()
+        .cursor(gpui::CursorStyle::ResizeLeftRight)
+        .hover(move |this| this.bg(hover))
+        .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+            entity.update(cx, |workspace, cx| {
+                workspace.drag = Some(divider);
+                cx.notify();
+            });
+        })
+        .child(div().w(px(1.)).h_full().bg(theme::border_soft()))
+        .into_any_element()
 }
 
 /// A square icon button for the toolbar; the caller attaches `on_click`.

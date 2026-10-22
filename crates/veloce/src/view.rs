@@ -65,11 +65,134 @@ pub fn grid_move(cursor: usize, len: usize, cols: usize, direction: GridMove) ->
     }
 }
 
-/// Width available to one pane: the window minus the sidebar and the inspector,
-/// shared between the panes that are showing.
-pub fn pane_width(window: f32, sidebar: f32, inspector: f32, split: bool) -> f32 {
-    let usable = (window - sidebar - inspector).max(0.0);
-    if split { usable / 2.0 } else { usable }
+// ---- resizable layout --------------------------------------------------------
+
+/// Width of a draggable divider (the visible line is 1px inside it).
+pub const HANDLE_WIDTH: f32 = 5.0;
+pub const SIDEBAR_DEFAULT: f32 = 176.0;
+pub const SIDEBAR_MIN: f32 = 140.0;
+pub const SIDEBAR_MAX: f32 = 320.0;
+pub const INSPECTOR_DEFAULT: f32 = 340.0;
+pub const INSPECTOR_MIN: f32 = 240.0;
+pub const INSPECTOR_MAX: f32 = 720.0;
+/// Narrowest a file pane may get.
+pub const PANE_MIN: f32 = 260.0;
+
+/// The three dividers a user can drag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Divider {
+    /// Between the sidebar and the panes.
+    Sidebar,
+    /// Between the two panes.
+    Panes,
+    /// Between the panes and the inspector.
+    Inspector,
+}
+
+/// Window space taken by the inspector and its divider (nothing when closed).
+fn inspector_block(inspector: f32, inspector_open: bool) -> f32 {
+    if inspector_open {
+        inspector + HANDLE_WIDTH
+    } else {
+        0.0
+    }
+}
+
+/// Space the file panes can share: the window minus the sidebar, the inspector
+/// and every divider.
+pub fn panes_area(
+    window: f32,
+    sidebar: f32,
+    inspector: f32,
+    inspector_open: bool,
+    split: bool,
+) -> f32 {
+    let handles = HANDLE_WIDTH + if split { HANDLE_WIDTH } else { 0.0 };
+    (window - sidebar - inspector_block(inspector, inspector_open) - handles).max(0.0)
+}
+
+/// Keep the sidebar between its limits *and* leave the panes their minimum room.
+pub fn clamp_sidebar(
+    width: f32,
+    window: f32,
+    inspector: f32,
+    inspector_open: bool,
+    split: bool,
+) -> f32 {
+    let panes_min = PANE_MIN * if split { 2.0 } else { 1.0 };
+    let handles = HANDLE_WIDTH + if split { HANDLE_WIDTH } else { 0.0 };
+    let room = window - inspector_block(inspector, inspector_open) - handles - panes_min;
+    width.clamp(SIDEBAR_MIN, SIDEBAR_MAX.min(room).max(SIDEBAR_MIN))
+}
+
+/// Keep the inspector between its limits and leave the panes their minimum room.
+pub fn clamp_inspector(width: f32, window: f32, sidebar: f32, split: bool) -> f32 {
+    let panes_min = PANE_MIN * if split { 2.0 } else { 1.0 };
+    let handles = HANDLE_WIDTH * if split { 3.0 } else { 2.0 };
+    let room = window - sidebar - handles - panes_min;
+    width.clamp(INSPECTOR_MIN, INSPECTOR_MAX.min(room).max(INSPECTOR_MIN))
+}
+
+/// Left pane's share of the panes area, kept so both panes stay usable.
+pub fn clamp_ratio(ratio: f32, area: f32) -> f32 {
+    if area <= PANE_MIN * 2.0 {
+        return 0.5;
+    }
+    let lowest = PANE_MIN / area;
+    ratio.clamp(lowest, 1.0 - lowest)
+}
+
+/// Widths of the left and right file panes.
+pub fn pane_widths(
+    window: f32,
+    sidebar: f32,
+    inspector: f32,
+    inspector_open: bool,
+    split: bool,
+    ratio: f32,
+) -> (f32, f32) {
+    let area = panes_area(window, sidebar, inspector, inspector_open, split);
+    if !split {
+        return (area, 0.0);
+    }
+    let left = (area * clamp_ratio(ratio, area)).round();
+    (left, area - left)
+}
+
+/// Pointer x (window coordinates) → new sidebar width while dragging.
+pub fn sidebar_from_pointer(
+    pointer_x: f32,
+    window: f32,
+    inspector: f32,
+    inspector_open: bool,
+    split: bool,
+) -> f32 {
+    clamp_sidebar(
+        pointer_x - HANDLE_WIDTH / 2.0,
+        window,
+        inspector,
+        inspector_open,
+        split,
+    )
+}
+
+/// Pointer x → new inspector width while dragging its left edge.
+pub fn inspector_from_pointer(pointer_x: f32, window: f32, sidebar: f32, split: bool) -> f32 {
+    clamp_inspector(
+        window - pointer_x - HANDLE_WIDTH / 2.0,
+        window,
+        sidebar,
+        split,
+    )
+}
+
+/// Pointer x → new left-pane share while dragging the divider between the panes.
+pub fn ratio_from_pointer(pointer_x: f32, sidebar: f32, area: f32) -> f32 {
+    if area <= 0.0 {
+        return 0.5;
+    }
+    let left = pointer_x - sidebar - HANDLE_WIDTH - HANDLE_WIDTH / 2.0;
+    clamp_ratio(left / area, area)
 }
 
 // ---- columns ---------------------------------------------------------------
@@ -151,10 +274,113 @@ mod tests {
     }
 
     #[test]
-    fn pane_width_splits_what_the_sidebar_and_inspector_leave() {
-        assert_eq!(pane_width(1000.0, 200.0, 0.0, false), 800.0);
-        assert_eq!(pane_width(1000.0, 200.0, 200.0, true), 300.0);
-        assert_eq!(pane_width(100.0, 200.0, 0.0, false), 0.0);
+    fn panes_area_subtracts_every_divider_and_panel() {
+        assert_eq!(panes_area(1000.0, 200.0, 0.0, false, false), 795.0);
+        assert_eq!(panes_area(1000.0, 200.0, 300.0, true, false), 490.0);
+        assert_eq!(panes_area(1000.0, 200.0, 300.0, true, true), 485.0);
+        assert_eq!(panes_area(100.0, 200.0, 0.0, false, false), 0.0);
+    }
+
+    #[test]
+    fn closed_inspector_takes_no_space_whatever_its_width() {
+        assert_eq!(
+            panes_area(1000.0, 200.0, 500.0, false, false),
+            panes_area(1000.0, 200.0, 0.0, false, false)
+        );
+    }
+
+    #[test]
+    fn pane_widths_fill_the_area_exactly() {
+        for ratio in [0.2, 0.5, 0.73] {
+            let (left, right) = pane_widths(1400.0, 176.0, 340.0, true, true, ratio);
+            let area = panes_area(1400.0, 176.0, 340.0, true, true);
+            assert!((left + right - area).abs() < 0.01, "ratio {ratio}");
+            assert!(left >= PANE_MIN && right >= PANE_MIN);
+        }
+    }
+
+    #[test]
+    fn a_single_pane_gets_all_the_room() {
+        let (left, right) = pane_widths(1000.0, 200.0, 0.0, false, false, 0.5);
+        assert_eq!(left, 795.0);
+        assert_eq!(right, 0.0);
+    }
+
+    #[test]
+    fn ratio_never_squeezes_a_pane_below_its_minimum() {
+        let area = 1000.0;
+        let low = clamp_ratio(0.01, area);
+        let high = clamp_ratio(0.99, area);
+        assert_eq!(low * area, PANE_MIN);
+        assert_eq!((1.0 - high) * area, PANE_MIN);
+        assert_eq!(clamp_ratio(0.5, area), 0.5);
+    }
+
+    #[test]
+    fn a_tiny_area_falls_back_to_an_even_split() {
+        assert_eq!(clamp_ratio(0.9, 300.0), 0.5);
+        assert_eq!(ratio_from_pointer(10.0, 176.0, 0.0), 0.5);
+    }
+
+    #[test]
+    fn dragging_the_sidebar_respects_its_limits_and_the_panes_minimum() {
+        assert_eq!(
+            sidebar_from_pointer(10.0, 1400.0, 340.0, true, false),
+            SIDEBAR_MIN
+        );
+        assert_eq!(
+            sidebar_from_pointer(900.0, 1400.0, 340.0, true, false),
+            SIDEBAR_MAX
+        );
+        assert_eq!(
+            sidebar_from_pointer(200.0, 1400.0, 340.0, true, false),
+            197.5
+        );
+        // A narrow window caps the sidebar so the panes keep their room.
+        let capped = sidebar_from_pointer(600.0, 800.0, 0.0, false, true);
+        assert!(capped < SIDEBAR_MAX);
+        assert!(capped >= SIDEBAR_MIN);
+    }
+
+    #[test]
+    fn dragging_the_inspector_grows_it_leftwards() {
+        let narrow = inspector_from_pointer(1100.0, 1400.0, 176.0, false);
+        let wide = inspector_from_pointer(900.0, 1400.0, 176.0, false);
+        assert!(wide > narrow);
+        assert_eq!(
+            inspector_from_pointer(1390.0, 1400.0, 176.0, false),
+            INSPECTOR_MIN
+        );
+        assert_eq!(
+            inspector_from_pointer(10.0, 3000.0, 176.0, false),
+            INSPECTOR_MAX
+        );
+    }
+
+    #[test]
+    fn inspector_leaves_room_for_two_panes_when_split() {
+        let single = inspector_from_pointer(300.0, 1000.0, 176.0, false);
+        let split = inspector_from_pointer(300.0, 1000.0, 176.0, true);
+        assert!(split <= single);
+        assert!(split >= INSPECTOR_MIN);
+    }
+
+    #[test]
+    fn dragging_between_the_panes_sets_the_left_share() {
+        let sidebar = 176.0;
+        let area = 1000.0;
+        let middle = sidebar + HANDLE_WIDTH + area * 0.5 + HANDLE_WIDTH / 2.0;
+        assert!((ratio_from_pointer(middle, sidebar, area) - 0.5).abs() < 0.001);
+        assert!(ratio_from_pointer(0.0, sidebar, area) >= PANE_MIN / area);
+        assert!(ratio_from_pointer(5000.0, sidebar, area) <= 1.0 - PANE_MIN / area);
+    }
+
+    #[test]
+    fn layout_math_never_goes_negative_or_nan() {
+        for window in [0.0, 100.0, 500.0] {
+            let (l, r) = pane_widths(window, 176.0, 340.0, true, true, 0.5);
+            assert!(l >= 0.0 && r >= 0.0 && l.is_finite() && r.is_finite());
+        }
     }
 
     #[test]
