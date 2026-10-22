@@ -88,6 +88,17 @@ const MIGRATIONS: &[&str] = &[
     );
     CREATE INDEX thumbnails_last_used ON thumbnails(last_used);
     ",
+    // v2: saved remote connections (SSH, S3, WebDAV ...), managed in Settings.
+    "
+    CREATE TABLE connections (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        kind       TEXT NOT NULL,
+        name       TEXT NOT NULL,
+        config     TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    );
+    CREATE UNIQUE INDEX connections_kind_name ON connections(kind, name);
+    ",
 ];
 
 /// View and sort remembered for one folder, as Finder does.
@@ -104,6 +115,17 @@ pub struct FolderPrefs {
 pub struct TabState {
     pub path: String,
     pub active: bool,
+}
+
+/// A saved remote connection. `config` is opaque JSON owned by the caller; the
+/// store only keeps it. Secrets (passwords, secret keys) do not belong here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SavedConnection {
+    pub id: i64,
+    pub kind: String,
+    pub name: String,
+    pub config: String,
+    pub created_at: i64,
 }
 
 /// Rows kept in `recents`; older visits are pruned.
@@ -363,6 +385,61 @@ impl Store {
             .map_err(ctx("read visit count"))
     }
 
+    // ---- connections -------------------------------------------------------
+
+    /// Save a connection and return its id. A second connection of the same kind
+    /// with the same name is refused, so names stay unambiguous in the UI.
+    pub fn add_connection(&self, kind: &str, name: &str, config: &str) -> Result<i64> {
+        let conn = self.lock();
+        conn.execute(
+            "INSERT INTO connections (kind, name, config, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![kind, name, config, now()],
+        )
+        .map_err(ctx("add connection"))?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    pub fn update_connection(&self, id: i64, name: &str, config: &str) -> Result<bool> {
+        self.lock()
+            .execute(
+                "UPDATE connections SET name = ?2, config = ?3 WHERE id = ?1",
+                params![id, name, config],
+            )
+            .map(|changed| changed > 0)
+            .map_err(ctx("update connection"))
+    }
+
+    pub fn delete_connection(&self, id: i64) -> Result<bool> {
+        self.lock()
+            .execute("DELETE FROM connections WHERE id = ?1", [id])
+            .map(|changed| changed > 0)
+            .map_err(ctx("delete connection"))
+    }
+
+    /// All connections, by kind then name.
+    pub fn list_connections(&self) -> Result<Vec<SavedConnection>> {
+        let conn = self.lock();
+        let mut statement = conn
+            .prepare(
+                "SELECT id, kind, name, config, created_at FROM connections
+                 ORDER BY kind, name COLLATE NOCASE",
+            )
+            .map_err(ctx("list connections"))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(SavedConnection {
+                    id: row.get(0)?,
+                    kind: row.get(1)?,
+                    name: row.get(2)?,
+                    config: row.get(3)?,
+                    created_at: row.get(4)?,
+                })
+            })
+            .map_err(ctx("list connections"))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(ctx("list connections"))
+    }
+
     // ---- thumbnails --------------------------------------------------------
 
     pub fn put_thumbnail(&self, key: &str, png: &[u8]) -> Result<()> {
@@ -403,6 +480,13 @@ impl Store {
             .map_err(ctx("touch thumbnail"))?;
         }
         Ok(png)
+    }
+
+    /// Remove every cached thumbnail; returns how many were deleted.
+    pub fn clear_thumbnails(&self) -> Result<usize> {
+        self.lock()
+            .execute("DELETE FROM thumbnails", [])
+            .map_err(ctx("clear thumbnails"))
     }
 
     /// Total bytes of cached thumbnails.
@@ -722,6 +806,82 @@ mod tests {
         let b = Store::in_memory().unwrap();
         a.set_setting("k", "1").unwrap();
         assert_eq!(b.get_setting("k").unwrap(), None);
+    }
+
+    #[test]
+    fn connections_round_trip_and_list_by_kind_then_name() {
+        let (_dir, store) = temp_store();
+        let b = store
+            .add_connection("ssh", "beta", "{\"host\":\"b\"}")
+            .unwrap();
+        store.add_connection("s3", "assets", "{}").unwrap();
+        store.add_connection("ssh", "Alpha", "{}").unwrap();
+        let all = store.list_connections().unwrap();
+        let order: Vec<(&str, &str)> = all
+            .iter()
+            .map(|c| (c.kind.as_str(), c.name.as_str()))
+            .collect();
+        assert_eq!(order, [("s3", "assets"), ("ssh", "Alpha"), ("ssh", "beta")]);
+        let beta = all.iter().find(|c| c.id == b).unwrap();
+        assert_eq!(beta.config, "{\"host\":\"b\"}");
+        assert!(beta.created_at > 0);
+    }
+
+    #[test]
+    fn a_connection_name_is_unique_within_its_kind_only() {
+        let (_dir, store) = temp_store();
+        store.add_connection("ssh", "prod", "{}").unwrap();
+        assert!(store.add_connection("ssh", "prod", "{}").is_err());
+        store.add_connection("s3", "prod", "{}").unwrap();
+    }
+
+    #[test]
+    fn connections_can_be_edited_and_deleted() {
+        let (_dir, store) = temp_store();
+        let id = store.add_connection("ssh", "old", "{}").unwrap();
+        assert!(store.update_connection(id, "new", "{\"port\":22}").unwrap());
+        let changed = store.list_connections().unwrap();
+        assert_eq!(changed[0].name, "new");
+        assert_eq!(changed[0].config, "{\"port\":22}");
+        assert!(store.delete_connection(id).unwrap());
+        assert!(!store.delete_connection(id).unwrap(), "already gone");
+        assert!(!store.update_connection(id, "x", "{}").unwrap());
+        assert!(store.list_connections().unwrap().is_empty());
+    }
+
+    #[test]
+    fn clearing_thumbnails_empties_the_cache() {
+        let (_dir, store) = temp_store();
+        store.put_thumbnail("a", &[1; 10]).unwrap();
+        store.put_thumbnail("b", &[2; 10]).unwrap();
+        assert_eq!(store.clear_thumbnails().unwrap(), 2);
+        assert_eq!(store.thumbnail_bytes().unwrap(), 0);
+        assert_eq!(store.clear_thumbnails().unwrap(), 0);
+    }
+
+    #[test]
+    fn a_database_from_before_connections_upgrades_in_place() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("veloce.db");
+        {
+            // Build a v1 database by hand, with data in it.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(&format!(
+                "BEGIN; {} PRAGMA user_version = 1; COMMIT;",
+                MIGRATIONS[0]
+            ))
+            .unwrap();
+            conn.execute("INSERT INTO settings (key, value) VALUES ('k', 'v')", [])
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            store.get_setting("k").unwrap().as_deref(),
+            Some("v"),
+            "data kept"
+        );
+        store.add_connection("ssh", "after-upgrade", "{}").unwrap();
+        assert_eq!(schema_version(), 2);
     }
 
     #[test]

@@ -564,18 +564,35 @@ fn render_palette(palette: &mut Palette, cx: &mut Context<Palette>) -> AnyElemen
             .into_any_element(),
     };
 
+    let close_left = entity.clone();
+    let close_right = entity.clone();
+    // A full-window backdrop: a click anywhere outside the card dismisses the
+    // palette, and `occlude` keeps that click from reaching what lies beneath.
     div()
         .absolute()
-        .top(px(72.))
+        .top(px(0.))
         .left(px(0.))
         .right(px(0.))
+        .bottom(px(0.))
+        .occlude()
         .flex()
         .justify_center()
+        .items_start()
+        .pt(px(72.))
+        .on_mouse_down(gpui::MouseButton::Left, move |_, _, cx| {
+            close_left.update(cx, |palette, cx| palette.close(cx));
+        })
+        .on_mouse_down(gpui::MouseButton::Right, move |_, _, cx| {
+            close_right.update(cx, |palette, cx| palette.close(cx));
+        })
         .child(
             div()
                 .w(px(560.))
                 .flex()
                 .flex_col()
+                // Clicks inside the card must not reach the dismissing backdrop.
+                .on_mouse_down(gpui::MouseButton::Left, |_, _, cx| cx.stop_propagation())
+                .on_mouse_down(gpui::MouseButton::Right, |_, _, cx| cx.stop_propagation())
                 .rounded_lg()
                 .bg(theme::bg_raised())
                 .border_1()
