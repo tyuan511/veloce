@@ -123,6 +123,8 @@ struct ConnectionForm {
     kind: Kind,
     name: Entity<TextInput>,
     fields: Vec<(Field, Entity<TextInput>)>,
+    /// Also mount it as a local folder through FUSE.
+    mount: bool,
     error: Option<String>,
 }
 
@@ -355,8 +357,12 @@ impl SettingsView {
                 (*field, input)
             })
             .collect();
+        let mount = existing
+            .as_ref()
+            .is_some_and(|connection| connections::wants_mount(&connection.config));
         self.form = Some(ConnectionForm {
             editing,
+            mount,
             kind,
             name,
             fields,
@@ -371,6 +377,7 @@ impl SettingsView {
             return;
         };
         let draft = Draft {
+            mount: form.mount,
             kind: form.kind,
             name: form.name.read(cx).content().to_string(),
             values: form
@@ -997,7 +1004,7 @@ impl SettingsView {
                                     edit_entity.update(cx, |view, cx| view.edit_connection(id, cx));
                                 },
                             ))
-                            .child(button(eid(format!("del-{id}")), "Remove", move |_, cx| {
+                            .child(button(eid(format!("del-{id}")), tr("Remove"), move |_, cx| {
                                 entity.update(cx, |view, cx| view.delete_connection(id, cx));
                             }))
                             .into_any_element(),
@@ -1036,7 +1043,7 @@ impl SettingsView {
                     div()
                         .text_xs()
                         .text_color(theme::text_faint())
-                        .child(tr("Passwords and secret keys are never saved here; they will be kept in the system keychain when the remote backends arrive."))
+                        .child(tr("Passwords and secret keys are never saved here; they are kept in the system keychain."))
                         .into_any_element(),
                 );
             }
@@ -1058,6 +1065,19 @@ impl SettingsView {
                 field_box(input, 260.0),
             ));
         }
+        let mount_entity = entity.clone();
+        rows.push(row(
+            tr("Mount as a local folder"),
+            Some(tr("Read-only, under ~/Veloce. Needs FUSE-T or macFUSE.")),
+            toggle("form-mount", form.mount, move |on, cx| {
+                mount_entity.update(cx, |view, cx| {
+                    if let Some(form) = view.form.as_mut() {
+                        form.mount = on;
+                    }
+                    cx.notify();
+                });
+            }),
+        ));
         if let Some(error) = &form.error {
             rows.push(
                 div()

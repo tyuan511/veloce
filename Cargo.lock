@@ -7473,7 +7473,17 @@ dependencies = [
  "tree-sitter-typescript",
  "tree-sitter-yaml",
  "unicode-segmentation",
+ "veloce-mount",
  "veloce-store",
+ "vfs-core",
+]
+
+[[package]]
+name = "veloce-mount"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "libc",
  "vfs-core",
 ]
 

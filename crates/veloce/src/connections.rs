@@ -136,6 +136,8 @@ pub struct Draft {
     pub name: String,
     /// Values by field key.
     pub values: Vec<(String, String)>,
+    /// Also mount the connection as a local folder through FUSE.
+    pub mount: bool,
 }
 
 impl Draft {
@@ -205,7 +207,44 @@ pub fn validate_with(draft: &Draft, editing: bool) -> Result<String, String> {
             }
         }
     }
+    if draft.mount {
+        config.insert(MOUNT_KEY.to_string(), Value::Bool(true));
+    }
     Ok(Value::Object(config).to_string())
+}
+
+/// Config key of the "mount as a local folder" choice. Not a form field, so it can
+/// never be mistaken for one of the values a backend is opened with.
+pub const MOUNT_KEY: &str = "mount";
+
+/// Whether a stored connection asks to be mounted as a local folder.
+pub fn wants_mount(config: &str) -> bool {
+    serde_json::from_str::<Value>(config)
+        .ok()
+        .and_then(|value| value.get(MOUNT_KEY).and_then(Value::as_bool))
+        .unwrap_or(false)
+}
+
+/// The folder name a connection is mounted under: its own name, with the characters a
+/// path cannot hold replaced. `taken` holds the names other mounts already use.
+pub fn mount_folder_name(name: &str, taken: &[String]) -> String {
+    let clean: String = name
+        .trim()
+        .chars()
+        .map(|c| if c == '/' || c == ':' || c.is_control() { '-' } else { c })
+        .collect();
+    let base = if clean.is_empty() || clean.chars().all(|c| c == '.') {
+        "connection".to_string()
+    } else {
+        clean
+    };
+    if !taken.contains(&base) {
+        return base;
+    }
+    (2..)
+        .map(|n| format!("{base} {n}"))
+        .find(|candidate| !taken.contains(candidate))
+        .unwrap_or(base)
 }
 
 /// The stored values of a connection as form text, so editing starts from what was
@@ -322,6 +361,7 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
+            mount: false,
         }
     }
 
@@ -635,6 +675,37 @@ mod tests {
         assert_eq!(get("port"), Some("2222"), "numbers come back as text");
         assert_eq!(get("key_path"), None);
         assert!(stored_values("not json").is_empty());
+    }
+
+    #[test]
+    fn the_mount_choice_is_stored_and_read_back() {
+        let mut with = draft(Kind::WebDav, "x", &[("url", "https://d.example.com")]);
+        assert!(!wants_mount(&validate(&with).unwrap()));
+        with.mount = true;
+        let json = validate(&with).unwrap();
+        assert!(wants_mount(&json));
+        // It is not a form value, so it never comes back as editable text.
+        assert!(stored_values(&json).iter().all(|(key, _)| key != MOUNT_KEY));
+        // And it does not disturb opening the connection.
+        assert!(to_spec(Kind::WebDav, &json, None).is_ok());
+    }
+
+    #[test]
+    fn damaged_configs_do_not_ask_for_a_mount() {
+        assert!(!wants_mount("not json"));
+        assert!(!wants_mount("{}"));
+        assert!(!wants_mount(r#"{"mount":"yes"}"#));
+    }
+
+    #[test]
+    fn mount_folder_names_are_safe_paths_and_never_collide() {
+        assert_eq!(mount_folder_name("prod", &[]), "prod");
+        assert_eq!(mount_folder_name("  a/b:c  ", &[]), "a-b-c");
+        assert_eq!(mount_folder_name("", &[]), "connection");
+        assert_eq!(mount_folder_name("..", &[]), "connection", "no path tricks");
+        assert_eq!(mount_folder_name("prod", &["prod".into()]), "prod 2");
+        let taken = ["prod".to_string(), "prod 2".to_string()];
+        assert_eq!(mount_folder_name("prod", &taken), "prod 3");
     }
 
     #[test]

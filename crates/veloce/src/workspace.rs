@@ -44,6 +44,7 @@ use crate::{
     persist::{Persist, Startup as SavedStartup},
     prefs::LayoutPrefs,
     preview::{PreviewEvent, PreviewView},
+    mounts::{self, Mounts},
     remote::{self, ConnectionsRevision},
     settings::{AppSettings, Startup},
     settings_apply,
@@ -167,6 +168,8 @@ pub struct Workspace {
     subscriptions: Vec<Subscription>,
     /// Saved remote connections, for the sidebar.
     connections: Vec<SavedConnection>,
+    /// FUSE mounts of the connections that asked for one.
+    mounts: Arc<Mutex<Mounts>>,
     services: Services,
     /// Last error surfaced to the user (transient banner).
     banner: Option<(String, std::time::Instant)>,
@@ -267,6 +270,7 @@ impl Workspace {
             subscriptions: Vec::new(),
             banner: None,
             connections: Vec::new(),
+            mounts: Arc::new(Mutex::new(Mounts::default())),
             services,
         };
 
@@ -325,6 +329,15 @@ impl Workspace {
 
     /// Load both panes and start watching the focused one.
     pub fn start(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Unmount on the way out, so quitting never leaves a dead folder behind.
+        self.subscriptions.push(cx.on_app_quit(|workspace, _| {
+            let all = workspace
+                .mounts
+                .lock()
+                .map(|mut mounts| mounts.take_all())
+                .unwrap_or_default();
+            async move { drop(all) }
+        }));
         // Palette → workspace: run the chosen row. Subscribed with the window,
         // since some commands (a confirmation prompt) need to take focus.
         let palette = self.palette.clone();
@@ -408,6 +421,13 @@ impl Workspace {
                 // Reconnect with the new settings the next time it is opened.
                 registry.retain_connections(|_, key| key != id.to_string());
             }
+            if let Some(id) = cx.global::<ConnectionsRevision>().edited {
+                // A mount made with the old settings is replaced by the sync below.
+                let old = workspace.mounts.lock().ok().and_then(|mut mounts| mounts.take(id));
+                if let Some(old) = old {
+                    cx.background_executor().spawn(async move { drop(old) }).detach();
+                }
+            }
             workspace.reload_connections(cx);
         }));
 
@@ -458,11 +478,78 @@ impl Workspace {
                     });
                 }
                 workspace.connections = list;
+                workspace.sync_mounts(cx);
                 cx.notify();
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Make the FUSE mounts match the saved connections: mount the ones that ask for it
+    /// and are not mounted, unmount the ones that no longer do. Everything slow runs off
+    /// the UI thread.
+    fn sync_mounts(&mut self, cx: &mut Context<Self>) {
+        let (plan, removed) = {
+            let Ok(mut mounts) = self.mounts.lock() else {
+                return;
+            };
+            let plan = mounts.plan(&self.connections);
+            let removed: Vec<_> = plan.unmount.iter().filter_map(|id| mounts.take(*id)).collect();
+            (plan, removed)
+        };
+        if !removed.is_empty() {
+            cx.background_executor().spawn(async move { drop(removed) }).detach();
+        }
+        for id in plan.mount {
+            let Some(connection) = self.connections.iter().find(|c| c.id == id).cloned() else {
+                continue;
+            };
+            let Some(folder) = self
+                .mounts
+                .lock()
+                .ok()
+                .map(|mut mounts| mounts.begin(id, &connection.name))
+            else {
+                continue;
+            };
+            let point = mounts::mount_root(&self.home).join(folder);
+            let mounts = self.mounts.clone();
+            cx.spawn(async move |this, cx| {
+                let name = connection.name.clone();
+                let job_point = point.clone();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let opened = remote::mount(&connection)?;
+                        let root = remote::root_uri(&connection)
+                            .ok_or_else(|| tr("Unknown connection type").to_string())?;
+                        let provider: Arc<dyn vfs_core::VfsProvider> = opened.provider;
+                        veloce_mount::mount(provider, root, &job_point, &connection.name)
+                    })
+                    .await;
+                this.update(cx, |workspace, cx| {
+                    let banner = match result {
+                        Ok(mounted) => {
+                            if let Ok(mut mounts) = mounts.lock() {
+                                mounts.finish(id, Some(mounted));
+                            }
+                            trf("Mounted {} at {}", &[&name, &point.display().to_string()])
+                        }
+                        Err(message) => {
+                            if let Ok(mut mounts) = mounts.lock() {
+                                mounts.finish(id, None);
+                            }
+                            trf("Cannot mount {}: {}", &[&name, &message])
+                        }
+                    };
+                    workspace.banner = Some((banner, std::time::Instant::now()));
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
+        }
     }
 
     /// Browse a saved connection in the focused pane, connecting first if needed.

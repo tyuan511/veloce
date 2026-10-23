@@ -21,6 +21,7 @@ mod icons;
 mod info;
 mod keymap;
 mod listing;
+mod mounts;
 mod open_with;
 mod palette;
 mod pane;

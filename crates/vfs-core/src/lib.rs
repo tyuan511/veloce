@@ -15,6 +15,7 @@ pub mod entry;
 pub mod error;
 pub mod filter;
 pub mod local;
+pub mod mountfs;
 pub mod ops;
 pub mod provider;
 pub mod remote;

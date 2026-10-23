@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/vfs-core", "crates/veloce", "crates/store"]
+members = ["crates/vfs-core", "crates/veloce", "crates/store", "crates/veloce-mount"]
 resolver = "3"
 
 [workspace.package]

@@ -1,0 +1,12 @@
+[package]
+name = "veloce-mount"
+description = "Mount a remote connection as a local read-only folder through FUSE"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vfs-core = { path = "../vfs-core" }
+futures.workspace = true
+libc = "0.2"
