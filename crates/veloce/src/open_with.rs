@@ -208,6 +208,29 @@ pub fn app_cache_key(path: &Path) -> String {
     }
 }
 
+/// Where the empty stand-in for a remote file of extension `ext` lives. LaunchServices
+/// picks the application list from the extension alone, so this lets "Open With" be
+/// offered for a remote file without downloading it first.
+pub fn placeholder_path(base: &Path, ext: &str) -> PathBuf {
+    let ext = ext.to_lowercase();
+    if ext.is_empty() {
+        base.join("none").join("sample")
+    } else {
+        base.join(&ext).join(format!("sample.{ext}"))
+    }
+}
+
+/// Create the placeholder (empty) if it is not there yet.
+pub fn ensure_placeholder(path: &Path) -> std::io::Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::File::create(path).map(|_| ())
+}
+
 /// `open -a <app> <files...>`.
 pub fn open_with_args(app: &Path, files: &[PathBuf]) -> Vec<std::ffi::OsString> {
     let mut args = vec!["-a".into(), app.as_os_str().to_os_string()];
@@ -237,6 +260,32 @@ mod tests {
 
     fn names(apps: &[AppInfo]) -> Vec<&str> {
         apps.iter().map(|a| a.name.as_str()).collect()
+    }
+
+    #[test]
+    fn placeholders_keep_the_extension_so_launch_services_can_pick_apps() {
+        let base = Path::new("/tmp/x");
+        assert_eq!(
+            placeholder_path(base, "PNG"),
+            PathBuf::from("/tmp/x/png/sample.png")
+        );
+        assert_eq!(placeholder_path(base, ""), PathBuf::from("/tmp/x/none/sample"));
+        // Same extension, same cache key as a real local file of that type.
+        assert_eq!(
+            app_cache_key(&placeholder_path(base, "png")),
+            app_cache_key(Path::new("/Users/me/photo.PNG"))
+        );
+    }
+
+    #[test]
+    fn a_placeholder_is_created_once_and_left_alone_afterwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = placeholder_path(dir.path(), "md");
+        ensure_placeholder(&path).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+        std::fs::write(&path, b"kept").unwrap();
+        ensure_placeholder(&path).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"kept");
     }
 
     #[test]

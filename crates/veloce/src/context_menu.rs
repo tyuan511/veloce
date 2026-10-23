@@ -137,6 +137,9 @@ pub struct MenuContext {
     /// Whether the single selected item is starred; `None` when it cannot be (several
     /// items, or not on a local disk).
     pub favorite: Option<bool>,
+    /// The folder is on a server: rows that need local files (clipboard, shortcuts,
+    /// archives, terminal) are left out instead of doing nothing.
+    pub remote: bool,
 }
 
 impl Default for MenuContext {
@@ -148,6 +151,7 @@ impl Default for MenuContext {
             sort: SortSpec::default(),
             open_with: OpenWith::Loading,
             favorite: None,
+            remote: false,
         }
     }
 }
@@ -382,22 +386,29 @@ pub fn favorite_menu(is_dir: bool, removable: bool) -> Vec<MenuItem> {
 pub fn build_menu(target: &MenuTarget, ctx: &MenuContext) -> Vec<MenuItem> {
     use MenuAction::*;
     match target {
-        MenuTarget::Background => vec![
-            action(Refresh, tr("Refresh"), Some("⌘R"), true),
-            MenuItem::Separator,
-            action(Paste, tr("Paste"), Some("⌘V"), ctx.can_paste),
-            MenuItem::Separator,
-            action(NewFolder, tr("New folder"), Some("⇧⌘N"), true),
-            action(NewFile, tr("New file"), None, true),
-            action(OpenInTerminal, tr("Open in Terminal"), None, true),
-            MenuItem::Separator,
+        MenuTarget::Background => {
+            let mut items = vec![action(Refresh, tr("Refresh"), Some("⌘R"), true)];
+            if !ctx.remote {
+                items.push(MenuItem::Separator);
+                items.push(action(Paste, tr("Paste"), Some("⌘V"), ctx.can_paste));
+            }
+            items.push(MenuItem::Separator);
+            items.push(action(NewFolder, tr("New folder"), Some("⇧⌘N"), true));
+            items.push(action(NewFile, tr("New file"), None, true));
+            if !ctx.remote {
+                items.push(action(OpenInTerminal, tr("Open in Terminal"), None, true));
+            }
+            items.push(MenuItem::Separator);
+            items.extend([
             submenu(tr("Sort By"), sort_menu(ctx.sort)),
             submenu(tr("View"), view_menu(ctx.view)),
             checked(
                 action(ToggleHidden, tr("Show hidden files"), Some("⇧⌘."), true),
                 ctx.show_hidden,
             ),
-        ],
+            ]);
+            items
+        }
         MenuTarget::Items {
             count,
             is_dir,
@@ -428,15 +439,21 @@ pub fn build_menu(target: &MenuTarget, ctx: &MenuContext) -> Vec<MenuItem> {
                 items.push(action(Preview, tr("Preview"), Some("Space"), true));
             }
             items.push(MenuItem::Separator);
-            items.push(action(Cut, tr("Cut"), Some("⌘X"), true));
-            items.push(action(Copy, tr("Copy"), Some("⌘C"), true));
-            if folder {
-                items.push(action(PasteInto, tr("Paste"), Some("⌘V"), ctx.can_paste));
+            // The file clipboard holds local paths, so it cannot carry remote items;
+            // copy them to the other pane instead.
+            if !ctx.remote {
+                items.push(action(Cut, tr("Cut"), Some("⌘X"), true));
+                items.push(action(Copy, tr("Copy"), Some("⌘C"), true));
+                if folder {
+                    items.push(action(PasteInto, tr("Paste"), Some("⌘V"), ctx.can_paste));
+                }
             }
             items.push(action(CopyPath, tr("Copy as path"), Some("⇧⌘C"), true));
             items.push(MenuItem::Separator);
             items.push(action(Rename, tr("Rename"), Some("F2"), single));
-            items.push(action(CreateShortcut, tr("Create shortcut"), None, true));
+            if !ctx.remote {
+                items.push(action(CreateShortcut, tr("Create shortcut"), None, true));
+            }
             if let Some(starred) = ctx.favorite {
                 let label = if starred {
                     tr("Remove from Favorites")
@@ -445,7 +462,7 @@ pub fn build_menu(target: &MenuTarget, ctx: &MenuContext) -> Vec<MenuItem> {
                 };
                 items.push(action(ToggleFavorite, label, None, true));
             }
-            if let (true, Some(stem)) = (single, archive_stem) {
+            if let (true, Some(stem), false) = (single, archive_stem, ctx.remote) {
                 items.push(action(ExtractHere, tr("Extract Here"), None, true));
                 items.push(action(
                     ExtractTo,
@@ -454,11 +471,13 @@ pub fn build_menu(target: &MenuTarget, ctx: &MenuContext) -> Vec<MenuItem> {
                     true,
                 ));
             }
-            items.push(submenu(tr("Compress to"), compress_menu()));
+            if !ctx.remote {
+                items.push(submenu(tr("Compress to"), compress_menu()));
+            }
             items.push(MenuItem::Separator);
             items.push(action(Delete, tr("Delete"), Some("Del"), true));
             items.push(MenuItem::Separator);
-            if folder {
+            if folder && !ctx.remote {
                 items.push(action(OpenInTerminal, tr("Open in Terminal"), None, true));
             }
             items.push(action(Properties, tr("Properties"), Some("⌥↵"), single));
@@ -549,6 +568,57 @@ mod tests {
 
     fn ctx() -> MenuContext {
         MenuContext::default()
+    }
+
+    #[test]
+    fn remote_menus_leave_out_rows_that_need_local_files() {
+        let remote = MenuContext {
+            remote: true,
+            ..ctx()
+        };
+        let local_only = [
+            MenuAction::Cut,
+            MenuAction::Copy,
+            MenuAction::PasteInto,
+            MenuAction::Paste,
+            MenuAction::CreateShortcut,
+            MenuAction::OpenInTerminal,
+            MenuAction::ExtractHere,
+            MenuAction::ExtractTo,
+        ];
+        let mut targets = vec![folder(), files(1), MenuTarget::Background];
+        targets.push(MenuTarget::Items {
+            count: 1,
+            is_dir: false,
+            app_bundle: false,
+            files_only: true,
+            archive_stem: Some("a".into()),
+        });
+        for target in &targets {
+            let items = build_menu(target, &remote);
+            let actions: Vec<_> = flatten(&items).into_iter().map(|a| a.action).collect();
+            for action in local_only {
+                assert!(!actions.contains(&action), "{action:?} on {target:?}");
+            }
+            assert!(
+                !items
+                    .iter()
+                    .any(|i| matches!(i, MenuItem::Submenu(s) if s.label == "Compress to")),
+                "no compress submenu"
+            );
+        }
+        // What does work stays.
+        let items = build_menu(&folder(), &remote);
+        let actions: Vec<_> = flatten(&items).into_iter().map(|a| a.action).collect();
+        for kept in [
+            MenuAction::Open,
+            MenuAction::Rename,
+            MenuAction::Delete,
+            MenuAction::CopyPath,
+            MenuAction::Properties,
+        ] {
+            assert!(actions.contains(&kept), "{kept:?}");
+        }
     }
 
     #[test]

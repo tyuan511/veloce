@@ -61,16 +61,6 @@ pub(crate) enum InlinePrompt {
     NewFolder,
     NewFile,
     Rename,
-    /// Permanently delete these remote items; runs only when the word is typed.
-    ConfirmDelete(Vec<VfsUri>),
-}
-
-/// The word that must be typed to confirm a permanent remote delete. Typing a word,
-/// not pressing Enter on a default button, so a stray key can't destroy data.
-pub(crate) const DELETE_WORD: &str = "DELETE";
-
-pub(crate) fn delete_confirmed(typed: &str) -> bool {
-    typed.trim() == DELETE_WORD
 }
 
 /// An open right-click menu. The origin is the raw cursor position; it is
@@ -99,6 +89,11 @@ fn query_apps(
     path: &std::path::Path,
     home: &std::path::Path,
 ) -> Option<(Vec<AppInfo>, Vec<Option<PathBuf>>)> {
+    // A placeholder for a remote file does not exist yet; make it. Only those live
+    // under the scratch folder, so a real file that vanished still yields `None`.
+    if !path.exists() && path.starts_with(std::env::temp_dir().join("veloce-open-with")) {
+        open_with::ensure_placeholder(path).ok()?;
+    }
     if !path.exists() {
         return None;
     }
@@ -526,46 +521,89 @@ impl Workspace {
     }
 
     /// Download a remote file to a scratch folder and open it with its default app.
-    /// The copy shows in the task panel like any other transfer.
     fn open_remote_file(&mut self, uri: VfsUri, cx: &mut Context<Self>) {
+        self.with_local_copies(vec![uri], cx, |_, files, _| {
+            for file in files {
+                let _ = open::that_detached(&file);
+            }
+        });
+    }
+
+    /// Run `then` with a local path for every uri, in order. Local ones are used as
+    /// they are; remote ones are first downloaded to a scratch folder as ordinary
+    /// transfer tasks (so progress shows in the task panel). If any download fails
+    /// nothing runs and the reason is shown.
+    fn with_local_copies(
+        &mut self,
+        uris: Vec<VfsUri>,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Self, Vec<PathBuf>, &mut Context<Self>) + 'static,
+    ) {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |elapsed| elapsed.as_nanos());
-        let local = std::env::temp_dir()
-            .join("veloce-remote")
-            .join(stamp.to_string())
-            .join(uri.file_name());
         let tasks = self.services.tasks.clone();
-        let id = tasks.transfer(
-            uri,
-            VfsUri::local(&local),
-            self.services.registry.clone(),
-            vfs_core::ops::ConflictPolicy::Overwrite,
-            false,
-        );
+        let mut files = Vec::new();
+        let mut pending = Vec::new();
+        for (index, uri) in uris.into_iter().enumerate() {
+            match uri.as_local_path() {
+                Some(path) => files.push(path),
+                None => {
+                    // One folder per file, so equal names from different places
+                    // cannot overwrite each other.
+                    let local = std::env::temp_dir()
+                        .join("veloce-remote")
+                        .join(format!("{stamp}-{index}"))
+                        .join(uri.file_name());
+                    let id = tasks.transfer(
+                        uri,
+                        VfsUri::local(&local),
+                        self.services.registry.clone(),
+                        vfs_core::ops::ConflictPolicy::Overwrite,
+                        false,
+                    );
+                    pending.push(id);
+                    files.push(local);
+                }
+            }
+        }
         cx.spawn(async move |this, cx| {
-            let state = loop {
+            let mut failure = None;
+            while !pending.is_empty() {
                 cx.background_executor()
                     .timer(std::time::Duration::from_millis(100))
                     .await;
-                let finished = tasks
-                    .snapshots()
-                    .into_iter()
-                    .find(|task| task.id == id)
-                    .filter(|task| task.is_terminal());
-                if let Some(task) = finished {
-                    break task.state;
-                }
-            };
-            this.update(cx, |workspace, cx| {
-                match state {
-                    vfs_core::TaskState::Done => {
-                        let _ = open::that_detached(&local);
+                let snapshots = tasks.snapshots();
+                pending.retain(|id| {
+                    let finished = snapshots
+                        .iter()
+                        .find(|task| task.id == *id)
+                        .filter(|task| task.is_terminal());
+                    match finished {
+                        Some(task) => {
+                            match &task.state {
+                                vfs_core::TaskState::Done => {}
+                                vfs_core::TaskState::Failed(message) => {
+                                    failure.get_or_insert(message.clone());
+                                }
+                                _ => {
+                                    failure.get_or_insert_with(String::new);
+                                }
+                            }
+                            false
+                        }
+                        None => true,
                     }
-                    vfs_core::TaskState::Failed(message) => {
+                });
+            }
+            this.update(cx, |workspace, cx| {
+                match failure {
+                    None => then(workspace, files, cx),
+                    // Cancelled by the user: nothing to report.
+                    Some(message) if message.is_empty() => {}
+                    Some(message) => {
                         workspace.banner = Some((message, std::time::Instant::now()));
                     }
-                    _ => {}
                 }
                 cx.notify();
             })
@@ -709,7 +747,9 @@ impl Workspace {
             let pane = self.focused_pane().read(cx);
             (pane.view, pane.listing.show_hidden, pane.sort)
         };
+        let remote = !self.focused_pane().read(cx).current_uri().scheme.is_local();
         let ctx = MenuContext {
+            remote,
             can_paste: !self.clipboard.is_empty(),
             view,
             show_hidden,
@@ -745,7 +785,12 @@ impl Workspace {
         });
         cx.notify();
         if wants_apps {
-            let first = selection.iter().find_map(|entry| entry.uri.as_local_path());
+            let first = selection.first().map(|entry| {
+                entry
+                    .uri
+                    .as_local_path()
+                    .unwrap_or_else(|| self.placeholder_for(entry))
+            });
             if let Some(path) = first {
                 self.load_open_with(id, path, cx);
             }
@@ -784,6 +829,15 @@ impl Workspace {
     /// Fill the Open With submenu: straight from the per-file-type cache when
     /// there is one, otherwise ask LaunchServices off the UI thread. A stale
     /// cache entry is shown at once and refreshed behind the menu's back.
+    /// The stand-in local path an application list is asked for when `entry` lives
+    /// on a server. The file itself is created in the background by `query_apps`.
+    fn placeholder_for(&self, entry: &vfs_core::FileEntry) -> PathBuf {
+        open_with::placeholder_path(
+            &std::env::temp_dir().join("veloce-open-with"),
+            &entry.extension().unwrap_or_default(),
+        )
+    }
+
     fn load_open_with(&mut self, id: u64, path: PathBuf, cx: &mut Context<Self>) {
         const FRESH_FOR: std::time::Duration = std::time::Duration::from_secs(600);
         let key = open_with::app_cache_key(&path);
@@ -823,9 +877,10 @@ impl Workspace {
         let Some(entry) = self.focused_pane().read(cx).cursor_entry().cloned() else {
             return;
         };
-        let Some(path) = entry.uri.as_local_path() else {
-            return;
-        };
+        let path = entry
+            .uri
+            .as_local_path()
+            .unwrap_or_else(|| self.placeholder_for(&entry));
         let ctx = MenuContext::default();
         self.menu_counter += 1;
         let id = self.menu_counter;
@@ -883,18 +938,21 @@ impl Workspace {
     /// Open the selected files with `app`.
     fn open_selection_with(&mut self, app: AppInfo, cx: &mut Context<Self>) {
         let files = self.open_with_files(cx);
-        if let Err(message) = open_with::open_with(&app.path, &files) {
-            self.banner = Some((message, std::time::Instant::now()));
-        }
+        self.with_local_copies(files, cx, move |workspace, files, _| {
+            if let Err(message) = open_with::open_with(&app.path, &files) {
+                workspace.banner = Some((message, std::time::Instant::now()));
+            }
+        });
     }
 
-    fn open_with_files(&self, cx: &mut Context<Self>) -> Vec<PathBuf> {
+    /// The selected files (not folders), wherever they live.
+    fn open_with_files(&self, cx: &mut Context<Self>) -> Vec<VfsUri> {
         self.focused_pane()
             .read(cx)
             .selection_or_cursor()
             .iter()
             .filter(|entry| !entry.is_dir())
-            .filter_map(|entry| entry.uri.as_local_path())
+            .map(|entry| entry.uri.clone())
             .collect()
     }
 
@@ -914,13 +972,14 @@ impl Workspace {
             let Some(app) = paths.into_iter().next() else {
                 return;
             };
-            if let Err(message) = open_with::open_with(&app, &files) {
-                this.update(cx, |workspace, cx| {
-                    workspace.banner = Some((message, std::time::Instant::now()));
-                    cx.notify();
-                })
-                .ok();
-            }
+            this.update(cx, |workspace, cx| {
+                workspace.with_local_copies(files, cx, move |workspace, files, _| {
+                    if let Err(message) = open_with::open_with(&app, &files) {
+                        workspace.banner = Some((message, std::time::Instant::now()));
+                    }
+                });
+            })
+            .ok();
         })
         .detach();
     }
@@ -1036,8 +1095,17 @@ impl Workspace {
             MenuAction::ExtractHere => pane.update(cx, |pane, cx| pane.extract_selection(true, cx)),
             MenuAction::ExtractTo => pane.update(cx, |pane, cx| pane.extract_selection(false, cx)),
             MenuAction::CopyPath => {
-                let paths = pane.read(cx).selection_paths();
-                Self::copy_text_to_clipboard(&paths, cx);
+                let entries = pane.read(cx).selection_or_cursor();
+                if entries.iter().any(|entry| !entry.uri.scheme.is_local()) {
+                    // A server path is only meaningful with its connection, so copy
+                    // the whole uri (`s3://1/images/a.png`).
+                    let text: Vec<String> =
+                        entries.iter().map(|entry| entry.uri.to_string()).collect();
+                    cx.write_to_clipboard(gpui::ClipboardItem::new_string(text.join("\n")));
+                } else {
+                    let paths = pane.read(cx).selection_paths();
+                    Self::copy_text_to_clipboard(&paths, cx);
+                }
             }
             MenuAction::Cut => {
                 let paths = pane.read(cx).selection_paths();
@@ -1067,7 +1135,7 @@ impl Workspace {
             MenuAction::CreateShortcut => pane.update(cx, |pane, cx| pane.shortcut_selection(cx)),
             MenuAction::Delete => {
                 // 回收站操作几乎瞬间完成，不值得为它弹出任务面板。
-                self.delete_selection(window, cx);
+                self.delete_selection(cx);
             }
             MenuAction::Rename => {
                 if let Some(entry) = pane.read(cx).cursor_entry().cloned() {
@@ -1268,7 +1336,7 @@ impl Workspace {
     fn run_palette_choice(
         &mut self,
         choice: PaletteChoice,
-        window: &mut Window,
+        _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match choice {
@@ -1318,7 +1386,7 @@ impl Workspace {
                         self.move_to_other_pane(cx);
                     }
                     crate::palette::CommandId::TrashSelection => {
-                        self.delete_selection(window, cx);
+                        self.delete_selection(cx);
                     }
                     crate::palette::CommandId::Refresh => {
                         pane.update(cx, |pane, cx| pane.refresh(cx));
@@ -1442,26 +1510,12 @@ impl Workspace {
             return;
         };
         let value = value.trim().to_string();
-        if let InlinePrompt::ConfirmDelete(uris) = kind {
-            if delete_confirmed(&value) {
-                self.focused_pane()
-                    .update(cx, |pane, cx| pane.delete_remote(uris, cx));
-            } else {
-                self.banner = Some((
-                    tr("Nothing was deleted: the confirmation word did not match").to_string(),
-                    std::time::Instant::now(),
-                ));
-            }
-            cx.notify();
-            return;
-        }
         if value.is_empty() {
             cx.notify();
             return;
         }
         let pane = self.focused_pane();
         match kind {
-            InlinePrompt::ConfirmDelete(_) => {}
             InlinePrompt::NewFolder => {
                 pane.update(cx, |pane, cx| pane.create_dir(&value, cx));
             }
@@ -1751,13 +1805,13 @@ impl Workspace {
         self.move_to_other_pane(cx);
     }
 
-    fn on_trash(&mut self, _: &TrashSelection, window: &mut Window, cx: &mut Context<Self>) {
-        self.delete_selection(window, cx);
+    fn on_trash(&mut self, _: &TrashSelection, _: &mut Window, cx: &mut Context<Self>) {
+        self.delete_selection(cx);
     }
 
     /// Local items go to the Trash. Remote ones have no Trash, so they are deleted
-    /// for good, but only after the user types the confirmation word.
-    fn delete_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// for good, straight away, like the local delete is.
+    fn delete_selection(&mut self, cx: &mut Context<Self>) {
         let pane = self.focused_pane();
         let remote: Vec<VfsUri> = pane
             .read(cx)
@@ -1769,12 +1823,7 @@ impl Workspace {
         if remote.is_empty() {
             pane.update(cx, |pane, cx| pane.trash_selection(cx));
         } else {
-            self.start_prompt(
-                InlinePrompt::ConfirmDelete(remote),
-                String::new(),
-                window,
-                cx,
-            );
+            pane.update(cx, |pane, cx| pane.delete_remote(remote, cx));
         }
     }
 
@@ -1932,10 +1981,6 @@ impl Render for Workspace {
                 InlinePrompt::NewFolder => tr("New folder name").to_string(),
                 InlinePrompt::NewFile => tr("New file name").to_string(),
                 InlinePrompt::Rename => tr("Rename to").to_string(),
-                InlinePrompt::ConfirmDelete(uris) => trf(
-                    "Permanently delete {} remote item(s)? Type {} to confirm",
-                    &[&uris.len().to_string(), DELETE_WORD],
-                ),
             };
             (title, input.clone())
         });
@@ -2750,17 +2795,3 @@ pub fn new_workspace(persist: Persist, startup: SavedStartup, cx: &mut App) -> E
 
 /// Kept so the module compiles if mouse handlers are added later.
 fn _unused(_: MouseButton, _: &mut Window, _: &mut App, _: &Subscription) {}
-
-#[cfg(test)]
-mod delete_tests {
-    use super::delete_confirmed;
-
-    #[test]
-    fn only_the_exact_word_confirms_a_permanent_delete() {
-        assert!(delete_confirmed("DELETE"));
-        assert!(delete_confirmed("  DELETE \n"));
-        for no in ["", "delete", "Delete", "DELET", "DELETE all", "y", "yes"] {
-            assert!(!delete_confirmed(no), "{no:?}");
-        }
-    }
-}
