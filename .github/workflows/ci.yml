@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# A newer push to the same branch makes the older run pointless.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # AGENTS.md: `cargo build` must be warning-free, so CI refuses warnings.
+  RUSTFLAGS: -D warnings
+
+jobs:
+  check:
+    # GPUI renders with Metal, and the app leans on macOS tools (sips, Quick Look,
+    # LaunchServices), so this is a macOS project and CI runs where it runs.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets
+
+      # No GPU or window server is needed: the UI has no automated tests, and
+      # everything that is tested is plain logic (see AGENTS.md).
+      - name: Test
+        run: cargo test --workspace
