@@ -1,12 +1,15 @@
 # Veloce
 
+[![CI](https://github.com/tyuan511/veloce/actions/workflows/ci.yml/badge.svg)](https://github.com/tyuan511/veloce/actions/workflows/ci.yml)
+
 A GPU-accelerated, keyboard-first file manager for people who live in terminals but
 still need to drag a file into Slack. Local disk, SSH/SFTP, S3/OSS and WebDAV behind
 one interface — built on Rust + [GPUI](https://gpui.rs) (the engine behind Zed), so
 the list keeps 120 FPS in a directory with 200,000 entries.
 
-> Status: **Milestone 1** — the local core is complete and usable as a daily driver.
-> Remote backends are stubbed at the trait level (see `docs/research.md` §7).
+> Status: the local core is a daily driver, and SFTP, S3 and WebDAV connections are
+> wired in for browsing, previewing, transferring and (optionally) mounting as local
+> folders. macOS only for now. See [Remote connections](#remote-connections).
 
 ## Why
 
@@ -14,7 +17,7 @@ the list keeps 120 FPS in a directory with 200,000 entries.
 |---|---|---|---|---|
 | 100k-file directory | spins, beachballs | unusable | fast | **streams in, first screen < 10 ms** |
 | keyboard flow | weak | none | excellent | **Vim keys + command palette** |
-| cross-protocol move | — | download→upload | — | **in-memory pipe (M3)** |
+| cross-protocol move | — | download→upload | — | **streamed through memory, no temp file** |
 | local trash / OS integration | native | none | none | **native trash, `open`, clipboard** |
 | UI stack | native | wxWidgets / Java | TUI | **GPUI, GPU, no WebView** |
 
@@ -30,9 +33,13 @@ crates/
     filter.rs        nucleo-backed in-folder fuzzy filter
     search.rs        parallel recursive search (ignore + nucleo)
     watch.rs         debounced filesystem watcher
-    ops.rs           TaskManager: background copy/move/trash with progress
-  store/             veloce-store: SQLite state (settings, folder views, session, recents,
-                     thumbnail cache), no GUI dependency
+    ops.rs           TaskManager: background copy/move/trash/transfer with progress
+    remote.rs        RemoteProvider: SFTP, S3, WebDAV through OpenDAL, one per connection
+    transfer.rs      copy/move between any two providers (local <-> remote <-> remote)
+    mountfs.rs       the FUSE-independent half of mounting (paths, attrs, read clamping)
+  veloce-mount/      read-only FUSE mount of a connection, over libfuse 2.9 (FUSE-T / macFUSE)
+  store/             veloce-store: SQLite state (settings, folder views, session, favorites,
+                     saved connections, thumbnail cache), no GUI dependency
   veloce/            GPUI front-end
     listing.rs       pure list logic: sort/filter/cursor/selection/path parsing
     workspace.rs     sidebar + two panes + inspector + task panel + palette, all actions
@@ -40,6 +47,9 @@ crates/
     preview.rs       Space-to-preview: bounded head read, images, folders
     palette.rs       ⌘P fuzzy jump / ⌘⇧P commands
     tasks_panel.rs   transfer progress, cancellation
+    connections.rs   connection forms: validation, what is stored, how it is opened
+    secrets.rs       passwords and secret keys in the macOS keychain
+    mounts.rs        which connections are FUSE-mounted, and where
     text_input.rs    IME-correct single-line field (EntityInputHandler)
     theme.rs         light/dark palettes following the OS, one accent
 ```
@@ -52,11 +62,12 @@ CLI or a daemon later, and every non-visual behaviour is testable with `cargo te
 OpenDAL's `fs` backend is fine for remote parity, but local files need things a generic
 abstraction hides: the OS trash, extended attributes / Finder tags, native permission
 bits, and the fastest possible `readdir`. So `LocalProvider` implements `VfsProvider`
-directly, and OpenDAL will back only the remote schemes (milestone 3).
+directly, and OpenDAL backs only the remote schemes.
 
 ## Build
 
-Requires macOS or Linux, Rust 1.90+, and Xcode command line tools.
+Requires macOS, Rust 1.90+ (stable), and the Xcode command line tools. FUSE-T or macFUSE
+is optional and only needed to mount remote connections as folders.
 
 ```sh
 cargo dev [dir]                    # debug build + launch the GUI
@@ -68,6 +79,38 @@ GPUI normally compiles its Metal shaders at build time, which needs the full Met
 toolchain (`xcodebuild -downloadComponent MetalToolchain`). This crate enables the
 `runtime_shaders` feature instead, so a plain Xcode CLT install is enough — the shaders
 compile once at first launch.
+
+## Remote connections
+
+*Settings → Connections* saves SFTP, S3 (and compatible: R2, MinIO, OSS) and WebDAV
+connections. They show up in the sidebar and open in the focused pane like any folder.
+
+- **Secrets stay out of the database.** S3 secret keys and WebDAV passwords go to the
+  macOS keychain; only non-secret fields are stored. SFTP uses the system `ssh`, so it
+  authenticates with keys and the agent (no passwords) and trusts a host on first use.
+- **What works remotely:** browsing, preview (a bounded head of the file, or one download
+  rendered to a small picture, cached), open / open with (downloads first), rename, new
+  folder / file, delete, and copy / move between the two panes (`F5` / `F6`), including
+  local ↔ remote and remote ↔ remote, streamed with progress in the task panel.
+- **What does not:** cut / copy / paste through the clipboard, shortcuts, archives and
+  Open in Terminal on remote items; those rows are left out of the menu.
+- **Remote delete is permanent.** A server has no Trash, so this is the one place
+  deletion is not recoverable (local items always go to the Trash).
+- **Remote thumbnails are off.** A folder of remote photos would mean downloading every
+  one of them; a picture is only rendered when you preview a file by hand.
+
+### Mount as a local folder
+
+Tick *Mount as a local folder* on a connection and it is mounted read-only at
+`~/Veloce/<name>` (visible in Finder) when the app starts and when the connection is
+saved, and unmounted when you untick it, delete or edit the connection, or quit. This
+needs [FUSE-T](https://www.fuse-t.org) (or macFUSE); without either the app runs as
+usual and tells you to install one.
+
+The mount talks to libfuse 2.9's high-level API directly instead of using the `fuser`
+crate: FUSE-T serves NFS to the kernel and has no `/dev/fuse` protocol, so `fuser`
+reports success while nothing is mounted. Listings and attributes are cached for five
+seconds; reads fetch only the requested byte range.
 
 ## Keys
 
@@ -93,7 +136,7 @@ compile once at first launch.
 | `⌘⌫` | move to trash (recoverable) |
 | `⌘⇧N` / `shift-R` | new folder / rename |
 | `⌘X` / `⌘C` / `⌘V` | cut / copy / paste, Explorer-style: cut + paste moves, copy + paste in the same folder makes `name - Copy`; `esc` cancels a cut |
-| `Del` / `⌘⌫` | delete (to the trash) |
+| `Del` / `⌘⌫` | delete (local: to the trash; remote: permanent) |
 | `F2` / `⌥↵` / `⌘O` | rename / properties / open |
 | `⇧⌘C` | copy as path |
 | right-click | Explorer-style menu: open, compress to ZIP, cut, copy, paste, create shortcut, delete, rename, properties |
@@ -107,8 +150,8 @@ compile once at first launch.
 Veloce keeps what you would miss in one SQLite file
 (`~/Library/Application Support/Veloce/veloce.db`): window layout and toggles, the
 view and sort of each folder (like Finder, an unvisited folder opens as a list),
-the open tabs of both panes, recently visited folders (the sidebar's *Recent*
-section) and generated thumbnails. Everything is loaded before the window opens;
+the open tabs of both panes, the files and folders you starred (right-click → *Add to Favorites*, shown in the
+sidebar), saved connections and generated thumbnails. Everything is loaded before the window opens;
 writes happen on a background thread, so the UI never waits on disk. If the file
 cannot be opened or is damaged it is moved aside and the app carries on without
 remembering.
@@ -130,8 +173,8 @@ Shortcuts are editable: click **+** on a command and press the new keys (a key
 already used elsewhere, or Esc/⌘Q/⌘,, is refused); changes apply at once and are
 stored as overrides, so new defaults in later versions still reach you. Context-menu
 hints still show the default keys. Connections (SSH, S3, WebDAV) are managed there too: the form validates
-and stores the non-secret fields; passwords and secret keys are deliberately not
-saved, since the remote backends will keep them in the system keychain.
+and stores the non-secret fields, and passwords and secret keys go to the system
+keychain.
 
 ## Layout
 
@@ -151,8 +194,9 @@ Drag the dividers to resize the sidebar, the preview panel and, when split, the 
 - **Archives.** Right-click compresses to ZIP, TAR.GZ, TAR.XZ, TAR.BZ2 and 7Z, and
   extracts zip / tar.* / 7z / rar / gz / bz2 / xz / zst with the system `tar`, `zip`
   and `gzip` (here or into a new `name/` folder, never merging into an existing one).
-- **Trash, never `rm`.** Deleting uses the `trash` crate; there is no hard-delete path in
-  the UI at all.
+- **Trash, never `rm`.** Deleting a local item uses the `trash` crate; there is no
+  hard-delete path for local files. The single exception is items on a remote
+  connection, which have no Trash (`Pane::delete_remote`, see `AGENTS.md`).
 - **Conflicts default to "keep both".** Copies rename to `name 2.ext` rather than
   silently clobbering a file you already had.
 - **The watcher is debounced.** A `git checkout` emits thousands of FSEvents; they
@@ -161,14 +205,18 @@ Drag the dividers to resize the sidebar, the preview panel and, when split, the 
 ## Tests
 
 ```sh
-cargo test              # 513 tests, no GPU or window server needed
-cargo test -p vfs-core  # 156 core tests
+cargo test              # no GPU, window server or network needed
+cargo test -p vfs-core  # the core: providers, transfers, search, mount logic
 ```
 
 **UI is not covered by automated tests** (see `AGENTS.md`): interaction is verified
 by hand. What *is* tested is every decision the UI makes — `listing.rs` holds the
 sort / filter / cursor / selection / path-parsing logic as pure functions, so the
 list's behaviour is covered without a single `TestAppContext`.
+
+Remote backends are tested against OpenDAL's in-memory service, and the FUSE glue by
+hand (`cargo run -p veloce-mount --example mount_dir -- <dir> <mountpoint>` mounts a
+local folder through the same code path).
 
 Coverage includes path normalization, natural sorting, chunked listing, range reads,
 copy/move/trash semantics, conflict policies, cancellation, `.gitignore`-aware search,
@@ -177,11 +225,9 @@ and the theme's contrast and layout invariants (asserted at compile time).
 
 ## Roadmap
 
-- **M2** — syntax highlighting in the preview (`tree-sitter`), directory size rollups,
-  open-in-terminal / open-in-editor.
-- **M3** — OpenDAL backends (S3/OSS/R2/MinIO, SFTP, WebDAV), `~/.ssh/config` parsing,
-  `keyring` credential storage, in-memory cross-protocol pipe.
-- **M4** — multi-rename with regex preview, directory diff & sync, embedded SSH terminal.
+- Remote: write support for mounts, `~/.ssh/config` parsing, resumable transfers,
+  clipboard copy / paste across backends.
+- Multi-rename with regex preview, directory diff & sync, embedded SSH terminal.
 
 See `docs/research.md` for the full product and engineering analysis.
 
